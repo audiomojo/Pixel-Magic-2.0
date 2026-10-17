@@ -1,0 +1,15 @@
+# Private photo corpus and runtime data — never commit
+test-automation/sample-images/
+data/
+data-test/
+tests/reports/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.DS_Store
