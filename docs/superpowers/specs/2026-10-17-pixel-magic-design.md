@@ -48,8 +48,8 @@ Success means:
 | `postgres` (16) | Databases `pixelmagic` (app) and `temporal` (+ `temporal_visibility`). Named volume, defaults for `fsync` and `synchronous_commit`. |
 | `temporal` | Temporal server with Postgres persistence and SQL visibility. The schema is created by a one-shot admin-tools container. |
 | `temporal-ui` | Workflow history UI at `127.0.0.1:8080`. |
-| `migrate` | One-shot `alembic upgrade head` for `pixelmagic`. |
-| `worker` | Python 3.12 + Temporal Python SDK. Serves the workflow queue `main` plus `io`, `cpu` and `cluster`. Bind-mounts `DATA_DIR` at `/data`. |
+| `migrate` | One-shot `node-pg-migrate up` (plain SQL migrations) for `pixelmagic`. |
+| `worker` | TypeScript on Node 24 LTS + Temporal TypeScript SDK. Serves the workflow queue `main` plus `io`, `cpu` and `cluster`. Bind-mounts `DATA_DIR` at `/data`. |
 | `worker-extra` | The same image with `WORKER_QUEUES=main,io,cpu` (no `cluster`), so its in-memory index never flips between replicas. Scale with `docker compose up --scale worker-extra=N`. |
 | `grafana` | Dashboard over a Postgres datasource at `127.0.0.1:3000`. |
 
@@ -99,7 +99,7 @@ scan_stats(id int PK = 1, pending_files bigint, pending_bytes bigint, scanned_at
 staging_builds(gen bigint PK, watermark timestamptz, built_at, entries bigint)
 ```
 
-- `phash` and `dhash` are stored as signed int64; `pm.hashing.to_signed` / `to_unsigned` convert.
+- `phash` and `dhash` are stored as signed int64; `toSigned` / `toUnsigned` (`BigInt.asIntN` / `asUintN`) convert. In TypeScript, hashes are always `bigint`.
 - Indexes: `files(state)`, `contents(state)`, `contents(live_content_id)`, `contents(copy_group_id)`.
 - Every path is stored **relative to `DATA_DIR`**, so a native macOS worker with a different mount point sees the same rows.
 
@@ -115,7 +115,7 @@ Each step can be retried, and the state left by a crash at any point is handled:
    - If both are missing and `files.sha256` is set, go to step 5 (the vault step already ran).
    - If both are missing and there is no hash, mark `QUARANTINED(vanished)`.
 3. Stream SHA-256 in 1 MiB chunks, heartbeating. **Commit** `state=CLAIMED, sha256`.
-4. Detect the type by content using exiftool `FileType` and `MIMEType`, never by extension. This handles `wide`-atom MOVs and the JPEG named `IMG_E8719.HEIC`. Read metadata through one `exiftool -stay_open` process per worker:
+4. Detect the type by content using exiftool `FileType` and `MIMEType`, never by extension. This handles `wide`-atom MOVs and the JPEG named `IMG_E8719.HEIC`. Read metadata through `exiftool-vendored` (one long-lived `-stay_open` exiftool per worker, raw tags with `-G -n`):
    - `DateTimeOriginal`, `SubSecTimeOriginal`, `Make`/`Model`, Apple `BurstUUID` and `ContentIdentifier` (stills)
    - QuickTime `ContentIdentifier` and `Duration` (MOVs)
 5. **Vault:** `link(work/claimed/<file_id>, vault/<ab>/<cd>/<sha256>.<ext>)`.
@@ -130,20 +130,20 @@ Returns `IngestResult(file_id, sha256, is_new, kind)`.
 ### 6.2 `decode_content` (queue `cpu`) and `record_hash` (queue `io`)
 
 - Skip if `state ≥ HASHED`.
-- Decode in a `ProcessPoolExecutor` child with a timeout of `DECODE_TIMEOUT_S` = 60 s:
-  - register `pillow-heif`; RAW uses `rawpy.extract_thumb()`
-  - `Image.MAX_IMAGE_PIXELS = 200_000_000` (larger is a decompression bomb, a permanent error)
-  - JPEG `draft('L', (256, 256))`, then `ImageOps.exif_transpose`
-  - `imagehash.phash` / `dhash`, `hash_size=8`
+- Decode in a child process (`workerpool`, process workers) with a timeout of `DECODE_TIMEOUT_S` = 60 s. A hang or segfault kills only the child:
+  - **sharp** (libvips) with `limitInputPixels: 200_000_000` (larger is a decompression bomb, a permanent error), `failOn: 'truncated'`, and `.rotate()` to apply EXIF orientation. JPEG shrink-on-load makes the 32×32 resize fast.
+  - **HEIC/HEIF** is decoded with `heic-decode` (libheif compiled to WebAssembly), because prebuilt sharp has no HEVC decoder. The raw RGBA is then handed to sharp. One code path works on the Mac and in Docker; Task 4 benchmarks it.
+  - **RAW** uses the embedded preview, extracted with exiftool.
+  - **pHash** (our own implementation, the standard algorithm): 32×32 grayscale → 2-D DCT-II → top-left 8×8 → bit = coefficient > median of those 64. **dHash:** 9×8 grayscale → bit = pixel[x+1] > pixel[x]. Both are 64-bit, row-major, first bit = most significant.
 - Width and height are those of the **original**, not the draft.
 - A broken pool (segfault) is recreated, and the activity fails as retryable (§7).
 - Formats: JPEG, PNG, HEIC/HEIF, WebP, TIFF, GIF, BMP, RAW (embedded preview).
 
 ### 6.3 `cluster_content` (queue `cluster`, single-active)
 
-**In-memory index.** The worker keeps NumPy arrays of `phash`, `dhash` (uint64), `captured_at_ns`, `subsec`, `camera`, `burst_uuid`, `width`, `height`, `mime` and `copy_group_id`, plus the grouping state. It reloads them all whenever `cluster_state.version` differs from the version it cached (§12 R2).
+**In-memory index.** The worker keeps typed arrays: `phash` and `dhash` as hi/lo `Uint32Array` pairs, plus `captured_at_ns`, `subsec`, `camera`, `burst_uuid`, `width`, `height`, `mime` and `copy_group_id`, plus the grouping state. It reloads them all whenever `cluster_state.version` differs from the version it cached (§12 R2).
 
-**Matching.** A new hash is compared against **every** stored hash with `np.bitwise_count(index ^ h)`. Each candidate within `LOOK_ALIKE_PHASH` = 8 **and** `LOOK_ALIKE_DHASH` = 10 is classified by `classify(a, b) -> "copy" | "similar"`:
+**Matching.** A new hash is compared against **every** stored hash with XOR + 32-bit popcount over the typed arrays. Each candidate within `LOOK_ALIKE_PHASH` = 8 **and** `LOOK_ALIKE_DHASH` = 10 is classified by `classify(a, b) -> "copy" | "similar"`:
 
 Rows are evaluated top to bottom; the first match wins.
 
@@ -212,7 +212,7 @@ current/
 | Class | Raised as | Behaviour |
 |-------|-----------|-----------|
 | Transient (DB or Temporal unavailable, `EIO`, `ENOSPC`, worker death) | Any ordinary exception | Retry policy: initial 1 s, backoff ×2, max interval 5 min, **unlimited attempts**. Disk-full stalls the work; it never fails it. |
-| Permanent (`UnidentifiedImageError`, truncated, decompression bomb, unsupported) | Returned as an outcome, not raised (§12 R4) | `decode_content` returns the reason, and `record_hash` records `QUARANTINED(reason)`. The workflow ends normally. |
+| Permanent (undecodable, truncated, decompression bomb, unsupported) | Returned as an outcome, not raised (§12 R4) | `decode_content` returns the reason, and `record_hash` records `QUARANTINED(reason)`. The workflow ends normally. |
 | Poison (decode timeout, broken pool) | `ApplicationError(type="Poison")`, retryable | Only `decode_content` (no database access) has `maximum_attempts = POISON_ATTEMPTS` = 5. After that, the workflow runs `mark_failed(sha256, error)` and sets `contents.state=FAILED`. `make retry-failed` resets those rows and starts a `ContentWorkflow` for each. |
 
 Activity timeouts:
@@ -236,7 +236,7 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
   - quarantined by reason, FAILED count and the last 20 `last_error` values
   - age of the last staging build
 - **Alert (optional):** "backlog > 0 and no stage throughput for 10 min" → an ntfy webhook.
-- **Logs:** `structlog` JSON to stdout, including `workflow_id`, `file_id` and `sha256`.
+- **Logs:** `pino` JSON to stdout, including `workflow_id`, `file_id` and `sha256`.
 
 ## 9. Future AI hook (design only)
 
@@ -292,3 +292,4 @@ These changes were made while writing the implementation plan. The sections abov
 - **R4 Decode and record are split.** `decode_content` (cpu, no database, 5 attempts) is separate from `record_hash` (io, unlimited retries). A long database outage therefore never marks content FAILED. FAILED moved from `files.state` to `contents.state`. Quarantine is returned as an activity outcome rather than raised.
 - **R5 Deterministic staging names.** Group folders are named after their best copy's SHA-256 (`g-<sha8>`, `s-<sha8>`), not database ids, so a calm run and a chaos run produce identical trees.
 - **R6 FAILED contents** are staged under `quarantine/failed/`.
+- **R7 Language: TypeScript.** The pipeline is TypeScript on Node 24 LTS (ESM, strict). The future AI scorer may be any language Temporal supports (likely native Python or Swift for Metal/ANE). It only shares the `ai` task-queue name and JSON payloads with the pipeline.

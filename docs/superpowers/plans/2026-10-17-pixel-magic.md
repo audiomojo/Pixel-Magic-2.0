@@ -4,19 +4,36 @@
 
 **Goal:** Build a resumable, Temporal-orchestrated photo-dedupe pipeline. It moves dropped files into a content-addressed vault, groups true copies of the same shot and keeps every similar shot, and rebuilds a hardlinked staging tree that can be regenerated at any time.
 
-**Architecture:** One Python package (`pixelmagic`) runs as Temporal workers on the task queues `main` (workflows), `io`, `cpu` and `cluster`. Postgres holds the facts (`files`, `contents`, `groups`). Temporal holds progress. Staging is computed from the database and swapped in with an atomic symlink rename. Compose runs postgres, temporal, temporal-ui, migrate, worker, worker-extra and grafana.
+**Architecture:** One TypeScript package runs as Temporal workers on the task queues `main` (workflows), `io`, `cpu` and `cluster`. Postgres holds the facts (`files`, `contents`, `groups`). Temporal holds progress. Staging is computed from the database and swapped in with an atomic symlink rename. Compose runs postgres, temporal-admin, temporal, temporal-ui, migrate, worker, worker-extra and grafana.
 
-**Tech Stack:** Python 3.12, uv, temporalio, psycopg 3 (async + pool), Alembic/SQLAlchemy (migrations only), pydantic-settings, Pillow, pillow-heif, rawpy, imagehash, NumPy ≥ 2.0, PyExifTool (+ exiftool binary), pebble, structlog. Tests use pytest, pytest-asyncio, pytest-cov, hypothesis and testcontainers[postgres]. Lint and types use ruff and mypy (strict on `src/`).
+**Tech Stack:**
+- **Runtime:** Node 24 LTS, TypeScript 5.x (strict, ESM, `module: NodeNext`), npm
+- **Temporal:** `@temporalio/{client,worker,workflow,activity,testing}`
+- **Data and config:** `pg` (with `BigInt` parsing for int8), `node-pg-migrate` (SQL migrations), `zod` (config)
+- **Imaging:** `sharp`, `heic-decode`, `exiftool-vendored`, `workerpool` (process workers)
+- **Logging:** `pino`
+- **Tests:** vitest, `@vitest/coverage-v8`, fast-check, `@testcontainers/postgresql`
+- **Lint and format:** eslint (typescript-eslint, strict-type-checked), prettier
+- **Script runner:** `tsx` for `tools/`
 
-**Spec:** `docs/superpowers/specs/2026-10-17-pixel-magic-design.md` (including §12 "Revisions during planning")
+**Spec:** `docs/superpowers/specs/2026-10-17-pixel-magic-design.md` (including §12 "Revisions during planning", R1–R7)
 
 ## Global Constraints
 
-- Python 3.12. The package lives at `src/pixelmagic/`, and every command runs through `uv run`.
-- All config comes from env vars with the exact names below. Defaults: `DATA_DIR=/data`, `DATABASE_URL`, `TEMPORAL_ADDRESS=temporal:7233`, `TEMPORAL_NAMESPACE=default`, `WORKER_QUEUES=main,io,cpu,cluster`, `SCAN_INTERVAL_S=30`, `STABLE_SECONDS=5`, `MAX_IN_FLIGHT=5000`, `IO_CONCURRENCY=8`, `CPU_CONCURRENCY=<cpu count>`, `DECODE_TIMEOUT_S=60`, `POISON_ATTEMPTS=5`, `LOOK_ALIKE_PHASH=8`, `LOOK_ALIKE_DHASH=10`, `COPY_PHASH=4`, `COPY_DHASH=6`, `LIVE_MAX_DURATION_S=5`, `STAGE_MAX_STALENESS_S=900`.
-- The `DATA_DIR` layout is `dropzone/`, `work/claimed/`, `vault/<ab>/<cd>/<sha256>.<ext>`, `vault/.copies/<file_id>.<ext>`, `staging/.gen-<n>/` and `staging/current` (symlink). Every path stored in the database is **relative to `DATA_DIR`**.
+- **Build and run:**
+  - Node ≥ 24 (`"engines"`), `"type": "module"`, and `tsconfig` with `strict`, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`.
+  - Source lives in `src/`, compiled by `tsc` to `dist/`. Services run `node dist/<entry>.js`.
+- **64-bit hashes are `bigint` everywhere.** Never use `number` for a hash, size or `mtime_ns`. Configure `pg` with `types.setTypeParser(20, BigInt)`. In Temporal payloads, bigints travel as decimal strings.
+- **Config** comes from env vars with these exact names and defaults. They are parsed by `zod` into camelCase fields (`SCAN_INTERVAL_S` → `scanIntervalS`):
+  - `DATA_DIR=/data`, `DATABASE_URL` (required), `TEMPORAL_ADDRESS=temporal:7233`, `TEMPORAL_NAMESPACE=default`, `WORKER_QUEUES=main,io,cpu,cluster`
+  - `SCAN_INTERVAL_S=30`, `STABLE_SECONDS=5`, `MAX_IN_FLIGHT=5000`
+  - `IO_CONCURRENCY=8`, `CPU_CONCURRENCY=<os.availableParallelism()>`, `DECODE_TIMEOUT_S=60`, `POISON_ATTEMPTS=5`
+  - `LOOK_ALIKE_PHASH=8`, `LOOK_ALIKE_DHASH=10`, `COPY_PHASH=4`, `COPY_DHASH=6`
+  - `LIVE_MAX_DURATION_S=5`, `STAGE_MAX_STALENESS_S=900`
+- **The `DATA_DIR` layout** is `dropzone/`, `work/claimed/`, `vault/<ab>/<cd>/<sha256>.<ext>`, `vault/.copies/<fileId>.<ext>`, `staging/.gen-<n>/` and `staging/current` (symlink). Every path stored in the database is **relative to `DATA_DIR`**.
 - **Nothing in the pipeline ever unlinks a file it hasn't first hardlinked or renamed somewhere else.** The only unlinks allowed are `work/claimed/<id>` after its vault link is committed, and old `staging/.gen-*` directories.
-- Vault files are mode `0444`. Containers run as non-root (`UID`/`GID` build args, default 501/20).
+- Vault files are mode `0o444`. Containers run as non-root (`UID`/`GID` build args, default 501/20).
+- **Workflow code** (`src/workflows.ts`) imports only `@temporalio/workflow` and **type-only** imports from `src/types.ts` and `src/activities/index.ts`.
 - Published ports are `127.0.0.1` only: Grafana 3000, Temporal UI 8080, Postgres 5432, Temporal 7233.
 - The corpus `test-automation/sample-images/` is never written to. It stays git-ignored, and tests reach it only by cloning with `cp -c`.
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -28,10 +45,10 @@ No task is complete, and no next task starts, until **all** of the following pas
 | Gate | Command | Applies from |
 |------|---------|--------------|
 | G1 Red first | The task's new tests were seen failing before the implementation (the implementer pastes the failing output) | Task 1 |
-| G2 Full regression | `uv run pytest tests/unit tests/workflow -q` with **every** test from earlier tasks, 0 failures, 0 unexpected skips | Task 1 |
-| G3 Static | `uv run ruff check . && uv run ruff format --check . && uv run mypy src` | Task 1 |
-| G4 Coverage | `uv run pytest tests/unit tests/workflow --cov=pixelmagic --cov-fail-under=85` (branch coverage), and every module the task touched is ≥ 85% | Task 2 |
-| G5 Corpus unit | `uv run pytest -m corpus -q` passes (runs real sample files read-only) | Task 5 |
+| G2 Full regression | `npm test` (= `vitest run --project unit --project workflow`) with **every** test from earlier tasks, 0 failures, 0 unexpected skips | Task 1 |
+| G3 Static | `npm run lint && npm run format:check && npm run typecheck && npm run build` | Task 1 |
+| G4 Coverage | `npm run test:coverage` (v8 coverage, thresholds lines 85 / branches 85), and every file the task touched is ≥ 85% | Task 2 |
+| G5 Corpus unit | `npm run test:corpus` passes (real sample files, read-only) | Task 4 |
 | G6 Live stack | `make down && make up && make fs-check`, then the Task 9 Step 5 trickle (IMG_0034 HEIC/JPG lands in `unique/` + `copies/`) | Task 9 |
 | G7 Corpus safety | `make corpus-verify` exits 0 | Task 11 |
 | G8 E2E | `make test-smoke` (and `make test-standard` after Tasks 12 and 13) | Task 12 |
@@ -40,55 +57,60 @@ No task is complete, and no next task starts, until **all** of the following pas
 
 ## Review Focus
 
-1. **An EXIF-less export that looks like two different burst frames** must never put both frames into one copy group. The export is flagged `copy_ambiguous` and is never chosen as a best copy. Pinned by `test_bridge_export_never_merges_conflicting_shots` (Task 3) and the e2e burst check (Task 12).
-2. **Re-dropping a file that was already ingested** (same path, size and mtime) gets a new `files` row and ends as `COPY`. It must not be stuck in the drop zone or wrongly marked `vanished`. Pinned by `test_redrop_after_ingest_becomes_copy` (Task 6).
-3. **An ingest activity re-run after its commit but before Temporal recorded completion** (a crash at that moment) returns the same outcome, without creating a second row. Pinned by `test_rerun_after_commit_returns_same_outcome` (Task 6).
-4. **A Postgres or Temporal outage of several minutes while images are being hashed** makes the work wait. It never marks content `FAILED`, because only `decode_content` has an attempt limit. Pinned by `test_record_hash_outage_never_fails_content` (Task 9).
-5. **Opening a staged file for writing** (an editor saving in place) must fail without changing the vault original. Pinned by `test_staged_file_is_read_only` (Task 8).
+1. **An EXIF-less export that looks like two different burst frames** must never put both frames into one copy group. The export is flagged `copyAmbiguous` and is never chosen as a best copy. Pinned by `bridge export never merges conflicting shots` (Task 3) and the e2e burst check (Task 12).
+2. **Re-dropping a file that was already ingested** (same path, size and mtime) gets a new `files` row and ends as `COPY`. It must not be stuck in the drop zone or wrongly marked `vanished`. Pinned by `re-drop after ingest becomes COPY` (Task 6).
+3. **An ingest activity re-run after its commit but before Temporal recorded completion** (a crash at that moment) returns the same outcome, without creating a second row. Pinned by `re-run after commit returns same outcome` (Task 6).
+4. **A Postgres or Temporal outage of several minutes while images are being hashed** makes the work wait. It never marks content `FAILED`, because only `decodeContent` has an attempt limit. Pinned by `recordHash outage never fails content` (Task 9).
+5. **Opening a staged file for writing** (an editor saving in place) must fail without changing the vault original. Pinned by `staged file is read-only` (Task 8).
 
 ---
 
 ## File Structure
 
 ```
-pyproject.toml            uv project; deps; ruff/mypy/pytest config (markers: corpus, e2e, chaos)
-Dockerfile                python:3.12-slim + exiftool (libimage-exiftool-perl) + libheif; non-root; uv sync
-docker-compose.yml        postgres, temporal-admin (schema), temporal, temporal-ui, migrate, worker, worker-extra, grafana
+package.json              scripts: build, typecheck, lint, format:check, test, test:coverage, test:corpus, test:e2e, test:chaos
+tsconfig.json             strict ESM NodeNext; include src, tests, tools
+vitest.config.ts          projects: unit (tests/unit, excluding *.corpus.test.ts), workflow (tests/workflow),
+                          corpus (tests/**/*.corpus.test.ts), e2e (tests/e2e), chaos (tests/chaos)
+eslint.config.js, .prettierrc
+Dockerfile                node:24-bookworm-slim + perl (for exiftool-vendored); non-root; npm ci; tsc build
+docker-compose.yml        postgres, temporal-admin, temporal, temporal-ui, migrate, worker, worker-extra, grafana
 docker-compose.test.yml   override: ephemeral 127.0.0.1 ports, DATA_DIR from env
-Makefile                  up down logs lint fmt test fs-check stage retry-failed verify-vault corpus-* test-smoke test-standard chaos update-golden
+Makefile                  up down logs lint test fs-check stage retry-failed verify-vault corpus-* test-smoke test-standard chaos update-golden
 .env.example
-infra/postgres/init.sql   creates DBs pixelmagic, temporal, temporal_visibility
+infra/postgres/init.sql   creates DBs pixelmagic, temporal, temporal_visibility + read-only role pm_reader
 infra/grafana/            provisioning/{datasources,dashboards}/*.yml, dashboards/pipeline-live.json
-alembic.ini, migrations/  Alembic env + 0001_initial.py
-src/pixelmagic/
-  config.py               Settings, get_settings()
-  types.py                dataclasses shared by workflows and activities
-  fsops.py                DataLayout, check_same_device, vault_rel, sha256_stream, link_into_vault, is_ignored
-  fscheck.py              `python -m pixelmagic.fscheck`: proves link/rename/symlink-swap on the mount
-  db.py                   async pool factory, transaction helper
-  hashing.py              to_signed/to_unsigned, ImageFacts, QuarantineError, compute_image_facts
-  metadata.py             Metadata, parse_metadata (pure), ExifTool reader
-  classify.py             Facts, Thresholds, hamming, looks_alike, capture_conflict, classify
-  grouping.py             Grouper (capture-consistent union-find), Assignment
-  index.py                HashIndex (NumPy arrays + match query)
-  staging_plan.py         StageContent, StageFile, Entry, best_copy_key, pair_live_photos, plan_staging
+migrations/0001_initial.sql
+src/
+  config.ts               Settings, loadSettings()
+  logger.ts               pino instance
+  types.ts                payload types shared by workflows and activities (type-only)
+  ids.ts                  fileWorkflowId
+  fsops.ts                DataLayout, checkSameDevice, vaultRel, sha256File, linkIntoVault, isIgnored
+  fscheck.ts              entry: proves link/rename/symlink-swap on the mount
+  db.ts                   createPool, withTx
+  hashing.ts              toSigned/toUnsigned, hamming, phashFromGray, dhashFromGray (pure)
+  decode.ts               computeImageFacts (runs inside a workerpool child), QuarantineError
+  decodeWorker.ts         workerpool child entry
+  metadata.ts             Metadata, parseMetadata (pure), MetadataReader (exiftool-vendored)
+  classify.ts             Facts, Thresholds, looksAlike, captureConflict, classify
+  grouping.ts             Grouper (capture-consistent union-find), Assignment
+  hashIndex.ts            HashIndex (typed arrays + match query)
+  stagingPlan.ts          StageContent, StageFile, Entry, bestCopyKey, pairLivePhotos, planStaging
   activities/
-    ingest.py             ingest_file
-    hashing.py            decode_content, record_hash, mark_failed
-    cluster.py            cluster_content
-    staging.py            maybe_build_staging
-    scan.py               scan_and_start
-  workflows.py            FileWorkflow, ContentWorkflow, ScanWorkflow, StagingWorkflow, run_content_steps
-  worker.py               `python -m pixelmagic.worker`: workers per queue, ensure_schedules, startup checks
-  cli.py                  `python -m pixelmagic.cli {stage,retry-failed,verify-vault}`
-tools/corpus/             build_manifest.py, seed.py, verify.py, synth.py
+    index.ts              createActivities(deps) → the Activities object; Deps type
+    ingest.ts, hashing.ts, cluster.ts, staging.ts, scan.ts
+  workflows.ts            FileWorkflow, ContentWorkflow, ScanWorkflow, StagingWorkflow
+  worker.ts               entry: workers per queue, ensureSchedules, startup checks
+  cli.ts                  entry: stage | retry-failed | verify-vault (node:util parseArgs)
+tools/corpus/             lib.ts, buildManifest.ts, seed.ts, verify.ts, synth.ts (run with tsx)
 tests/
-  conftest.py             pg (testcontainers, migrated), data_layout (tmp DATA_DIR), image fixtures
-  unit/ …                 one file per module
-  workflow/test_workflows.py
-  lib/                    stack.py, invariant.py, expectations.py, snapshot.py
-  e2e/                    test_smoke.py, test_standard.py, golden/smoke_tree.txt
-  chaos/test_chaos.py
+  helpers/                pg.ts (testcontainers + migrate + truncate), layout.ts, images.ts (sharp-generated fixtures), activityEnv.ts, corpus.ts
+  unit/ …                 one file per module (*.test.ts); corpus-dependent ones are *.corpus.test.ts
+  workflow/workflows.test.ts
+  lib/                    stack.ts, invariant.ts, expectations.ts, snapshot.ts
+  e2e/                    smoke.test.ts, standard.test.ts, golden/smoke_tree.txt
+  chaos/chaos.test.ts
   corpus/manifest.json    committed: names + hashes only
 ```
 
@@ -97,83 +119,84 @@ tests/
 ### Task 1: Scaffold, config and filesystem guarantees
 
 **Files:**
-- Create: `pyproject.toml`, `Dockerfile`, `Makefile`, `.env.example`, `src/pixelmagic/__init__.py`, `src/pixelmagic/config.py`, `src/pixelmagic/fsops.py`, `src/pixelmagic/fscheck.py`, `README.md`
-- Modify: `.gitignore` (already ignores the corpus, `data/` and `data-test/`)
-- Test: `tests/unit/test_config.py`, `tests/unit/test_fsops.py`
+- Create: `package.json`, `tsconfig.json`, `vitest.config.ts`, `eslint.config.js`, `.prettierrc`, `Dockerfile`, `.dockerignore`, `Makefile`, `.env.example`, `README.md`, `src/config.ts`, `src/logger.ts`, `src/fsops.ts`, `src/fscheck.ts`
+- Modify: `.gitignore` (add `node_modules/`, `dist/`, `coverage/`, `.superpowers/`)
+- Test: `tests/unit/config.test.ts`, `tests/unit/fsops.test.ts`
 
 **Interfaces:**
 - Produces:
-  - `Settings` (pydantic-settings, field names = lower-case env names from Global Constraints) and `get_settings() -> Settings`
-  - `DataLayout(root: Path)` with properties `dropzone`, `claimed`, `vault`, `vault_copies`, `staging`, a method `ensure() -> None`, and `rel(p: Path) -> str`
-  - `check_same_device(layout: DataLayout) -> None`, which raises `SameDeviceError`
-  - `vault_rel(sha256: str, ext: str) -> str`
-  - `sha256_stream(path: Path, on_chunk: Callable[[], None] | None = None, chunk: int = 1 << 20) -> str`
-  - `LinkOutcome` enum: `LINKED | ALREADY_LINKED | EXISTS_OTHER`
-  - `link_into_vault(src: Path, dest: Path) -> LinkOutcome` (creates parent dirs; fsyncs the dest dir)
-  - `is_ignored(name: str) -> bool`
+  - `type Settings` with the camelCase fields from Global Constraints; `workerQueues: string[]`
+  - `loadSettings(env?: NodeJS.ProcessEnv): Settings`
+  - `class DataLayout { constructor(root: string) }` with readonly `root`, `dropzone`, `claimed`, `vault`, `vaultCopies` and `staging`, a method `ensure(): Promise<void>`, and `rel(abs: string): string`
+  - `checkSameDevice(layout: DataLayout): Promise<void>`, which throws `SameDeviceError`
+  - `vaultRel(sha256: string, ext: string): string`
+  - `sha256File(path: string, onChunk?: () => void): Promise<string>` (1 MiB chunks)
+  - `type LinkOutcome = 'LINKED' | 'ALREADY_LINKED' | 'EXISTS_OTHER'`
+  - `linkIntoVault(src: string, dest: string): Promise<LinkOutcome>`. It creates parent dirs, fsyncs the dest dir, and uses `fs.link`. On `EEXIST` it compares `dev` and `ino`.
+  - `isIgnored(name: string): boolean`
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-def test_settings_defaults(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
-    s = get_settings()
-    assert (s.scan_interval_s, s.stable_seconds, s.max_in_flight) == (30, 5, 5000)
-    assert (s.look_alike_phash, s.look_alike_dhash, s.copy_phash, s.copy_dhash) == (8, 10, 4, 6)
-    assert s.worker_queues == ["main", "io", "cpu", "cluster"]
+```ts
+test('settings defaults', () => {
+  const s = loadSettings({ DATABASE_URL: 'postgres://x' });
+  expect([s.scanIntervalS, s.stableSeconds, s.maxInFlight]).toEqual([30, 5, 5000]);
+  expect([s.lookAlikePhash, s.lookAlikeDhash, s.copyPhash, s.copyDhash]).toEqual([8, 10, 4, 6]);
+  expect(s.workerQueues).toEqual(['main', 'io', 'cpu', 'cluster']);
+});
+test('missing DATABASE_URL throws', () => expect(() => loadSettings({})).toThrow(/DATABASE_URL/));
 
-def test_vault_rel():
-    assert vault_rel("ab" + "cd" + "0" * 60, "heic") == "vault/ab/cd/abcd" + "0" * 60 + ".heic"
+test('vaultRel', () => expect(vaultRel('abcd' + '0'.repeat(60), 'heic')).toBe(`vault/ab/cd/abcd${'0'.repeat(60)}.heic`));
 
-@pytest.mark.parametrize("name,ignored", [(".DS_Store", True), ("._IMG_1.HEIC", True), ("a.part", True),
-    ("a.crdownload", True), ("~$lock", True), ("IMG_2834 1.HEIC", False), ("café.jpg", False)])
-def test_is_ignored(name, ignored): assert is_ignored(name) is ignored
+test.each([['.DS_Store', true], ['._IMG_1.HEIC', true], ['a.part', true], ['a.crdownload', true], ['~$lock', true],
+           ['IMG_2834 1.HEIC', false], ['café.jpg', false]])('isIgnored(%s)', (n, want) => expect(isIgnored(n)).toBe(want));
 
-def test_link_into_vault_outcomes(tmp_path):
-    a, b, dest = tmp_path/"a", tmp_path/"b", tmp_path/"v/ab/cd/x.jpg"
-    a.write_bytes(b"1"); b.write_bytes(b"1")
-    assert link_into_vault(a, dest) is LinkOutcome.LINKED
-    assert link_into_vault(a, dest) is LinkOutcome.ALREADY_LINKED
-    assert link_into_vault(b, dest) is LinkOutcome.EXISTS_OTHER
-    assert os.stat(a).st_ino == os.stat(dest).st_ino
+test('linkIntoVault outcomes', async () => {
+  const d = await tmpDir(); await writeFile(`${d}/a`, '1'); await writeFile(`${d}/b`, '1');
+  const dest = `${d}/v/ab/cd/x.jpg`;
+  expect(await linkIntoVault(`${d}/a`, dest)).toBe('LINKED');
+  expect(await linkIntoVault(`${d}/a`, dest)).toBe('ALREADY_LINKED');
+  expect(await linkIntoVault(`${d}/b`, dest)).toBe('EXISTS_OTHER');
+  expect((await stat(`${d}/a`)).ino).toBe((await stat(dest)).ino);
+});
 
-def test_sha256_stream_calls_on_chunk(tmp_path):
-    p = tmp_path/"f"; p.write_bytes(b"x" * (3 << 20)); calls = []
-    assert sha256_stream(p, on_chunk=lambda: calls.append(1)) == hashlib.sha256(b"x" * (3 << 20)).hexdigest()
-    assert len(calls) == 3
+test('sha256File streams and calls onChunk per MiB', async () => {
+  const p = `${await tmpDir()}/f`; const buf = Buffer.alloc(3 << 20, 'x'); await writeFile(p, buf);
+  let calls = 0;
+  expect(await sha256File(p, () => calls++)).toBe(createHash('sha256').update(buf).digest('hex'));
+  expect(calls).toBe(3);
+});
 
-def test_check_same_device_passes_on_one_fs(tmp_path):
-    layout = DataLayout(tmp_path); layout.ensure(); check_same_device(layout)
+test('checkSameDevice passes on one fs', async () => {
+  const l = new DataLayout(await tmpDir()); await l.ensure(); await expect(checkSameDevice(l)).resolves.toBeUndefined();
+});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_config.py tests/unit/test_fsops.py -v`
-Expected: FAIL with `ModuleNotFoundError: pixelmagic`
+Run: `npm install && npx vitest run --project unit`
+Expected: FAIL with `Cannot find module '../../src/config.js'`
 
-- [ ] **Step 3: Implement the scaffold, `config.py` and `fsops.py`**
+- [ ] **Step 3: Implement the scaffold, `config.ts`, `logger.ts`, `fsops.ts` and `fscheck.ts`**
 
-- **`pyproject.toml`:** list every dependency from Tech Stack. Configure ruff (line length 100). Set mypy `strict = true` for `src`. Declare pytest markers `corpus`, `e2e` and `chaos`, with `asyncio_mode = "auto"`.
-- **`link_into_vault`:** use `os.link`. On `FileExistsError`, compare with `os.path.samefile`.
-- **`check_same_device`:** compare `st_dev` across the four roots.
-- **`fscheck.main()`:** in a temp dir under `DATA_DIR`, run link, rename, and a `symlink` + `os.replace` swap over an existing symlink, and check that the inode is shared. Exit 0 and print `fs-check OK`, otherwise exit 1.
-- **`Dockerfile`:** `apt-get install libimage-exiftool-perl`; create the user from `UID`/`GID` args; `uv sync --frozen --no-dev`.
-- **`Makefile`:** add the targets listed in File Structure. They may be stubs until their task: `lint`, `fmt`, `test` (= `uv run pytest tests/unit tests/workflow`) and `fs-check` (= `docker compose run --rm worker python -m pixelmagic.fscheck`).
+- **`fscheck.ts`:** in a temp dir under `DATA_DIR`, run `link`, `rename`, and a symlink swap (`symlink` to `.current.tmp`, then `rename` over an existing symlink). Check that the inode is shared. Print `fs-check OK` and exit 0, otherwise exit 1.
+- **`Dockerfile`:** two-stage. The build stage runs `npm ci && npm run build`. The runtime stage is `node:24-bookworm-slim` plus `apt-get install perl`, runs `npm ci --omit=dev`, copies `dist/` and `migrations/`, and creates the user from `UID`/`GID`.
+- **`Makefile`:** `test` = `npm test`; `fs-check` = `docker compose run --rm worker node dist/fscheck.js`. Other targets may be stubs until their task.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2 and G3**
 
-Run: `uv run pytest tests/unit -v && uv run ruff check . && uv run mypy src`
-Expected: PASS, no lint or type errors
+Run: `npm test && npm run lint && npm run format:check && npm run typecheck && npm run build`
+Expected: PASS, no errors
 
 - [ ] **Step 5: Verify the guarantees on the real Docker Desktop bind mount**
 
-Run: `docker build -t pixelmagic . && docker run --rm -v "$PWD/data:/data" pixelmagic python -m pixelmagic.fscheck`
+Run: `mkdir -p data && docker build -t pixelmagic . && docker run --rm -v "$PWD/data:/data" pixelmagic node dist/fscheck.js`
 Expected: `fs-check OK`. If it fails, stop: the one-filesystem design does not hold on this mount.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add -A && git commit -m "feat: scaffold, config, filesystem primitives and fs-check"
+git add -A && git commit -m "feat: TypeScript scaffold, config, filesystem primitives and fs-check"
 ```
 
 ---
@@ -181,66 +204,66 @@ git add -A && git commit -m "feat: scaffold, config, filesystem primitives and f
 ### Task 2: Infrastructure, schema and migrations
 
 **Files:**
-- Create: `docker-compose.yml`, `docker-compose.test.yml`, `infra/postgres/init.sql`, `alembic.ini`, `migrations/env.py`, `migrations/versions/0001_initial.py`, `src/pixelmagic/db.py`, `tests/conftest.py`
-- Test: `tests/unit/test_schema.py`
+- Create: `docker-compose.yml`, `docker-compose.test.yml`, `infra/postgres/init.sql`, `migrations/0001_initial.sql`, `src/db.ts`, `tests/helpers/pg.ts`
+- Test: `tests/unit/schema.test.ts`
 
 **Interfaces:**
-- Consumes: `Settings.database_url`
+- Consumes: `Settings.databaseUrl`
 - Produces:
-  - Schema (spec §5 with the §12 revisions):
-    - `files(id, rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state, workflow_run_id UNIQUE, attempts, last_error, discovered_at, updated_at)`
+  - Schema (spec §5 with the §12 revisions; column names snake_case in SQL):
+    - `files(id bigserial, rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state, workflow_run_id UNIQUE, attempts, last_error, discovered_at, updated_at)`
     - `contents(sha256 PK, ext, kind, mime, size_bytes, width, height, phash, dhash, captured_at, subsec, camera, burst_uuid, live_content_id, duration_s, state, quarantine_reason, copy_group_id, copy_ambiguous bool default false, last_error, ingested_at, hashed_at, clustered_at, updated_at)`
     - `groups(id, kind, merged_into, similar_set_id)`
-    - `cluster_state(id=1, version bigint)`
-    - `scan_stats(id=1, pending_files, pending_bytes, scanned_at)`
+    - `cluster_state(id=1, version bigint default 0)` (seeded)
+    - `scan_stats(id=1, pending_files, pending_bytes, scanned_at)` (seeded)
     - `staging_builds(gen PK, watermark, built_at, entries)`
-  - CHECK constraints for every state column. The partial unique index is on `files(rel_path, size_bytes, mtime_ns) WHERE state IN ('DISCOVERED','CLAIMED')`.
-  - `db.create_pool(url: str, max_size: int = 10) -> AsyncConnectionPool`
-  - Fixture `pg` (session scope): a testcontainers Postgres 16 with `alembic upgrade head` applied, which yields a URL. Fixture `conn` (function scope) truncates every table.
+  - CHECK constraints for every state column. The partial unique index is on `files(rel_path, size_bytes, mtime_ns) WHERE state IN ('DISCOVERED','CLAIMED')`. An `updated_at` trigger is added on `files` and `contents`.
+  - `createPool(url: string, max?: number): pg.Pool`, with the int8 → `BigInt` parser installed
+  - `withTx<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>): Promise<T>`
+  - Test helper `startPg(): Promise<{ url: string; pool: pg.Pool; truncate(): Promise<void>; stop(): Promise<void> }>`: testcontainers `postgres:16` with migrations applied through the node-pg-migrate API. It is started once per test file in `beforeAll`.
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-async def test_partial_unique_allows_redrop_after_final(conn):
-    ins = "INSERT INTO files(rel_path, original_name, size_bytes, mtime_ns, state) VALUES ('a.jpg','a.jpg',1,1,%s)"
-    await conn.execute(ins, ("INGESTED",))
-    await conn.execute(ins, ("DISCOVERED",))           # allowed: the earlier row is final
-    with pytest.raises(psycopg.errors.UniqueViolation):
-        await conn.execute(ins, ("CLAIMED",))           # two non-final rows for one drop
-
-async def test_state_check_rejects_unknown(conn):
-    with pytest.raises(psycopg.errors.CheckViolation):
-        await conn.execute("INSERT INTO files(rel_path, original_name, size_bytes, mtime_ns, state) VALUES ('a','a',1,1,'NOPE')")
-
-async def test_bigint_holds_signed_phash(conn):
-    await conn.execute("INSERT INTO contents(sha256, ext, kind, mime, size_bytes, state, phash) VALUES (%s,'jpg','still','image/jpeg',1,'HASHED',%s)", ("0"*64, -(2**63)))
-    assert (await (await conn.execute("SELECT phash FROM contents")).fetchone())[0] == -(2**63)
-
-async def test_singletons_seeded(conn):
-    assert (await (await conn.execute("SELECT version FROM cluster_state WHERE id=1")).fetchone())[0] == 0
+```ts
+const ins = `INSERT INTO files(rel_path, original_name, size_bytes, mtime_ns, state) VALUES ('a.jpg','a.jpg',1,1,$1)`;
+test('partial unique allows re-drop after final', async () => {
+  await pool.query(ins, ['INGESTED']);
+  await pool.query(ins, ['DISCOVERED']);                                    // earlier row is final
+  await expect(pool.query(ins, ['CLAIMED'])).rejects.toMatchObject({ code: '23505' });
+});
+test('state CHECK rejects unknown', async () =>
+  expect(pool.query(ins, ['NOPE'])).rejects.toMatchObject({ code: '23514' }));
+test('bigint holds signed phash and parses as BigInt', async () => {
+  await pool.query(`INSERT INTO contents(sha256, ext, kind, mime, size_bytes, state, phash) VALUES ($1,'jpg','still','image/jpeg',1,'HASHED',$2)`,
+                   ['0'.repeat(64), (-(2n ** 63n)).toString()]);
+  expect((await pool.query('SELECT phash FROM contents')).rows[0].phash).toBe(-(2n ** 63n));
+});
+test('singletons seeded', async () =>
+  expect((await pool.query('SELECT version FROM cluster_state WHERE id=1')).rows[0].version).toBe(0n));
+test('updated_at trigger bumps', async () => { /* insert, update state, assert updated_at increased */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_schema.py -v`
-Expected: FAIL (`relation "files" does not exist`, or the fixture fails because migrations are missing)
+Run: `npx vitest run tests/unit/schema.test.ts`
+Expected: FAIL (`relation "files" does not exist`, or the helper is missing)
 
-- [ ] **Step 3: Implement the migration, `db.py` and compose**
+- [ ] **Step 3: Implement the migration, `db.ts`, the pg helper and compose**
 
 - **Compose:**
   - `postgres:16` with `init.sql`, a `pg_isready` healthcheck and the `pg-data` volume.
-  - `temporalio/admin-tools` one-shot that runs `temporal-sql-tool` setup and update-schema for `temporal` and `temporal_visibility` (Postgres plugin `postgres12`).
-  - `temporalio/server` (pin the current stable 1.x tag) with `DB=postgres12`, depending on the admin step completing successfully.
-  - `temporalio/ui`.
-  - `migrate` (the app image, `alembic upgrade head`).
-  - `worker` (`WORKER_QUEUES=main,io,cpu,cluster`) and `worker-extra` (`WORKER_QUEUES=main,io,cpu`, `deploy.replicas: 0`), both mounting `${DATA_DIR:-./data}:/data` and with `stop_grace_period: 60s`.
+  - `temporal-admin` (`temporalio/admin-tools`, one-shot) runs `temporal-sql-tool` create, setup-schema and update-schema for `temporal` and `temporal_visibility` using the `postgres12` plugin.
+  - `temporal` (`temporalio/server`, pinned to the current stable 1.x tag, `DB=postgres12`) depends on `temporal-admin` completing successfully.
+  - `temporal-ui`.
+  - `migrate` runs the app image with `npx node-pg-migrate up -m migrations`.
+  - `worker` (`WORKER_QUEUES=main,io,cpu,cluster`) and `worker-extra` (`WORKER_QUEUES=main,io,cpu`, `deploy.replicas: 0`) both mount `${DATA_DIR:-./data}:/data` and set `stop_grace_period: 60s`.
   - `grafana`. Every service gets `restart: unless-stopped`.
-- **`docker-compose.test.yml`:** remaps every port to `127.0.0.1::<port>`, which assigns ephemeral ports.
+- **`docker-compose.test.yml`:** remaps every port to `127.0.0.1::<port>`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G4**
 
-Run: `uv run pytest tests/unit/test_schema.py -v`
-Expected: PASS
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage`
+Expected: PASS, coverage thresholds met
 
 - [ ] **Step 5: Verify the stack comes up**
 
@@ -258,98 +281,102 @@ git add -A && git commit -m "feat: compose infrastructure, Temporal on Postgres,
 ### Task 3: Dedupe core — classify and capture-consistent grouping
 
 **Files:**
-- Create: `src/pixelmagic/classify.py`, `src/pixelmagic/grouping.py`
-- Test: `tests/unit/test_classify.py`, `tests/unit/test_grouping.py`
+- Create: `src/classify.ts`, `src/grouping.ts`, and `src/hashing.ts` (only `hamming`, `toSigned` and `toUnsigned` here; Task 4 adds the rest)
+- Test: `tests/unit/classify.test.ts`, `tests/unit/grouping.test.ts`, `tests/unit/hashing.test.ts`
 
 **Interfaces:**
 - Produces:
-  - `Facts`, a frozen dataclass: `sha256: str`, `phash: int`, `dhash: int` (both unsigned), `width: int`, `height: int`, `mime: str`, `captured_s: int | None` (epoch seconds), `subsec: str | None`, `camera: str | None`, `burst_uuid: str | None`
-  - `Thresholds`, a frozen dataclass with `look_alike_phash=8, look_alike_dhash=10, copy_phash=4, copy_dhash=6`
-  - `hamming(a: int, b: int) -> int`
-  - `looks_alike(a: Facts, b: Facts, t: Thresholds) -> bool`
-  - `capture_conflict(a: tuple[int, str | None], b: tuple[int, str | None]) -> bool`: true if the seconds differ, or if both subsecs are present and differ
-  - `classify(a: Facts, b: Facts, t: Thresholds) -> Literal["copy", "similar"]`, the spec §6.3 table, evaluated top to bottom
-  - `Grouper(new_id: Callable[[Literal["copy", "similar"]], int])` with methods:
-    - `load(sha256: str, copy_group: int, similar_set: int | None, capture: tuple[int, str | None] | None, ambiguous: bool) -> None`
-    - `add(f: Facts, matches: Sequence[tuple[str, Literal["copy", "similar"]]]) -> Assignment`
-    - `copy_partition() -> set[frozenset[str]]`
-    - `similar_partition() -> set[frozenset[str]]`: the connected components of the look-alike graph, including singleton copy groups
-  - `Assignment`, a frozen dataclass: `copy_group: int`, `ambiguous: bool`, `created: list[tuple[int, str]]`, `copy_merges: list[tuple[int, int]]` (loser, winner), `similar_merges: list[tuple[int, int]]`, `similar_links: dict[int, int]` (copy group → similar set)
+  - `hamming(a: bigint, b: bigint): number`, `toSigned(u: bigint): bigint`, `toUnsigned(s: bigint): bigint`
+  - `type CaptureKey = { s: number; sub: string | null }`
+  - `interface Facts`: `sha256: string`, `phash: bigint`, `dhash: bigint` (both unsigned), `width: number`, `height: number`, `mime: string`, `captured: CaptureKey | null`, `camera: string | null`, `burstUuid: string | null`
+  - `interface Thresholds`: `lookAlikePhash`, `lookAlikeDhash`, `copyPhash`, `copyDhash`; `DEFAULT_THRESHOLDS = { 8, 10, 4, 6 }`
+  - `looksAlike(a: Facts, b: Facts, t: Thresholds): boolean`
+  - `captureConflict(a: CaptureKey, b: CaptureKey): boolean`: true if the seconds differ, or if both `sub`s are non-null and differ
+  - `classify(a: Facts, b: Facts, t: Thresholds): 'copy' | 'similar'`, the spec §6.3 table, evaluated top to bottom
+  - `class Grouper { constructor(newId: (kind: 'copy' | 'similar') => number) }` with methods:
+    - `load(row: { sha256: string; copyGroup: number; similarSet: number | null; captured: CaptureKey | null; ambiguous: boolean }): void`
+    - `add(f: Facts, matches: ReadonlyArray<readonly [sha256: string, verdict: 'copy' | 'similar']>): Assignment`
+    - `copyPartition(): Set<string>`, where each element is a sorted, comma-joined set of SHA-256s
+    - `similarPartition(): Set<string>`: the connected components of the look-alike graph, including singletons
+  - `interface Assignment`: `copyGroup: number`, `ambiguous: boolean`, `created: Array<[id: number, kind: 'copy' | 'similar']>`, `copyMerges: Array<[loser: number, winner: number]>`, `similarMerges: Array<[loser: number, winner: number]>`, `similarLinks: Map<number, number>` (copy group → similar set)
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-T = Thresholds()
-def F(sha, ph=0, dh=0, w=4000, h=3000, mime="image/heic", t=1_600_000_000, sub="123", cam="Apple iPhone 12", burst=None):
-    return Facts(sha, ph, dh, w, h, mime, t, sub, cam, burst)
+```ts
+const T = DEFAULT_THRESHOLDS;
+const F = (sha: string, o: Partial<Facts> = {}): Facts => ({ sha256: sha, phash: 0n, dhash: 0n, width: 4000, height: 3000,
+  mime: 'image/heic', captured: { s: 1_600_000_000, sub: '123' }, camera: 'Apple iPhone 12', burstUuid: null, ...o });
+const NOEXIF = { captured: null, camera: null } as const;
 
-@pytest.mark.parametrize("a,b,want", [
-    (F("a", burst="B1"), F("b", ph=1, burst="B1"), "similar"),                     # same burst → never copy
-    (F("a"), F("b", t=1_600_000_001), "similar"),                                 # different second
-    (F("a"), F("b", sub="456"), "similar"),                                       # different subsec
-    (F("a"), F("b", cam="Canon"), "similar"),                                     # different camera
-    (F("a"), F("b", ph=3, w=2000, h=1500, mime="image/jpeg"), "copy"),            # same capture incl. subsec
-    (F("a", sub=None), F("b", sub=None, ph=2), "similar"),                        # same second, no subsec, same dims+mime
-    (F("a", sub=None), F("b", sub=None, ph=2, w=2000, h=1500), "copy"),           # same second, no subsec, resized
-    (F("a"), F("b", ph=4, dh=6, t=None, sub=None, cam=None), "copy"),             # EXIF-less export, tight match
-    (F("a"), F("b", ph=5, t=None, sub=None, cam=None), "similar"),                # EXIF-less, not tight enough
-    (F("a", t=None, sub=None, cam=None), F("b", ph=1, t=None, sub=None, cam=None), "similar"),  # both EXIF-less, same dims
-    (F("a", t=None, sub=None, cam=None), F("b", ph=1, w=10, h=10, t=None, sub=None, cam=None), "copy"),
-])
-def test_classify_table(a, b, want): assert classify(a, b, T) == want
+test.each<[Facts, Facts, 'copy' | 'similar']>([
+  [F('a', { burstUuid: 'B1' }), F('b', { phash: 1n, burstUuid: 'B1' }), 'similar'],                 // same burst → never copy
+  [F('a'), F('b', { captured: { s: 1_600_000_001, sub: '123' } }), 'similar'],                     // different second
+  [F('a'), F('b', { captured: { s: 1_600_000_000, sub: '456' } }), 'similar'],                     // different subsec
+  [F('a'), F('b', { camera: 'Canon' }), 'similar'],                                                // different camera
+  [F('a'), F('b', { phash: 0b111n, width: 2000, height: 1500, mime: 'image/jpeg' }), 'copy'],      // same capture incl. subsec
+  [F('a', { captured: { s: 1, sub: null } }), F('b', { phash: 3n, captured: { s: 1, sub: null } }), 'similar'], // no subsec, same dims+mime
+  [F('a', { captured: { s: 1, sub: null } }), F('b', { phash: 3n, width: 2000, height: 1500, captured: { s: 1, sub: null } }), 'copy'],
+  [F('a'), F('b', { phash: 0b1111n, dhash: 0b111111n, ...NOEXIF }), 'copy'],                     // EXIF-less export, tight
+  [F('a'), F('b', { phash: 0b11111n, ...NOEXIF }), 'similar'],                                     // EXIF-less, not tight
+  [F('a', NOEXIF), F('b', { phash: 1n, ...NOEXIF }), 'similar'],                                   // both EXIF-less, same dims
+  [F('a', NOEXIF), F('b', { phash: 1n, width: 10, height: 10, ...NOEXIF }), 'copy'],
+])('classify %#', (a, b, want) => expect(classify(a, b, T)).toBe(want));
 
-def test_looks_alike_bounds():
-    assert looks_alike(F("a"), F("b", ph=0b11111111, dh=0b1111111111), T)
-    assert not looks_alike(F("a"), F("b", ph=0b111111111), T)
+test('looksAlike bounds', () => {
+  expect(looksAlike(F('a'), F('b', { phash: 0xffn, dhash: 0x3ffn }), T)).toBe(true);
+  expect(looksAlike(F('a'), F('b', { phash: 0x1ffn }), T)).toBe(false);
+});
 
-def ids():
-    n = itertools.count(1); return lambda kind: next(n)
+test('toSigned/toUnsigned round-trip', () => fc.assert(fc.property(fc.bigUintN(64), (u) =>
+  toUnsigned(toSigned(u)) === u && toSigned(u) >= -(2n ** 63n) && toSigned(u) < 2n ** 63n)));
+test('hamming', () => { expect(hamming(0n, 2n ** 64n - 1n)).toBe(64); expect(hamming(0b1011n, 0b0001n)).toBe(2); });
 
-def test_bridge_export_never_merges_conflicting_shots():
-    for order in itertools.permutations(["A", "B", "X"]):
-        g = Grouper(ids()); facts = {"A": F("A", t=1), "B": F("B", t=2), "X": F("X", t=None, sub=None, cam=None)}
-        verdict = {frozenset("AX"): "copy", frozenset("BX"): "copy", frozenset("AB"): "similar"}
-        seen = []
-        for s in order:
-            a = g.add(facts[s], [(o, verdict[frozenset(s + o)]) for o in seen]); seen.append(s)
-        assert not any({"A", "B"} <= grp for grp in g.copy_partition())
-        assert g.similar_partition() == {frozenset("ABX")}
+test('bridge export never merges conflicting shots', () => {
+  const facts = { A: F('A', { captured: { s: 1, sub: '1' } }), B: F('B', { captured: { s: 2, sub: '1' } }), X: F('X', NOEXIF) };
+  const verdict = (p: string, q: string) => ([p, q].sort().join('') === 'AB' ? 'similar' : 'copy') as const;
+  for (const order of permutations(['A', 'B', 'X'] as const)) {
+    const g = new Grouper(counter()); const seen: string[] = [];
+    for (const s of order) { g.add(facts[s], seen.map((o) => [o, verdict(s, o)] as const)); seen.push(s); }
+    expect([...g.copyPartition()].some((grp) => grp.includes('A') && grp.includes('B'))).toBe(false);
+    expect(g.similarPartition()).toEqual(new Set(['A,B,X']));
+  }
+});
 
-@given(st.permutations(range(12)))
-def test_similar_partition_is_order_independent(perm):
-    # fixture graph: 12 contents, a fixed edge list with mixed copy/similar verdicts and no conflicts
-    assert run_grouper(EDGES, FACTS, perm).similar_partition() == EXPECTED_SIMILAR
-    assert run_grouper(EDGES, FACTS, perm).copy_partition() == EXPECTED_COPY
+test('partitions are order-independent without conflicts', () => fc.assert(fc.property(
+  fc.shuffledSubarray(range(12), { minLength: 12, maxLength: 12 }), (perm) => {
+    const g = runGrouper(EDGES, FACTS, perm);                    // fixture: 3 scenes × (burst pair + resized copy)
+    expect(g.similarPartition()).toEqual(EXPECTED_SIMILAR);
+    expect(g.copyPartition()).toEqual(EXPECTED_COPY);
+  })));
 ```
 
-`run_grouper`, `EDGES`, `FACTS` and the `EXPECTED_*` constants are defined in the test module: 12 shots in 3 scenes, where every scene has one burst pair and one resized copy.
+`permutations`, `counter`, `range`, `runGrouper`, `EDGES`, `FACTS` and the `EXPECTED_*` constants are defined in the test module.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_classify.py tests/unit/test_grouping.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/classify.test.ts tests/unit/grouping.test.ts tests/unit/hashing.test.ts`
+Expected: FAIL with `Cannot find module`
 
-- [ ] **Step 3: Implement `classify.py` and `grouping.py`**
+- [ ] **Step 3: Implement `classify.ts`, `grouping.ts` and the `hashing.ts` basics**
 
 `Grouper.add` follows this algorithm:
 
 ```
-copy_targets = distinct root copy groups of matches with verdict "copy"
-group = new copy group (or the first target if any)
-accepted = []
-for target in sorted(copy_targets, key=(-size, id)):        # deterministic: largest first
-    if captures(group) ∪ captures(target) ∪ {f.capture} has two conflicting keys: refuse → ambiguous = True; treat as "similar"
-    else: union(group, target) (smaller → larger; ties → lower id is winner) and record copy_merges
-similar_targets = root copy groups of every match (copy or similar) that is not in `group`
-if similar_targets: union all of their similar sets plus group's into one (creating one if none), record merges/links
+copyTargets = distinct root copy groups of matches with verdict 'copy'
+group = new copy group
+for target of copyTargets sorted by (size desc, id asc):
+    if captures(group) ∪ captures(target) ∪ {f.captured} holds two conflicting keys → refuse; ambiguous = true
+    else union(group, target): smaller → larger, tie → lower id wins; record copyMerges
+similarTargets = root copy groups of every match (copy or similar) not equal to `group`
+if any: union their similar sets and group's into one (create if none); record similarMerges / similarLinks
 ```
 
-Here `captures(group)` is the set of non-null capture keys of its members.
+Here `captures(group)` is the set of non-null capture keys of its members. `hamming` uses popcount on two 32-bit halves.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G4**
 
-Run: `uv run pytest tests/unit/test_classify.py tests/unit/test_grouping.py -v`
-Expected: PASS (hypothesis runs 100 permutations)
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage`
+Expected: PASS (fast-check runs 100 shuffles)
 
 - [ ] **Step 5: Commit**
 
@@ -362,64 +389,75 @@ git add -A && git commit -m "feat: copy/similar classifier and capture-consisten
 ### Task 4: Image decoding and perceptual hashes
 
 **Files:**
-- Create: `src/pixelmagic/hashing.py`, `tests/fixtures.py` (generates images in `tmp_path` with Pillow and pillow-heif)
-- Test: `tests/unit/test_hashing.py`
+- Create: `src/decode.ts`, `src/decodeWorker.ts`, `tests/helpers/images.ts` (sharp-generated JPEG/PNG/WebP fixtures, truncated and corrupt variants, a decompression-bomb PNG), `tests/helpers/corpus.ts` (`C(name)` path helper and `hasCorpus`)
+- Modify: `src/hashing.ts` (add `phashFromGray` and `dhashFromGray`)
+- Test: `tests/unit/hashing.test.ts`, `tests/unit/decode.test.ts`, `tests/unit/decode.corpus.test.ts`
 
 **Interfaces:**
+- Consumes: `hamming` (Task 3). RAW preview extraction calls `exiftool-vendored` directly (`extractPreview`); `MetadataReader` (Task 5) is not used here.
 - Produces:
-  - `to_signed(u: int) -> int`, `to_unsigned(s: int) -> int`
-  - `ImageFacts`, a frozen dataclass: `width: int`, `height: int`, `phash: int`, `dhash: int` (both unsigned), `mime: str`
-  - `QuarantineError(reason: str)` with reasons `decode_error | truncated | decompression_bomb | unsupported`
-  - `compute_image_facts(path: str) -> ImageFacts`. It is top-level and picklable, and runs in a pebble child.
+  - `phashFromGray(px: Uint8Array /* 32×32 */): bigint`, `dhashFromGray(px: Uint8Array /* 9×8 */): bigint`. Pure, row-major, first bit = MSB.
+  - `interface ImageFacts`: `width: number`, `height: number`, `phash: bigint`, `dhash: bigint`, `mime: string`
+  - `class QuarantineError extends Error { constructor(readonly reason: 'decode_error' | 'truncated' | 'decompression_bomb' | 'unsupported') }`
+  - `computeImageFacts(absPath: string, ext: string): Promise<ImageFacts>`
+  - `decodeWorker.ts` registers `{ computeImageFacts }` with `workerpool.worker`. Bigints cross the process boundary as decimal strings, and the caller converts them back.
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-@given(st.integers(0, 2**64 - 1))
-def test_signed_roundtrip(u): assert to_unsigned(to_signed(u)) == u and -(2**63) <= to_signed(u) < 2**63
+```ts
+test('phash of known gradient is stable (golden)', () => expect(phashFromGray(gradient32())).toBe(GOLDEN_PHASH));
+test('dhash bit order', () => expect(dhashFromGray(rampRows9x8())).toBe(0xffffffffffffffffn));
 
-def test_hash_stable_across_format_and_size(tmp_path):
-    jpg, png, heic, small = make_photo(tmp_path, "jpg"), make_photo(tmp_path, "png"), make_photo(tmp_path, "heic"), make_photo(tmp_path, "jpg", scale=0.5)
-    base = compute_image_facts(str(jpg))
-    for other in (png, heic, small):
-        assert hamming(base.phash, compute_image_facts(str(other)).phash) <= 4
+test('hash stable across format and size', async () => {
+  const d = await tmpDir(); const base = await computeImageFacts(await photo(d, 'jpg'), 'jpg');
+  for (const [p, e] of [[await photo(d, 'png'), 'png'], [await photo(d, 'jpg', { scale: 0.5 }), 'jpg'],
+                        [await photo(d, 'webp'), 'webp']] as const)
+    expect(hamming(base.phash, (await computeImageFacts(p, e)).phash)).toBeLessThanOrEqual(4);
+});
+test('EXIF orientation applied', async () => { /* same pixels saved rotated + orientation tag → hamming ≤ 4 */ });
+test('dimensions are oriented original, not the 32×32 resize', async () => {
+  const f = await computeImageFacts(await photo(await tmpDir(), 'jpg', { size: [4032, 3024] }), 'jpg');
+  expect([f.width, f.height]).toEqual([4032, 3024]);
+});
+test('different photos are far apart', async () => { /* two unrelated synthetic scenes → hamming > 16 */ });
+test.each([[truncatedJpeg, 'truncated'], [randomBytes, 'decode_error'], [bombPng, 'decompression_bomb']] as const)(
+  'quarantine reason %#', async (make, reason) =>
+    expect(computeImageFacts(await make(await tmpDir()), 'jpg')).rejects.toMatchObject({ reason }));
 
-def test_exif_orientation_is_applied(tmp_path):
-    assert hamming(compute_image_facts(str(make_photo(tmp_path, "jpg"))).phash,
-                   compute_image_facts(str(make_photo(tmp_path, "jpg", rotate_with_exif=True))).phash) <= 4
-
-def test_dimensions_are_original_not_draft(tmp_path):
-    f = compute_image_facts(str(make_photo(tmp_path, "jpg", size=(4032, 3024))))
-    assert (f.width, f.height) == (4032, 3024)
-
-@pytest.mark.parametrize("maker,reason", [(make_truncated_jpeg, "truncated"), (make_random_bytes, "decode_error"),
-                                          (make_bomb_png, "decompression_bomb")])
-def test_quarantine_reasons(tmp_path, maker, reason):
-    with pytest.raises(QuarantineError) as e: compute_image_facts(str(maker(tmp_path)))
-    assert e.value.reason == reason
+// decode.corpus.test.ts — describe.skipIf(!hasCorpus)
+test('HEIC and its JPG twin hash within copy range', async () =>
+  expect(hamming((await computeImageFacts(C('IMG_0034.HEIC'), 'heic')).phash,
+                 (await computeImageFacts(C('IMG_0034.JPG'), 'jpg')).phash)).toBeLessThanOrEqual(4));
+test('misnamed JPEG decodes', async () => expect((await computeImageFacts(C('IMG_E8719.HEIC'), 'jpg')).mime).toBe('image/jpeg'));
+test('TIF and BMP decode', async () => { /* VERP1022.TIF, AUXA4949.BMP */ });
+test('HEIC decode benchmark', async () => { /* 20 corpus HEICs, log ms/image; fail if median > 1500 ms */ });
 ```
+
+`GOLDEN_PHASH` is computed once from the first correct implementation, cross-checked by hand against the algorithm in spec §6.2, and committed. It locks the bit layout.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_hashing.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/hashing.test.ts tests/unit/decode.test.ts`
+Expected: FAIL with `Cannot find module` / `phashFromGray is not a function`
 
-- [ ] **Step 3: Implement `compute_image_facts`** following spec §6.2
+- [ ] **Step 3: Implement `phashFromGray`, `dhashFromGray` and `computeImageFacts`**
 
-- `Image.MAX_IMAGE_PIXELS = 200_000_000`. Map `DecompressionBombError` to `decompression_bomb`.
-- Map an `OSError` containing "truncated" to `truncated`, and `UnidentifiedImageError` to `decode_error`.
-- For RAW extensions use `rawpy.imread(...).extract_thumb()`.
-- Read the original size **before** `draft()`.
+Follow spec §6.2:
+- `sharp(input, { limitInputPixels: 200_000_000, failOn: 'truncated' }).rotate()`, then `.greyscale().resize(32, 32, { fit: 'fill' }).raw()` for pHash and `resize(9, 8)` for dHash.
+- HEIC/HEIF: `heic-decode` → `sharp(data, { raw: { width, height, channels: 4 } })`.
+- RAW extensions: `exiftool.extractPreview` into a temp file.
+- Map sharp errors by message: "pixel limit" → `decompression_bomb`; "Premature end" or "truncated" → `truncated`; "unsupported image format" → `decode_error`. Unknown extensions/MIME → `unsupported`.
+- DCT: a straightforward separable 2-D DCT-II over 32×32 is fine.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G5**
 
-Run: `uv run pytest tests/unit/test_hashing.py -v`
-Expected: PASS
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus`
+Expected: PASS. Record the benchmark's median HEIC ms in the report.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add -A && git commit -m "feat: draft-mode decode with pHash/dHash and quarantine reasons"
+git add -A && git commit -m "feat: sharp/heic decode with pHash/dHash and quarantine reasons"
 ```
 
 ---
@@ -427,65 +465,66 @@ git add -A && git commit -m "feat: draft-mode decode with pHash/dHash and quaran
 ### Task 5: Metadata via exiftool
 
 **Files:**
-- Create: `src/pixelmagic/metadata.py`
-- Test: `tests/unit/test_metadata.py`
+- Create: `src/metadata.ts`
+- Test: `tests/unit/metadata.test.ts`, `tests/unit/metadata.corpus.test.ts`
 
 **Interfaces:**
 - Produces:
-  - `Metadata`, a frozen dataclass: `file_type: str`, `mime: str`, `ext: str`, `kind: Literal["still", "motion", "other"]`, `captured_at: datetime | None` (tz-aware), `subsec: str | None`, `camera: str | None`, `burst_uuid: str | None`, `live_content_id: str | None`, `duration_s: float | None`
-  - `parse_metadata(tags: dict[str, Any]) -> Metadata`, which is pure. Its keys are exiftool `-G -n` names: `File:FileType`, `File:MIMEType`, `File:FileTypeExtension`, `EXIF:DateTimeOriginal`, `EXIF:OffsetTimeOriginal`, `EXIF:SubSecTimeOriginal`, `EXIF:Make`, `EXIF:Model`, `MakerNotes:BurstUUID`, `MakerNotes:ContentIdentifier`, `QuickTime:ContentIdentifier`, `QuickTime:Duration` and `QuickTime:CreateDate`.
-  - `ExifTool`, a context manager wrapping one `exiftool -stay_open` process, with `read(path: Path) -> Metadata`
+  - `interface Metadata`: `fileType: string`, `mime: string`, `ext: string`, `kind: 'still' | 'motion' | 'other'`, `capturedAt: Date | null`, `subsec: string | null`, `camera: string | null`, `burstUuid: string | null`, `liveContentId: string | null`, `durationS: number | null`
+  - `parseMetadata(tags: Record<string, unknown>): Metadata`, which is pure. Its keys are exiftool `-G -n` names: `File:FileType`, `File:MIMEType`, `File:FileTypeExtension`, `EXIF:DateTimeOriginal`, `EXIF:OffsetTimeOriginal`, `EXIF:SubSecTimeOriginal`, `EXIF:Make`, `EXIF:Model`, `MakerNotes:BurstUUID`, `MakerNotes:ContentIdentifier`, `QuickTime:ContentIdentifier`, `QuickTime:Duration` and `QuickTime:CreateDate`.
+  - `class MetadataReader` with methods `read(absPath: string): Promise<Metadata>` (exiftool-vendored raw read with `-G -n`) and `end(): Promise<void>`
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-def test_heic_still():
-    m = parse_metadata({"File:FileType": "HEIC", "File:MIMEType": "image/heic", "File:FileTypeExtension": "HEIC",
-        "EXIF:DateTimeOriginal": "2021:10:03 14:02:11", "EXIF:OffsetTimeOriginal": "-07:00",
-        "EXIF:SubSecTimeOriginal": "482", "EXIF:Make": "Apple", "EXIF:Model": "iPhone 12",
-        "MakerNotes:BurstUUID": "B-1", "MakerNotes:ContentIdentifier": "C-1"})
-    assert (m.kind, m.ext, m.subsec, m.camera, m.burst_uuid, m.live_content_id) == ("still", "heic", "482", "Apple iPhone 12", "B-1", "C-1")
-    assert m.captured_at == datetime(2021, 10, 3, 21, 2, 11, tzinfo=UTC)
+```ts
+const heic = { 'File:FileType': 'HEIC', 'File:MIMEType': 'image/heic', 'File:FileTypeExtension': 'HEIC',
+  'EXIF:DateTimeOriginal': '2021:10:03 14:02:11', 'EXIF:OffsetTimeOriginal': '-07:00', 'EXIF:SubSecTimeOriginal': 482,
+  'EXIF:Make': 'Apple', 'EXIF:Model': 'iPhone 12', 'MakerNotes:BurstUUID': 'B-1', 'MakerNotes:ContentIdentifier': 'C-1' };
+test('HEIC still', () => {
+  const m = parseMetadata(heic);
+  expect([m.kind, m.ext, m.subsec, m.camera, m.burstUuid, m.liveContentId]).toEqual(['still', 'heic', '482', 'Apple iPhone 12', 'B-1', 'C-1']);
+  expect(m.capturedAt?.toISOString()).toBe('2021-10-03T21:02:11.000Z');
+});
+test('camera dedupes make', () => expect(parseMetadata({ ...heic, 'EXIF:Model': 'Apple iPhone 12' }).camera).toBe('Apple iPhone 12'));
+test('misnamed JPEG uses content type', () =>
+  expect(parseMetadata({ 'File:FileType': 'JPEG', 'File:MIMEType': 'image/jpeg', 'File:FileTypeExtension': 'JPG' }).ext).toBe('jpg'));
+test('Live Photo MOV', () => {
+  const m = parseMetadata({ 'File:FileType': 'MOV', 'File:MIMEType': 'video/quicktime', 'File:FileTypeExtension': 'MOV',
+                            'QuickTime:ContentIdentifier': 'C-1', 'QuickTime:Duration': 2.97 });
+  expect([m.kind, m.liveContentId, m.durationS]).toEqual(['motion', 'C-1', 2.97]);
+});
+test('AAE sidecar and empty tags are other', () => {
+  expect(parseMetadata({ 'File:FileType': 'XMP', 'File:MIMEType': 'application/rdf+xml', 'File:FileTypeExtension': 'XMP' }).kind).toBe('other');
+  expect(parseMetadata({}).kind).toBe('other');
+});
+test('no offset is treated as UTC', () => expect(parseMetadata({ 'File:FileType': 'JPEG', 'File:MIMEType': 'image/jpeg',
+  'File:FileTypeExtension': 'JPG', 'EXIF:DateTimeOriginal': '2000:01:01 00:00:00' }).capturedAt?.toISOString()).toBe('2000-01-01T00:00:00.000Z'));
+test('zero/invalid date becomes null', () => { /* '0000:00:00 00:00:00' → null */ });
 
-def test_misnamed_jpeg_uses_content_type():
-    assert parse_metadata({"File:FileType": "JPEG", "File:MIMEType": "image/jpeg", "File:FileTypeExtension": "JPG"}).ext == "jpg"
-
-def test_live_mov():
-    m = parse_metadata({"File:FileType": "MOV", "File:MIMEType": "video/quicktime", "File:FileTypeExtension": "MOV",
-                        "QuickTime:ContentIdentifier": "C-1", "QuickTime:Duration": 2.97})
-    assert (m.kind, m.live_content_id, m.duration_s) == ("motion", "C-1", 2.97)
-
-def test_aae_and_unknown_are_other():
-    assert parse_metadata({"File:FileType": "XMP", "File:MIMEType": "application/rdf+xml", "File:FileTypeExtension": "XMP"}).kind == "other"
-    assert parse_metadata({}).kind == "other"
-
-def test_no_offset_is_treated_as_utc():
-    assert parse_metadata({"File:FileType": "JPEG", "File:MIMEType": "image/jpeg", "File:FileTypeExtension": "JPG",
-        "EXIF:DateTimeOriginal": "2000:01:01 00:00:00"}).captured_at == datetime(2000, 1, 1, tzinfo=UTC)
-
-@pytest.mark.corpus
-@pytest.mark.parametrize("name,kind,ext", [("IMG_E8719.HEIC", "still", "jpg"), ("IMG_0004.MOV", "motion", "mov"),
-                                            ("VERP1022.TIF", "still", "tif"), ("AUXA4949.BMP", "still", "bmp")])
-def test_real_files(corpus_dir, name, kind, ext):
-    with ExifTool() as et: m = et.read(corpus_dir / name)
-    assert (m.kind, m.ext) == (kind, ext)
+// metadata.corpus.test.ts
+test.each([['IMG_E8719.HEIC', 'still', 'jpg'], ['IMG_0004.MOV', 'motion', 'mov'], ['VERP1022.TIF', 'still', 'tif'],
+           ['AUXA4949.BMP', 'still', 'bmp']])('real %s', async (n, kind, ext) => {
+  const m = await reader.read(C(n)); expect([m.kind, m.ext]).toEqual([kind, ext]);
+});
+test('AAE is other', async () => expect((await reader.read(C('IMG_0066.AAE'))).kind).toBe('other'));
+test('a Live Photo pair shares a content id', async () => { /* IMG_2834 1.HEIC and IMG_2834 1.MOV */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_metadata.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/metadata.test.ts`
+Expected: FAIL with `Cannot find module`
 
-- [ ] **Step 3: Implement `metadata.py`**
+- [ ] **Step 3: Implement `metadata.ts`**
 
 - `kind` is `still` when the MIME type is `image/*` and FileType ∈ {JPEG, PNG, HEIC, HEIF, WEBP, TIFF, GIF, BMP, DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF}. It is `motion` when the MIME type is `video/*`. Otherwise it is `other`.
-- `camera` is `f"{Make} {Model}"` with the Make de-duplicated.
-- The `corpus_dir` fixture skips the test when `test-automation/sample-images` is absent.
+- `subsec` is the string form of the tag.
+- `ext` is `FileTypeExtension` lowercased, with `jpeg` normalised to `jpg`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G5**
 
-Run: `uv run pytest tests/unit/test_metadata.py -v`
-Expected: PASS (corpus tests pass on this Mac)
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus`
+Expected: PASS
 
 - [ ] **Step 5: Commit**
 
@@ -495,85 +534,84 @@ git add -A && git commit -m "feat: exiftool metadata with content-based type det
 
 ---
 
-### Task 6: `ingest_file` activity — the vault crash protocol
+### Task 6: `ingestFile` activity — the vault crash protocol
 
 **Files:**
-- Create: `src/pixelmagic/types.py`, `src/pixelmagic/activities/__init__.py` (an `Activities` class holding `pool`, `settings`, `layout`, `exiftool`, `client`), `src/pixelmagic/activities/ingest.py`
-- Test: `tests/unit/test_ingest.py`
+- Create: `src/types.ts`, `src/activities/index.ts`, `src/activities/ingest.ts`, `tests/helpers/activityEnv.ts`
+- Test: `tests/unit/ingest.test.ts`
 
 **Interfaces:**
-- Consumes: `DataLayout`, `link_into_vault`, `sha256_stream`, `vault_rel` (Task 1); `ExifTool.read` (Task 5); the schema (Task 2)
+- Consumes: `DataLayout`, `linkIntoVault`, `sha256File`, `vaultRel` (Task 1); `withTx` (Task 2); `MetadataReader` (Task 5)
 - Produces:
-  - `FileRef(rel_path: str, size: int, mtime_ns: int)`
-  - `IngestResult(file_id: int, sha256: str | None, state: Literal["INGESTED", "COPY", "QUARANTINED"], is_new: bool, kind: str | None)`
-  - `Activities.ingest_file(ref: FileRef) -> IngestResult`, an `@activity.defn` that heartbeats on every chunk. It reads `activity.info().workflow_run_id`.
+  - In `types.ts`:
+    - `interface FileRef { relPath: string; size: string; mtimeNs: string }`
+    - `interface IngestResult { fileId: string; sha256: string | null; ext: string | null; state: 'INGESTED' | 'COPY' | 'QUARANTINED'; isNew: boolean; kind: 'still' | 'motion' | 'other' | null }`
+  - In `activities/index.ts`:
+    - `interface Deps { pool: pg.Pool; settings: Settings; layout: DataLayout; metadata: MetadataReader; temporal?: Client; checkpoint?: (name: string) => void }`
+    - `createActivities(deps: Deps)`, which returns `{ ingestFile, … }` and gains members in later tasks
+    - `type Activities = ReturnType<typeof createActivities>`
+  - `ingestFile(ref: FileRef): Promise<IngestResult>`. It calls `heartbeat()` on every chunk, reads `Context.current().info.workflowExecution.runId`, and calls `deps.checkpoint?.(name)` at `'claim'`, `'link'` and `'copies_rename'` (a test seam).
+  - Helper `runActivity(fn, args, { runId })`, using `MockActivityEnvironment` with the overridden `workflowExecution`
 
 - [ ] **Step 1: Write the failing tests**
 
-The tests call `acts.ingest_file` through `ActivityEnvironment`, with `info` overridden to set `workflow_run_id`. A `drop(name, data)` helper writes into the drop zone and returns its `FileRef`.
+`drop(name, bytes, mtimeNs?)` writes into the drop zone and returns its `FileRef`. `crashAt(name)` builds Deps whose `checkpoint` throws `SimulatedCrash` once at that name.
 
-```python
-async def test_new_file_lands_in_vault(acts, layout, conn):
-    r = await run(acts.ingest_file, drop("IMG 1.jpg", JPEG_A), run_id="r1")
-    assert (r.state, r.is_new, r.kind) == ("INGESTED", True, "still")
-    v = layout.root / vault_rel(r.sha256, "jpg")
-    assert v.exists() and oct(v.stat().st_mode)[-3:] == "444" and not any(layout.claimed.iterdir())
-    assert not (layout.dropzone / "IMG 1.jpg").exists()
-
-async def test_byte_identical_second_file_is_copy(acts, layout):
-    a = await run(acts.ingest_file, drop("a.jpg", JPEG_A), run_id="r1")
-    b = await run(acts.ingest_file, drop("b.jpg", JPEG_A), run_id="r2")
-    assert (b.state, b.is_new, b.sha256) == ("COPY", False, a.sha256)
-    assert (layout.vault_copies / f"{b.file_id}.jpg").exists()
-
-async def test_resume_after_claim_before_commit(acts, layout, conn):
-    ref = drop("a.jpg", JPEG_A); crash_after(acts, "claim")           # raises after rename, before CLAIMED commit
-    with pytest.raises(SimulatedCrash): await run(acts.ingest_file, ref, run_id="r1")
-    r = await run(acts.ingest_file, ref, run_id="r1")
-    assert r.state == "INGESTED" and await count(conn, "files") == 1
-
-async def test_resume_after_vault_link_before_commit(acts, layout, conn): ...  # crash_after("link") → ALREADY_LINKED path → INGESTED
-async def test_resume_after_copies_rename_before_commit(acts, layout, conn): ...  # crash_after("copies_rename") → COPY
-
-async def test_rerun_after_commit_returns_same_outcome(acts, conn):
-    ref = drop("a.jpg", JPEG_A)
-    first = await run(acts.ingest_file, ref, run_id="r1")
-    assert await run(acts.ingest_file, ref, run_id="r1") == first and await count(conn, "files") == 1
-
-async def test_redrop_after_ingest_becomes_copy(acts, conn):
-    ref = drop("a.jpg", JPEG_A); await run(acts.ingest_file, ref, run_id="r1")
-    ref2 = drop("a.jpg", JPEG_A, mtime_ns=ref.mtime_ns)               # same path, size, mtime
-    r = await run(acts.ingest_file, ref2, run_id="r2")
-    assert r.state == "COPY" and await count(conn, "files") == 2
-
-async def test_vanished_file_is_quarantined(acts):
-    r = await run(acts.ingest_file, FileRef("gone.jpg", 1, 1), run_id="r1")
-    assert (r.state, r.sha256) == ("QUARANTINED", None)
-
-async def test_mov_is_motion_and_not_new_still(acts):
-    r = await run(acts.ingest_file, drop("IMG_1.MOV", MOV_BYTES), run_id="r1")
-    assert (r.state, r.kind) == ("INGESTED", "motion")
+```ts
+test('new file lands in vault, read-only, drop zone and claimed empty', async () => {
+  const r = await runActivity(acts.ingestFile, [await drop('IMG 1.jpg', JPEG_A)], { runId: 'r1' });
+  expect([r.state, r.isNew, r.kind]).toEqual(['INGESTED', true, 'still']);
+  const v = join(layout.root, vaultRel(r.sha256!, 'jpg'));
+  expect((await stat(v)).mode & 0o777).toBe(0o444);
+  expect(await readdir(layout.claimed)).toEqual([]); expect(existsSync(join(layout.dropzone, 'IMG 1.jpg'))).toBe(false);
+});
+test('byte-identical second file is COPY', async () => {
+  const a = await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
+  const b = await runActivity(acts.ingestFile, [await drop('b.jpg', JPEG_A)], { runId: 'r2' });
+  expect([b.state, b.isNew, b.sha256]).toEqual(['COPY', false, a.sha256]);
+  expect(existsSync(join(layout.vaultCopies, `${b.fileId}.jpg`))).toBe(true);
+});
+test.each(['claim', 'link', 'copies_rename'])('resume after crash at %s', async (point) => {
+  if (point === 'copies_rename') await runActivity(acts.ingestFile, [await drop('first.jpg', JPEG_A)], { runId: 'r0' });
+  const ref = await drop('a.jpg', JPEG_A); const crashing = createActivities(crashAt(point));
+  await expect(runActivity(crashing.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(SimulatedCrash);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r.state).toBe(point === 'copies_rename' ? 'COPY' : 'INGESTED');
+  expect(await count('files', `rel_path = 'a.jpg'`)).toBe(1); expect(await readdir(layout.claimed)).toEqual([]);
+});
+test('re-run after commit returns same outcome', async () => {
+  const ref = await drop('a.jpg', JPEG_A); const first = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(first); expect(await count('files')).toBe(1);
+});
+test('re-drop after ingest becomes COPY', async () => {
+  const ref = await drop('a.jpg', JPEG_A); await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  const ref2 = await drop('a.jpg', JPEG_A, BigInt(ref.mtimeNs));
+  expect((await runActivity(acts.ingestFile, [ref2], { runId: 'r2' })).state).toBe('COPY'); expect(await count('files')).toBe(2);
+});
+test('vanished file is quarantined', async () =>
+  expect(await runActivity(acts.ingestFile, [{ relPath: 'gone.jpg', size: '1', mtimeNs: '1' }], { runId: 'r1' }))
+    .toMatchObject({ state: 'QUARANTINED', sha256: null }));
+test('MOV is motion', async () => expect((await runActivity(acts.ingestFile, [await drop('IMG_1.MOV', MOV_BYTES)], { runId: 'r1' })).kind).toBe('motion'));
+test('heartbeats during hashing', async () => { /* 3 MiB file → MockActivityEnvironment heartbeat listener fires ≥ 3× */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_ingest.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/ingest.test.ts`
+Expected: FAIL with `Cannot find module`
 
-- [ ] **Step 3: Implement `ingest_file`** following spec §6.1 and §12 R1, in this order
+- [ ] **Step 3: Implement `ingestFile`** following spec §6.1 and §12 R1, in this order
 
-1. Look up the row by `workflow_run_id`. If it is final, return its stored outcome. Otherwise `INSERT … ON CONFLICT (rel_path, size_bytes, mtime_ns) WHERE state IN ('DISCOVERED','CLAIMED') DO UPDATE SET workflow_run_id = EXCLUDED.workflow_run_id RETURNING id`.
-2. Claim with `rename` (resume branches as in §6.1: claimed exists → continue; `.copies/<id>.*` exists → commit COPY; neither → QUARANTINED `vanished`). Hash, then commit `CLAIMED, sha256, ext`.
-3. Read metadata from the claimed file.
-4. `link_into_vault`. On `EXISTS_OTHER`, rename to `vault/.copies/<id>.<ext>`.
-5. In one transaction, `INSERT contents ON CONFLICT DO NOTHING` (state `INGESTED`, kind from the metadata) and update `files.state`.
-6. Unlink the claimed file. `chmod 0444` the vault file.
+1. Look up the row by `workflow_run_id`. If it is final, return the stored outcome. Otherwise `INSERT … ON CONFLICT (rel_path, size_bytes, mtime_ns) WHERE state IN ('DISCOVERED','CLAIMED') DO UPDATE SET workflow_run_id = EXCLUDED.workflow_run_id RETURNING id`.
+2. **Claim** with `rename`. If the source is missing: claimed exists → continue; `.copies/<id>.*` exists → commit COPY; neither → QUARANTINED `vanished`. Run `checkpoint('claim')`. Hash, then commit `CLAIMED, sha256`.
+3. Read metadata from the claimed file. Commit `ext`.
+4. `linkIntoVault`, then `checkpoint('link')`. On `EXISTS_OTHER`, `rename` to `.copies/<id>.<ext>`, then `checkpoint('copies_rename')`.
+5. In one transaction, `INSERT INTO contents … ON CONFLICT DO NOTHING` (state `INGESTED`, including the metadata columns) and update `files.state`.
+6. `unlink` the claimed file if it still exists. `chmod 0o444` the vault file.
 
-`crash_after` is a test seam: `Activities._checkpoint(name)`, which is a no-op in production.
+- [ ] **Step 4: Run gates G2–G5**
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `uv run pytest tests/unit/test_ingest.py -v`
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -587,74 +625,76 @@ git add -A && git commit -m "feat: idempotent ingest with crash-safe vault proto
 ### Task 7: Hash and cluster activities
 
 **Files:**
-- Create: `src/pixelmagic/index.py`, `src/pixelmagic/activities/hashing.py`, `src/pixelmagic/activities/cluster.py`
-- Test: `tests/unit/test_index.py`, `tests/unit/test_hash_cluster_activities.py`
+- Create: `src/hashIndex.ts`, `src/activities/hashing.ts`, `src/activities/cluster.ts`
+- Modify: `src/activities/index.ts` (register the new activities; create the decode pool `workerpool.pool(decodeWorkerPath, { workerType: 'process', maxWorkers: settings.cpuConcurrency })`), `src/types.ts`
+- Test: `tests/unit/hashIndex.test.ts`, `tests/unit/hashClusterActivities.test.ts`
 
 **Interfaces:**
-- Consumes: `compute_image_facts`, `QuarantineError`, `to_signed` (Task 4); `classify`, `Grouper`, `Thresholds` (Task 3); `vault_rel` (Task 1)
+- Consumes: `computeImageFacts` via the pool, `QuarantineError` (Task 4); `classify`, `Grouper`, `DEFAULT_THRESHOLDS` (Task 3); `vaultRel` (Task 1)
 - Produces:
-  - `DecodeResult(facts: ImageFacts | None, quarantine_reason: str | None)`
-  - `Activities.decode_content(sha256: str, ext: str) -> DecodeResult`. Queue `cpu`, no database access. It uses a pebble `ProcessPool(max_workers=cpu_concurrency)` with `timeout=decode_timeout_s`. A `TimeoutError` or `ProcessExpired` raises `ApplicationError("…", type="Poison")`, which is retryable.
-  - `Activities.record_hash(sha256: str, result: DecodeResult) -> str`. Queue `io`; returns `"HASHED"` or `"QUARANTINED"`. It is idempotent: `UPDATE … WHERE state = 'INGESTED'`.
-  - `Activities.mark_failed(sha256: str, error: str) -> None`, which sets `contents.state = 'FAILED'` and `last_error`
-  - `HashIndex` with methods `clear()`, `append(rows: Sequence[Facts], groups: Sequence[int])` and `matches(f: Facts, t: Thresholds) -> list[Facts]` (uses `np.bitwise_count`)
-  - `Activities.cluster_content(sha256: str) -> int` (returns the copy group id). Queue `cluster`. It holds `pg_advisory_xact_lock(hashtext('pm.cluster'))`. It reloads `HashIndex` and `Grouper` from the database when `cluster_state.version` ≠ the cached version, and increments the version in the same transaction as its writes. It is idempotent: if the state is already `CLUSTERED`, it returns the existing group.
+  - In `types.ts`: `interface DecodeResult { facts: { width: number; height: number; phash: string; dhash: string; mime: string } | null; quarantineReason: string | null }`
+  - `decodeContent(sha256: string, ext: string): Promise<DecodeResult>`. Queue `cpu`, no database access. It runs `pool.exec('computeImageFacts', [abs, ext]).timeout(decodeTimeoutS * 1000)`. A timeout or child crash throws `ApplicationFailure.retryable(msg, 'Poison')`. A `QuarantineError` returns `{ facts: null, quarantineReason }`.
+  - `recordHash(sha256: string, r: DecodeResult): Promise<'HASHED' | 'QUARANTINED'>`. Idempotent (`UPDATE … WHERE state = 'INGESTED'`; returns the current state when nothing changed).
+  - `markFailed(sha256: string, error: string): Promise<void>`, which sets `contents.state = 'FAILED'` and `last_error`
+  - `class HashIndex` with methods `clear(): void`, `append(rows: readonly Facts[], groups: readonly number[]): void` and `matches(f: Facts, t: Thresholds): Facts[]`. Hashes are stored as hi/lo `Uint32Array` pairs that grow by doubling.
+  - `clusterContent(sha256: string): Promise<number>` (returns the copy group id). Queue `cluster`. It holds `pg_advisory_xact_lock(hashtext('pm.cluster'))`. It reloads `HashIndex` and `Grouper` from the database when `cluster_state.version` ≠ the cached version, and increments `version` in the same transaction. If the state is already `CLUSTERED`, it returns the existing group.
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-def test_index_matches_within_thresholds():
-    idx = HashIndex(); idx.append([F("a", ph=0), F("b", ph=0b111111111)], [1, 2])
-    assert [m.sha256 for m in idx.matches(F("n", ph=0), T)] == ["a"]
-
-async def test_decode_poison_on_timeout(acts, monkeypatch):
-    monkeypatch.setattr(acts.settings, "decode_timeout_s", 1)
-    with pytest.raises(ApplicationError) as e: await run(acts.decode_content, *vault_hanging_file(acts))  # fixture: an fn that sleeps
-    assert e.value.type == "Poison" and not e.value.non_retryable
-
-async def test_record_hash_is_idempotent(acts, conn):
-    sha = await seed_content(conn, state="INGESTED")
-    assert await run(acts.record_hash, sha, DecodeResult(FACTS, None)) == "HASHED"
-    assert await run(acts.record_hash, sha, DecodeResult(FACTS, None)) == "HASHED"
-
-async def test_record_hash_quarantines(acts, conn):
-    sha = await seed_content(conn, state="INGESTED")
-    assert await run(acts.record_hash, sha, DecodeResult(None, "truncated")) == "QUARANTINED"
-
-async def test_cluster_copy_and_burst(acts, conn):
-    a, copy, burst = await seed_hashed(conn, F("a"), F("c", ph=2, w=2000, h=1500, mime="image/jpeg"), F("b", ph=1, sub="999"))
-    ga, gc, gb = [await run(acts.cluster_content, s) for s in (a, copy, burst)]
-    assert ga == gc != gb
-    assert await similar_set_of(conn, ga) == await similar_set_of(conn, gb) is not None
-
-async def test_cluster_reloads_when_another_worker_wrote(acts, acts2, conn):
-    a, b = await seed_hashed(conn, F("a"), F("c", ph=2, w=2000, h=1500, mime="image/jpeg"))
-    assert await run(acts.cluster_content, a) == await run(acts2.cluster_content, b)      # acts2 has a stale cache
-
-async def test_cluster_is_idempotent(acts, conn):
-    (a,) = await seed_hashed(conn, F("a"))
-    assert await run(acts.cluster_content, a) == await run(acts.cluster_content, a)
+```ts
+test('index matches within thresholds', () => {
+  const idx = new HashIndex(); idx.append([F('a'), F('b', { phash: 0x1ffn })], [1, 2]);
+  expect(idx.matches(F('n'), T).map((m) => m.sha256)).toEqual(['a']);
+});
+test('index grows past initial capacity', () => { /* append 10_000 rows; matches still exact */ });
+test('decodeContent: timeout is retryable Poison', async () => {
+  const acts = createActivities({ ...deps, settings: { ...deps.settings, decodeTimeoutS: 1 } });
+  await expect(runActivity(acts.decodeContent, await vaultHangingFile())).rejects.toMatchObject({ type: 'Poison', nonRetryable: false });
+});
+test('decodeContent: corrupt file returns quarantine reason', async () =>
+  expect(await runActivity(acts.decodeContent, await vaultFile(truncatedJpeg))).toEqual({ facts: null, quarantineReason: 'truncated' }));
+test('recordHash is idempotent', async () => {
+  const sha = await seedContent({ state: 'INGESTED' });
+  expect(await runActivity(acts.recordHash, [sha, OK])).toBe('HASHED'); expect(await runActivity(acts.recordHash, [sha, OK])).toBe('HASHED');
+});
+test('recordHash quarantines', async () =>
+  expect(await runActivity(acts.recordHash, [await seedContent({ state: 'INGESTED' }), { facts: null, quarantineReason: 'truncated' }])).toBe('QUARANTINED'));
+test('cluster: copy joins, burst frame gets own group in same similar set', async () => {
+  const [a, c, b] = await seedHashed(F('a'), F('c', { phash: 3n, width: 2000, height: 1500, mime: 'image/jpeg' }),
+                                     F('b', { phash: 1n, captured: { s: 1_600_000_000, sub: '999' } }));
+  const [ga, gc, gb] = [await cluster(a), await cluster(c), await cluster(b)];
+  expect(ga).toBe(gc); expect(gb).not.toBe(ga);
+  expect(await similarSetOf(ga)).not.toBeNull(); expect(await similarSetOf(ga)).toBe(await similarSetOf(gb));
+});
+test('cluster reloads when another worker wrote', async () => {
+  const [a, c] = await seedHashed(F('a'), F('c', { phash: 3n, width: 2000, height: 1500, mime: 'image/jpeg' }));
+  expect(await runActivity(acts.clusterContent, [a])).toBe(await runActivity(createActivities(deps).clusterContent, [c]));
+});
+test('cluster is idempotent', async () => { const [a] = await seedHashed(F('a')); expect(await cluster(a)).toBe(await cluster(a)); });
+test('concurrent clusterContent calls serialise', async () => { /* Promise.all of 2 look-alike copies on 2 Activities objects → one group */ });
 ```
+
+`vaultHangingFile()` uses an injected `decodeWorkerPath` pointing to a test worker whose `computeImageFacts` never resolves.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_index.py tests/unit/test_hash_cluster_activities.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/hashIndex.test.ts tests/unit/hashClusterActivities.test.ts`
+Expected: FAIL with `Cannot find module`
 
 - [ ] **Step 3: Implement the activities**
 
-`cluster_content` persists the `Assignment` from Task 3 like this:
-- insert the created groups
+`clusterContent` persists the `Assignment` from Task 3 like this:
+- insert the `created` groups
 - `UPDATE groups SET merged_into` for losers
 - `UPDATE contents SET copy_group_id = winner WHERE copy_group_id = loser`
-- `UPDATE groups SET similar_set_id` per entry in `similar_links`, re-pointing groups whose set was merged
+- `UPDATE groups SET similar_set_id` per entry in `similarLinks`, re-pointing groups whose set was merged
 - set `contents.copy_ambiguous`, `state = 'CLUSTERED'`, `clustered_at`
 
-Update the in-memory index only after the commit.
+Update the in-memory index only after `COMMIT`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G5**
 
-Run: `uv run pytest tests/unit/test_index.py tests/unit/test_hash_cluster_activities.py -v`
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -668,90 +708,87 @@ git add -A && git commit -m "feat: decode/record/cluster activities with single-
 ### Task 8: Staging plan and atomic build
 
 **Files:**
-- Create: `src/pixelmagic/staging_plan.py`, `src/pixelmagic/activities/staging.py`
-- Test: `tests/unit/test_staging_plan.py`, `tests/unit/test_staging_build.py`
+- Create: `src/stagingPlan.ts`, `src/activities/staging.ts`
+- Modify: `src/activities/index.ts`, `src/types.ts`
+- Test: `tests/unit/stagingPlan.test.ts`, `tests/unit/stagingBuild.test.ts`
 
 **Interfaces:**
-- Consumes: the schema (Task 2); `vault_rel` (Task 1)
+- Consumes: the schema (Task 2); `vaultRel` (Task 1)
 - Produces:
-  - `StageContent`, a frozen dataclass: `sha256`, `kind`, `ext`, `mime`, `width`, `height`, `size_bytes`, `captured_at`, `live_content_id`, `duration_s`, `state`, `quarantine_reason`, `copy_group`, `similar_set`, `ambiguous`
-  - `StageFile`, a frozen dataclass: `file_id`, `rel_path`, `original_name`, `mtime_ns`, `sha256`, `state`, `src_rel`
-  - `Entry(dest: str, src: str)`
-  - `best_copy_key(c: StageContent, has_live: bool) -> tuple`: `not ambiguous`, then the spec §6.4 order, then `sha256` reversed so the lowest sha wins. Used as `max(key=…)`.
-  - `pair_live_photos(contents: Sequence[StageContent], files: Sequence[StageFile], max_duration_s: float) -> dict[str, str]` (still sha → motion sha)
-  - `plan_staging(contents: Sequence[StageContent], files: Sequence[StageFile], max_duration_s: float) -> list[Entry]`, deterministic and sorted by `dest`
-  - `BuildResult(gen: int | None, entries: int, skipped: bool)`
-  - `Activities.maybe_build_staging(force: bool) -> BuildResult` (queue `io`, heartbeats every 1,000 links)
+  - `interface StageContent`: `sha256`, `kind`, `ext`, `mime`, `width`, `height`, `sizeBytes: bigint`, `capturedAt: Date | null`, `liveContentId`, `durationS`, `state`, `quarantineReason`, `copyGroup: number | null`, `similarSet: number | null`, `ambiguous: boolean`
+  - `interface StageFile`: `fileId: bigint`, `relPath`, `originalName`, `mtimeNs: bigint`, `sha256`, `state`, `srcRel`
+  - `interface Entry { dest: string; src: string }`
+  - `bestCopyKey(c: StageContent, hasLive: boolean): readonly (number | bigint | string)[]`, compared lexicographically, highest first: `!ambiguous`, then the spec §6.4 order. The final tie-break is the **lowest** `sha256`.
+  - `pairLivePhotos(contents: readonly StageContent[], files: readonly StageFile[], maxDurationS: number): Map<string, string>` (still sha → motion sha)
+  - `planStaging(contents: readonly StageContent[], files: readonly StageFile[], maxDurationS: number): Entry[]`, deterministic and sorted by `dest`
+  - In `types.ts`: `interface BuildResult { gen: number | null; entries: number; skipped: boolean }`
+  - `maybeBuildStaging(force: boolean): Promise<BuildResult>` (queue `io`, heartbeats every 1,000 links)
 
 - [ ] **Step 1: Write the failing tests**
 
-Here `C(...)` and `Fl(...)` are builders with defaults.
+Here `C(...)` and `Fl(...)` are builders with defaults; `dests(entries)` returns the sorted `dest` strings.
 
-```python
-def test_unique_best_copy_and_copies_folder():
-    heic = C("h"*64, ext="heic", width=4032, height=3024, copy_group=1); jpg = C("j"*64, ext="jpg", width=2016, height=1512, copy_group=1)
-    e = plan_staging([heic, jpg], [Fl(1, "IMG_0034.HEIC", heic), Fl(2, "IMG_0034.JPG", jpg)], 5)
-    assert dests(e) == ["copies/g-hhhhhhhh/IMG_0034.JPG", "unique/2021/2021-10/20211003_140211_IMG_0034.HEIC"]
+```ts
+test('unique best copy and content-named copies folder', () => {
+  const heic = C('h'.repeat(64), { ext: 'heic', width: 4032, height: 3024, copyGroup: 1 });
+  const jpg = C('j'.repeat(64), { ext: 'jpg', width: 2016, height: 1512, copyGroup: 1 });
+  expect(dests(planStaging([heic, jpg], [Fl(1n, 'IMG_0034.HEIC', heic), Fl(2n, 'IMG_0034.JPG', jpg)], 5)))
+    .toEqual(['copies/g-hhhhhhhh/IMG_0034.JPG', 'unique/2021/2021-10/20211003_140211_IMG_0034.HEIC']);
+});
+test('burst set keeps every shot in similar/', () => {
+  const a = C('a'.repeat(64), { copyGroup: 1, similarSet: 9 }), b = C('b'.repeat(64), { copyGroup: 2, similarSet: 9 });
+  expect(dests(planStaging([a, b], [Fl(1n, 'A.HEIC', a), Fl(2n, 'B.HEIC', b)], 5)).every((d) => d.startsWith('similar/2021/2021-10/s-'))).toBe(true);
+});
+test('Live MOV beside still with same base name', () => { /* liveContentId match → same dirname, same stem */ });
+test('stem fallback is exact and duration-bounded', () => {
+  const s1 = C('1'.repeat(64)), s2 = C('2'.repeat(64));
+  const m1 = C('3'.repeat(64), { kind: 'motion', ext: 'mov', durationS: 3 }), long = C('4'.repeat(64), { kind: 'motion', ext: 'mov', durationS: 30 });
+  const files = [Fl(1n, 'd/IMG_2834.HEIC', s1), Fl(2n, 'd/IMG_2834 1.HEIC', s2), Fl(3n, 'd/IMG_2834 1.MOV', m1), Fl(4n, 'd/IMG_2834.MOV', long)];
+  expect(pairLivePhotos([s1, s2, m1, long], files, 5)).toEqual(new Map([['2'.repeat(64), '3'.repeat(64)]]));
+});
+test('collision gets _sha8, then _2', () => { /* three contents with the same dated name */ });
+test('ambiguous content is never best', () => { /* bigger ambiguous content still lands in copies/ */ });
+test('quarantine, failed and other buckets', () => { /* QUARANTINED → quarantine/<reason>/; FAILED → quarantine/failed/; AAE → other/<rel_dir>/ */ });
+test('names are independent of group ids', () => { /* same contents under different copyGroup/similarSet numbers → identical dests */ });
+test('unclustered stills are not staged; INGESTED motion/other are', () => {});
 
-def test_burst_set_keeps_every_shot_in_similar():
-    a, b = C("a"*64, copy_group=1, similar_set=9), C("b"*64, copy_group=2, similar_set=9)
-    assert all(d.startswith("similar/2021/2021-10/s-") for d in dests(plan_staging([a, b], [Fl(1, "A.HEIC", a), Fl(2, "B.HEIC", b)], 5)))
-
-def test_live_mov_beside_still_with_same_base_name():
-    s, m = C("s"*64, live_content_id="L"), C("m"*64, kind="motion", ext="mov", live_content_id="L", duration_s=2.9)
-    d = dests(plan_staging([s, m], [Fl(1, "IMG_1.HEIC", s), Fl(2, "IMG_1.MOV", m)], 5))
-    assert {Path(x).parent for x in d} == {Path(d[0]).parent} and {Path(x).stem for x in d} == {Path(d[0]).stem}
-
-def test_stem_fallback_is_exact_and_duration_bounded():
-    s1, s2 = C("1"*64), C("2"*64)
-    m1, long = C("3"*64, kind="motion", ext="mov", duration_s=3), C("4"*64, kind="motion", ext="mov", duration_s=30)
-    files = [Fl(1, "d/IMG_2834.HEIC", s1), Fl(2, "d/IMG_2834 1.HEIC", s2), Fl(3, "d/IMG_2834 1.MOV", m1), Fl(4, "d/IMG_2834.MOV", long)]
-    assert pair_live_photos([s1, s2, m1, long], files, 5) == {"2"*64: "3"*64}
-
-def test_collision_gets_sha8_suffix(): ...                 # two different contents with the same dated name
-def test_ambiguous_content_is_never_best(): ...
-def test_quarantine_failed_and_other_buckets(): ...        # QUARANTINED → quarantine/<reason>/, FAILED → quarantine/failed/, AAE → other/<rel_dir>/
-def test_group_folder_names_are_content_derived(): ...      # same plan under different group ids → identical dests
-
-async def test_build_swaps_atomically_and_is_idempotent(acts, layout, conn):
-    await seed_pipeline_rows(conn, layout)
-    r1 = await run(acts.maybe_build_staging, True); r2 = await run(acts.maybe_build_staging, True)
-    assert r2.gen == r1.gen + 1 and tree(layout.staging / "current") == tree_of_gen(layout, r1.gen)
-    assert os.readlink(layout.staging / "current") == f".gen-{r2.gen}"
-    assert sorted(p.name for p in layout.staging.iterdir()) == [f".gen-{r1.gen}", f".gen-{r2.gen}", "current"]
-
-async def test_staged_files_share_inode_with_vault(acts, layout, conn): ...
-async def test_orphan_gen_from_crash_is_removed(acts, layout, conn): ...   # pre-create .gen-99 with no staging_builds row
-async def test_skips_when_unchanged(acts, conn): ...                        # force=False, no newer updated_at → skipped=True
-
-async def test_staged_file_is_read_only(acts, layout, conn):
-    await seed_pipeline_rows(conn, layout); await run(acts.maybe_build_staging, True)
-    f = next((layout.staging / "current" / "unique").rglob("*.*"))
-    with pytest.raises(PermissionError): open(f, "r+b")
+test('build swaps atomically and is repeatable', async () => {
+  await seedPipelineRows(); const r1 = await build(true); const r2 = await build(true);
+  expect(r2.gen).toBe(r1.gen! + 1); expect(await tree(join(layout.staging, 'current'))).toEqual(await tree(genDir(r1.gen!)));
+  expect(await readlink(join(layout.staging, 'current'))).toBe(`.gen-${r2.gen}`);
+  expect((await readdir(layout.staging)).sort()).toEqual([`.gen-${r1.gen}`, `.gen-${r2.gen}`, 'current']);
+});
+test('staged files share inode with vault', async () => {});
+test('orphan gen from a crash is removed', async () => { /* pre-create .gen-99 with no staging_builds row */ });
+test('skips when unchanged', async () => { /* force=false, no newer updated_at → skipped: true */ });
+test.skipIf(process.getuid?.() === 0)('staged file is read-only', async () => {
+  await seedPipelineRows(); await build(true);
+  const f = (await walk(join(layout.staging, 'current', 'unique')))[0]!;
+  await expect(open(f, 'r+')).rejects.toMatchObject({ code: 'EACCES' });
+});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_staging_plan.py tests/unit/test_staging_build.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run tests/unit/stagingPlan.test.ts tests/unit/stagingBuild.test.ts`
+Expected: FAIL with `Cannot find module`
 
-- [ ] **Step 3: Implement `staging_plan.py` and `maybe_build_staging`**
+- [ ] **Step 3: Implement `stagingPlan.ts` and `maybeBuildStaging`**
 
 **Rules** (spec §6.4 + §12 R5 and R6):
 - `g-<sha8>` is the group's best content's sha. `s-<sha8>` is the best content across the whole set.
-- Collisions get `_<sha8>`, then `_2`, `_3`, … in order of `(sha256, rel_path)`.
-- Contents that are not yet `CLUSTERED` (stills) are skipped. Motion and other contents with state `INGESTED` are staged.
+- Collisions get `_<sha8>`, then `_2`, `_3`, … in order of `(sha256, relPath)`.
 
 **Build:**
 - Take the advisory lock `hashtext('pm.stage')`.
-- The watermark is `greatest(max(files.updated_at), max(contents.updated_at), max(groups changes via cluster_state))`.
-- When `force=False`, skip if the watermark ≤ the last build's watermark, or if running `FileWorkflow`s > 0 and the time since the last build < `stage_max_staleness_s`.
-- Delete any `.gen-*` directory that has no `staging_builds` row. Link every entry, `os.symlink` to `.current.tmp`, then `os.replace` over `current`. Insert `staging_builds`. Delete generations older than the previous one.
+- The watermark is `greatest(max(files.updated_at), max(contents.updated_at))` combined with `cluster_state.version`.
+- When `force` is false, skip if unchanged, or if there are running `FileWorkflow`s (via `deps.temporal.workflow.count(...)`) and the time since the last build is less than `stageMaxStalenessS`.
+- Delete any `.gen-*` that has no `staging_builds` row. Link every entry, `symlink` to `.current.tmp`, then `rename` over `current`. Insert `staging_builds`. Delete generations older than the previous one.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G5**
 
-Run: `uv run pytest tests/unit/test_staging_plan.py tests/unit/test_staging_build.py -v`
-Expected: PASS (`test_staged_file_is_read_only` is skipped when run as root, with a reason message)
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus`
+Expected: PASS
 
 - [ ] **Step 5: Commit**
 
@@ -764,88 +801,92 @@ git add -A && git commit -m "feat: deterministic staging plan with atomic genera
 ### Task 9: Workflows, scanner and worker
 
 **Files:**
-- Create: `src/pixelmagic/workflows.py`, `src/pixelmagic/activities/scan.py`, `src/pixelmagic/worker.py`
-- Test: `tests/workflow/test_workflows.py`, `tests/unit/test_scan.py`
+- Create: `src/workflows.ts`, `src/ids.ts`, `src/activities/scan.ts`, `src/worker.ts`, `src/cli.ts` (only `stage [--force]` here; Task 10 completes the CLI)
+- Modify: `src/activities/index.ts`, `src/types.ts`, `Makefile` (`up`, `down`, `stage`)
+- Test: `tests/workflow/workflows.test.ts`, `tests/unit/scan.test.ts`
 
 **Interfaces:**
-- Consumes: every `Activities.*` method from Tasks 6–8
+- Consumes: every activity from Tasks 6–8
 - Produces:
-  - Workflows:
-    - `FileWorkflow.run(ref: FileRef) -> str` (the final content or file state)
-    - `ContentWorkflow.run(sha256: str, ext: str) -> str`
-    - `ScanWorkflow.run() -> ScanResult`
-    - `StagingWorkflow.run(force: bool = False) -> BuildResult`
-  - `run_content_steps(sha256: str, ext: str) -> str`: a workflow-side helper that runs decode → record → cluster and calls `mark_failed` on decode exhaustion
-  - `ScanResult(started: int, pending_files: int, pending_bytes: int)`
-  - `Activities.scan_and_start() -> ScanResult` (queue `io`)
-  - `file_workflow_id(ref: FileRef) -> str`, which is `"file-" + sha1(f"{rel_path}|{size}|{mtime_ns}")`
-  - `ensure_schedules(client: Client) -> None`: schedule `pm-scan` every `scan_interval_s` and `pm-stage` every 300 s, both with overlap `SKIP`
-  - Entrypoint: `python -m pixelmagic.worker`
-- Activity options, as module constants in `workflows.py`:
+  - Workflows (`@temporalio/workflow` only, type-only imports):
+    - `FileWorkflow(ref: FileRef, opts?: { poisonAttempts?: number }): Promise<string>` (the final state)
+    - `ContentWorkflow(sha256: string, ext: string, opts?): Promise<string>`
+    - `ScanWorkflow(): Promise<ScanResult>`
+    - `StagingWorkflow(force?: boolean): Promise<BuildResult>`
+  - `runContentSteps(sha256, ext, poisonAttempts)`, a workflow-side function: `decodeContent` → `recordHash` → `clusterContent`, with `markFailed` on decode exhaustion. It returns `'CLUSTERED' | 'QUARANTINED' | 'FAILED'`.
+  - In `types.ts`: `interface ScanResult { started: number; pendingFiles: number; pendingBytes: string }`
+  - `scanAndStart(): Promise<ScanResult>` (queue `io`)
+  - `fileWorkflowId(ref: FileRef): string` in `src/ids.ts`: `'file-' + sha1(`${relPath}|${size}|${mtimeNs}`)`
+  - `ensureSchedules(client: Client, s: Settings): Promise<void>`: `pm-scan` every `scanIntervalS` and `pm-stage` every 300 s, overlap `SKIP`. It ignores `ScheduleAlreadyRunning`.
+  - Entrypoint: `node dist/worker.js`
+- Activity options, as constants in `workflows.ts`:
 
 | Activity | Queue | Timeouts | Retry |
 |----------|-------|----------|-------|
-| `ingest_file` | `io` | start-to-close 1 h, heartbeat 30 s | unlimited, 1 s ×2 → 300 s |
-| `decode_content` | `cpu` | start-to-close 2 min | max attempts `poison_attempts` |
-| `record_hash` | `io` | start-to-close 1 min | unlimited |
-| `cluster_content` | `cluster` | start-to-close 1 min | unlimited |
-| `mark_failed` | `io` | — | unlimited |
-| `maybe_build_staging` | `io` | start-to-close 2 h, heartbeat 30 s | unlimited |
+| `ingestFile` | `io` | startToClose `1h`, heartbeat `30s` | unlimited, `1s` ×2 → `5m` |
+| `decodeContent` | `cpu` | startToClose `2m` | `maximumAttempts: poisonAttempts` (default 5) |
+| `recordHash` | `io` | startToClose `1m` | unlimited |
+| `clusterContent` | `cluster` | startToClose `1m` | unlimited |
+| `markFailed` | `io` | — | unlimited |
+| `maybeBuildStaging` | `io` | startToClose `2h`, heartbeat `30s` | unlimited |
 
 - [ ] **Step 1: Write the failing tests**
 
-These use `WorkflowEnvironment.start_time_skipping()`, with fake activities registered under the real activity names.
+These use `TestWorkflowEnvironment.createTimeSkipping()`, with a `Worker` registering fake activity implementations under the real names.
 
-```python
-async def test_new_still_runs_all_steps(env): assert await run_file(env, fakes(ingest=INGESTED_STILL)) == "CLUSTERED"
-async def test_copy_stops_after_ingest(env):
-    f = fakes(ingest=COPY_RESULT); assert await run_file(env, f) == "COPY" and f.calls == ["ingest_file"]
-async def test_motion_stops_after_ingest(env): assert await run_file(env, fakes(ingest=INGESTED_MOTION)) == "INGESTED"
-async def test_quarantine_stops_before_cluster(env):
-    f = fakes(ingest=INGESTED_STILL, record="QUARANTINED"); assert await run_file(env, f) == "QUARANTINED" and "cluster_content" not in f.calls
-async def test_decode_poison_marks_failed_after_5(env):
-    f = fakes(ingest=INGESTED_STILL, decode=always_poison); assert await run_file(env, f) == "FAILED"
-    assert f.calls.count("decode_content") == 5 and f.calls[-1] == "mark_failed"
-async def test_record_hash_outage_never_fails_content(env):
-    f = fakes(ingest=INGESTED_STILL, record=fail_n_times(40, then="HASHED")); assert await run_file(env, f) == "CLUSTERED"
-async def test_ingest_retries_through_outage(env): assert await run_file(env, fakes(ingest=fail_n_times(20, then=INGESTED_STILL))) == "CLUSTERED"
+```ts
+test('new still runs all steps', async () => expect(await runFile(fakes({ ingest: INGESTED_STILL }))).toBe('CLUSTERED'));
+test('COPY stops after ingest', async () => { const f = fakes({ ingest: COPY }); expect(await runFile(f)).toBe('COPY'); expect(f.calls).toEqual(['ingestFile']); });
+test('motion stops after ingest', async () => expect(await runFile(fakes({ ingest: INGESTED_MOTION }))).toBe('INGESTED'));
+test('quarantine stops before cluster', async () => {
+  const f = fakes({ ingest: INGESTED_STILL, record: 'QUARANTINED' });
+  expect(await runFile(f)).toBe('QUARANTINED'); expect(f.calls).not.toContain('clusterContent');
+});
+test('decode poison marks FAILED after 5', async () => {
+  const f = fakes({ ingest: INGESTED_STILL, decode: alwaysPoison });
+  expect(await runFile(f)).toBe('FAILED'); expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(5); expect(f.calls.at(-1)).toBe('markFailed');
+});
+test('recordHash outage never fails content', async () =>
+  expect(await runFile(fakes({ ingest: INGESTED_STILL, record: failNTimes(40, 'HASHED') }))).toBe('CLUSTERED'));
+test('ingest retries through outage', async () => expect(await runFile(fakes({ ingest: failNTimes(20, INGESTED_STILL) }))).toBe('CLUSTERED'));
+test('ContentWorkflow runs content steps only', async () => {});
 
-def test_file_workflow_id_is_stable():
-    assert file_workflow_id(FileRef("a b/é.jpg", 1, 2)) == file_workflow_id(FileRef("a b/é.jpg", 1, 2)) != file_workflow_id(FileRef("a b/é.jpg", 1, 3))
-
-async def test_scan_only_starts_stable_files(acts_with_fake_client, layout):
-    write_growing_file(layout.dropzone / "big.mov")                   # appends during the 5 s window
-    (layout.dropzone / "ok.jpg").write_bytes(JPEG_A); (layout.dropzone / ".DS_Store").write_bytes(b"x")
-    r = await run(acts_with_fake_client.scan_and_start)
-    assert started_rel_paths(acts_with_fake_client) == ["ok.jpg"] and r.pending_files == 2
-
-async def test_scan_ignores_already_started(acts_with_fake_client, layout): ...  # client raises WorkflowAlreadyStartedError → counted, no error
-async def test_scan_backpressure(acts_with_fake_client, layout): ...           # count_workflows returns MAX_IN_FLIGHT → started == 0, scan_stats still written
+test('fileWorkflowId is stable and sensitive', () => {
+  const r = { relPath: 'a b/é.jpg', size: '1', mtimeNs: '2' };
+  expect(fileWorkflowId(r)).toBe(fileWorkflowId({ ...r })); expect(fileWorkflowId(r)).not.toBe(fileWorkflowId({ ...r, mtimeNs: '3' }));
+});
+test('scan starts only stable, non-ignored files', async () => {
+  growFileDuringScan(join(layout.dropzone, 'big.mov'));
+  await writeFile(join(layout.dropzone, 'ok.jpg'), JPEG_A); await writeFile(join(layout.dropzone, '.DS_Store'), 'x');
+  const r = await runActivity(actsWithFakeClient.scanAndStart, []);
+  expect(fakeClient.startedRelPaths()).toEqual(['ok.jpg']); expect(r.pendingFiles).toBe(2);
+});
+test('scan tolerates WorkflowExecutionAlreadyStartedError', async () => {});
+test('scan backpressure', async () => { /* count() returns maxInFlight → started 0, scan_stats still written */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/workflow tests/unit/test_scan.py -v`
-Expected: FAIL with `ImportError`
+Run: `npx vitest run --project workflow && npx vitest run tests/unit/scan.test.ts`
+Expected: FAIL with `Cannot find module`
 
-- [ ] **Step 3: Implement the workflows, scan and worker**
+- [ ] **Step 3: Implement the workflows, scan, worker and minimal `cli stage`**
 
-- **`scan_and_start`:** take two `os.walk` snapshots `stable_seconds` apart (heartbeat between them). Write `scan_stats`. Get `running = client.count_workflows("WorkflowType='FileWorkflow' AND ExecutionStatus='Running'")`. Start up to `max_in_flight - running` workflows with `id_reuse_policy=ALLOW_DUPLICATE` and `id_conflict_policy=FAIL`, on task queue `main`.
-- **`worker.main()`:**
-  - Startup checks: `check_same_device`, an exiftool version check, `layout.ensure()`.
-  - Create one `temporalio.worker.Worker` per entry in `WORKER_QUEUES`. Workflows run on `main`. Each other queue gets its own activities and `max_concurrent_activities`: `io_concurrency`, `cpu_concurrency`, or 1 for `cluster`.
-  - Call `ensure_schedules` when the `cluster` queue is served.
-  - Graceful shutdown on SIGTERM with a 60 s timeout.
-  - Logs: structlog JSON.
+- **`scanAndStart`:** take two recursive `readdir` snapshots `stableSeconds` apart, heartbeating between them. Write `scan_stats`. Get `running` from `client.workflow.count("WorkflowType='FileWorkflow' AND ExecutionStatus='Running'")`. Start at most `maxInFlight - running` workflows on queue `main`, with `workflowIdReusePolicy: ALLOW_DUPLICATE` and `workflowIdConflictPolicy: FAIL`.
+- **`worker.ts`:**
+  - Startup checks: `checkSameDevice`, `layout.ensure()`, `metadata.read` on a probe file.
+  - Create one `Worker` per entry in `WORKER_QUEUES`. Workflows (`workflowsPath`) run on `main`. Each other queue gets `maxConcurrentActivityTaskExecutions`: `ioConcurrency`, `cpuConcurrency`, or 1 for `cluster`.
+  - Call `ensureSchedules` when `cluster` is served.
+  - `shutdownGraceTime: '60s'`, and close the pg pool, the exiftool process and the decode pool on shutdown. Log with pino.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G6**
 
-Run: `uv run pytest tests/workflow tests/unit/test_scan.py -v`
-Expected: PASS
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus && make down && make up && make fs-check`
+Expected: PASS, `fs-check OK`
 
-- [ ] **Step 5: Verify a real end-to-end trickle**
+- [ ] **Step 5: Verify a real end-to-end trickle (G6)**
 
-Run: `make up && cp -c test-automation/sample-images/IMG_0034.* data/dropzone/ && sleep 60 && make stage FORCE=1 && find data/staging/current -type f`
+Run: `cp -c test-automation/sample-images/IMG_0034.* data/dropzone/ && sleep 60 && make stage FORCE=1 && find data/staging/current/ -type f`
 Expected: `IMG_0034.HEIC` under `unique/…`, `IMG_0034.JPG` under `copies/g-…/`, and both workflows Completed in the Temporal UI
 
 - [ ] **Step 6: Commit**
@@ -859,56 +900,57 @@ git add -A && git commit -m "feat: Temporal workflows, scanner with backpressure
 ### Task 10: Operator CLI and Grafana dashboard
 
 **Files:**
-- Create: `src/pixelmagic/cli.py`, `infra/grafana/provisioning/datasources/pg.yml`, `infra/grafana/provisioning/dashboards/pm.yml`, `infra/grafana/dashboards/pipeline-live.json`
-- Modify: `Makefile` (wire up `stage`, `retry-failed` and `verify-vault`)
-- Test: `tests/unit/test_cli.py`, `tests/unit/test_dashboard_sql.py`
+- Create: `infra/grafana/provisioning/datasources/pg.yml`, `infra/grafana/provisioning/dashboards/pm.yml`, `infra/grafana/dashboards/pipeline-live.json`
+- Modify: `src/cli.ts`, `Makefile` (`retry-failed`, `verify-vault` via `docker compose exec worker node dist/cli.js …`)
+- Test: `tests/unit/cli.test.ts`, `tests/unit/dashboardSql.test.ts`
 
 **Interfaces:**
-- Consumes: `StagingWorkflow`, `ContentWorkflow` (Task 9); `sha256_stream` (Task 1)
+- Consumes: `StagingWorkflow`, `ContentWorkflow` (Task 9); `sha256File` (Task 1)
 - Produces:
-  - `cli stage [--force]`: runs `StagingWorkflow` with ID `stage-manual-<ts>` and waits
-  - `cli retry-failed`: resets FAILED contents to `INGESTED` and starts `ContentWorkflow` with ID `content-<sha>-retry-<epoch>`; prints the count
-  - `cli verify-vault [--sample N]`: exits 1 and lists any vault file whose hash doesn't match its name
-  - Dashboard panels with these titles: `Drop zone`, `In flight`, `Backlog by stage`, `Throughput / min`, `ETA`, `Copy groups`, `Similar sets`, `Reclaimable`, `Quarantined by reason`, `Failed`, `Recent errors`, `Last staging build`
+  - `main(argv: string[], deps?): Promise<number>` (the exit code) in `cli.ts`
+  - `stage [--force]` (from Task 9)
+  - `retry-failed`: resets FAILED contents to `INGESTED` and starts `ContentWorkflow` with ID `content-<sha>-retry-<epoch>`; prints the count
+  - `verify-vault [--sample N]`: exits 1 and lists any vault file whose hash doesn't match its name
+  - Dashboard titled "Pixel Magic: Pipeline Live", with `refresh: "5s"` and these panels: `Drop zone`, `In flight`, `Backlog by stage`, `Throughput / min`, `ETA`, `Copy groups`, `Similar sets`, `Reclaimable`, `Quarantined by reason`, `Failed`, `Recent errors`, `Last staging build`
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-async def test_every_panel_query_runs(conn):
-    await seed_pipeline_rows_sql(conn)
-    for panel in load_panels("infra/grafana/dashboards/pipeline-live.json"):
-        for target in panel["targets"]:
-            await conn.execute(target["rawSql"])                     # no Grafana macros allowed
-
-def test_dashboard_has_required_panels():
-    assert {p["title"] for p in load_panels(...)} >= REQUIRED_TITLES and load_json(...)["refresh"] == "5s"
-
-def test_verify_vault_detects_mismatch(tmp_layout, capsys):
-    good, bad = write_vault(tmp_layout, b"a"), write_vault(tmp_layout, b"b", name_sha="0"*64)
-    assert cli_main(["verify-vault"]) == 1 and "0"*64 in capsys.readouterr().out
-
-async def test_retry_failed_resets_and_starts(conn, fake_client): ...
+```ts
+test('every pixelmagic panel query runs against a seeded DB', async () => {
+  await seedPipelineRowsSql(pool);
+  for (const t of loadTargets('infra/grafana/dashboards/pipeline-live.json').filter((t) => t.datasource.uid === 'pixelmagic'))
+    await expect(pool.query(t.rawSql)).resolves.toBeDefined();               // no Grafana macros
+});
+test('visibility panel query runs against a stub executions_visibility', async () => { /* create minimal table in scratch schema */ });
+test('dashboard has required panels and 5s refresh', () => {
+  const d = loadDashboard(); expect(d.panels.map((p) => p.title)).toEqual(expect.arrayContaining(REQUIRED)); expect(d.refresh).toBe('5s');
+});
+test('verify-vault detects mismatch', async () => {
+  await writeVault(layout, 'a'); await writeVault(layout, 'b', { nameSha: '0'.repeat(64) });
+  const out = captureStdout(); expect(await main(['verify-vault'], deps)).toBe(1); expect(out()).toContain('0'.repeat(64));
+});
+test('retry-failed resets and starts', async () => { /* 2 FAILED rows → state INGESTED, fakeClient started 2 ContentWorkflows */ });
+test('unknown command exits 2 with usage', async () => {});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_cli.py tests/unit/test_dashboard_sql.py -v`
+Run: `npx vitest run tests/unit/cli.test.ts tests/unit/dashboardSql.test.ts`
 Expected: FAIL
 
 - [ ] **Step 3: Implement the CLI, datasource provisioning and dashboard JSON**
 
-- The datasource points at the `pixelmagic` DB with a read-only role created in `init.sql`.
-- The "In flight" panel uses `temporal_visibility.executions_visibility` (`status = 1`), grouped by `workflow_type_name`.
+- The datasources are `pixelmagic` and `temporal_visibility`, both through the read-only role `pm_reader`.
 - ETA = backlog ÷ the rate of `clustered_at` over the last 10 minutes.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run gates G2–G6**
 
-Run: `uv run pytest tests/unit/test_cli.py tests/unit/test_dashboard_sql.py -v`
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && npm run test:corpus && make down && make up`
 Expected: PASS
 
 - [ ] **Step 5: Verify in the browser**
 
-Run: `make up && open http://127.0.0.1:3000`
+Run: `open http://127.0.0.1:3000`
 Expected: "Pixel Magic: Pipeline Live" loads with no panel errors
 
 - [ ] **Step 6: Commit**
@@ -922,63 +964,69 @@ git add -A && git commit -m "feat: operator CLI and Postgres-backed Grafana dash
 ### Task 11: Corpus manifest, seeder and verifier
 
 **Files:**
-- Create: `tools/corpus/build_manifest.py`, `tools/corpus/seed.py`, `tools/corpus/verify.py`, `tools/corpus/synth.py`, `tests/corpus/manifest.json` (generated)
-- Modify: `Makefile` (`corpus-manifest`, `corpus-verify`)
-- Test: `tests/unit/test_corpus_tools.py`
+- Create: `tools/corpus/lib.ts`, `tools/corpus/buildManifest.ts`, `tools/corpus/seed.ts`, `tools/corpus/verify.ts`, `tools/corpus/synth.ts`, `tests/corpus/manifest.json` (generated)
+- Modify: `Makefile` (`corpus-manifest`, `corpus-verify`), `.gitignore` (`tests/corpus/.hash-cache.json`)
+- Test: `tests/unit/corpusTools.test.ts`
 
 **Interfaces:**
-- Consumes: nothing from `pixelmagic` except `is_ignored`. The oracle must stay independent: it uses `sips` and the exiftool CLI directly.
-- Produces:
-  - Manifest records: `name`, `size`, `mtime_ns`, `sha256`, `kind`, `ext_mismatch`, `width`, `height`, `captured_at`, `subsec`, `burst_uuid`, `content_id`, `duration_s`
-  - Manifest relations: `exact_groups`, `heic_jpg_twin`, `edit_of`, `space_suffix_copy`, `burst` (same `BurstUUID`, or captures ≤ 2 s apart with different subsec from the same camera), `live_photo` (content ID, or same stem with a MOV ≤ 5 s)
-  - Manifest `subsets`: `smoke` and `standard`, seeded and stratified, including the pinned files from spec §10.3
-  - `seed.py --subset {smoke,standard,full} --dest DIR [--layout flat|nested] [--shuffle SEED] [--extras junk,corrupt] [--synthetic]` writes `DIR/../seed-manifest.json`
-  - `synth.py`, which generates variants of real seeds: resize 50% keeping EXIF, re-encode q60 with EXIF stripped, PNG conversion, and an EXIF-stripped export of one burst frame (the bridge case). Ground truth lands in the seed manifest.
-  - `verify.py [--deep]`, which exits non-zero on any drift
+- Consumes: nothing from `src/` except `isIgnored`. The oracle must stay independent: it uses the `sips` CLI and the `exiftool` CLI bundled with exiftool-vendored, called directly.
+- Produces (in `lib.ts`):
+  - `buildRelations(recs: ManifestRecord[]): Relations`
+  - `selectSubsets(m: Manifest, seed: number): { smoke: string[]; standard: string[] }`
+  - `seed(opts: SeedOptions): Promise<SeedManifest>`
+  - `verify(corpusDir: string, m: Manifest, deep: boolean): Promise<string[]>` (the drift list)
+- Manifest records: `name`, `size`, `mtimeNs`, `sha256`, `kind`, `extMismatch`, `width`, `height`, `capturedAt`, `subsec`, `burstUuid`, `contentId`, `durationS`
+- Manifest relations: `exactGroups`, `heicJpgTwin`, `editOf`, `spaceSuffixCopy`, `burst` (same `BurstUUID`, or captures ≤ 2 s apart from the same camera with different subsec), `livePhoto` (content ID, or same stem with a MOV ≤ 5 s)
+- Pinned files in both subsets: everything in spec §10.3
+- CLIs:
+  - `tsx tools/corpus/seed.ts --subset smoke|standard|full --dest DIR [--layout flat|nested] [--shuffle N] [--extras junk,corrupt] [--synthetic]` writes `DIR/../seed-manifest.json`
+  - `synth.ts` generates variants from real seeds with sharp: resize 50% keeping EXIF (`withMetadata`), re-encode q60 with EXIF stripped, PNG conversion, and an EXIF-stripped export of one burst frame (the bridge case). Ground truth lands in the seed manifest.
 
-- [ ] **Step 1: Write the failing tests** (tiny fixtures under `tmp_path`, no corpus needed)
+- [ ] **Step 1: Write the failing tests** (tiny fixtures in a tmp dir, no corpus needed)
 
-```python
-def test_relations_from_names():
-    r = build_relations([rec("IMG_0034.HEIC"), rec("IMG_0034.JPG"), rec("IMG_E0433.HEIC"), rec("IMG_0433.HEIC"),
-                         rec("IMG_2834 1.HEIC"), rec("IMG_2834.HEIC")])
-    assert ("IMG_0034.HEIC", "IMG_0034.JPG") in r["heic_jpg_twin"] and ("IMG_E0433.HEIC", "IMG_0433.HEIC") in r["edit_of"]
-    assert ("IMG_2834 1.HEIC", "IMG_2834.HEIC") in r["space_suffix_copy"]
-
-def test_subsets_are_deterministic_and_include_pins():
-    m = fake_manifest(500); assert select_subsets(m, seed=7) == select_subsets(m, seed=7)
-    assert PINNED <= set(select_subsets(m, seed=7)["smoke"])
-
-def test_seed_clones_without_touching_source(tmp_path):
-    src = make_corpus(tmp_path); before = snapshot(src)
-    seed(src, subset=["a.jpg"], dest=tmp_path / "dz"); assert snapshot(src) == before and (tmp_path / "dz/a.jpg").exists()
-
-def test_verify_detects_drift(tmp_path): ...
+```ts
+test('relations from names', () => {
+  const r = buildRelations(['IMG_0034.HEIC', 'IMG_0034.JPG', 'IMG_E0433.HEIC', 'IMG_0433.HEIC', 'IMG_2834 1.HEIC', 'IMG_2834.HEIC'].map(rec));
+  expect(r.heicJpgTwin).toContainEqual(['IMG_0034.HEIC', 'IMG_0034.JPG']);
+  expect(r.editOf).toContainEqual(['IMG_E0433.HEIC', 'IMG_0433.HEIC']);
+  expect(r.spaceSuffixCopy).toContainEqual(['IMG_2834 1.HEIC', 'IMG_2834.HEIC']);
+});
+test('subsets are deterministic and include pins', () => {
+  const m = fakeManifest(500); expect(selectSubsets(m, 7)).toEqual(selectSubsets(m, 7));
+  expect(selectSubsets(m, 7).smoke).toEqual(expect.arrayContaining(PINNED));
+});
+test('seed clones without touching source', async () => {
+  const src = await makeCorpus(); const before = await snapshot(src);
+  await seed({ corpusDir: src, names: ['a.jpg'], dest: `${tmp}/dz` });
+  expect(await snapshot(src)).toEqual(before); expect(existsSync(`${tmp}/dz/a.jpg`)).toBe(true);
+});
+test('verify detects drift', async () => {});
+test('burst relation needs same camera and different subsec', () => {});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_corpus_tools.py -v`
+Run: `npx vitest run tests/unit/corpusTools.test.ts`
 Expected: FAIL
 
 - [ ] **Step 3: Implement the tools**
 
-- SHA-256 runs in parallel with a `ProcessPoolExecutor`, with a cache at `tests/corpus/.hash-cache.json` (git-ignored) keyed by `(name, size, mtime_ns)`.
-- Cloning uses `cp -c -p` and falls back to `shutil.copy2`.
+- SHA-256 runs in parallel with `worker_threads` (`availableParallelism()`), with a cache keyed by `(name, size, mtimeNs)`.
+- Cloning uses `cp -c -p` via `execFile` and falls back to `copyFile` + `utimes`. Check free space first.
 
-- [ ] **Step 4: Run the tests, then build the real manifest**
+- [ ] **Step 4: Run gates G2–G5 and G7, then build the real manifest**
 
-Run: `uv run pytest tests/unit/test_corpus_tools.py -v && make corpus-manifest && make corpus-verify`
+Run: `npm test && npm run lint && npm run typecheck && npm run test:coverage && make corpus-manifest && make corpus-verify`
 Expected:
-- tests PASS
-- the manifest summary prints about 14,880 files
-- `burst` count ≥ 5. If it is lower, report it and rely on `synth.py` bridge cases.
+- PASS
+- the summary prints about 14,880 files
+- `burst` count ≥ 5. If it is lower, report it; the `synth.ts` bridge cases then carry the burst tests.
 - verify exits 0
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools tests/unit/test_corpus_tools.py tests/corpus/manifest.json Makefile && git commit -m "feat: corpus manifest, deterministic subsets, CoW seeder, verifier"
+git add tools tests/unit/corpusTools.test.ts tests/corpus/manifest.json Makefile .gitignore && git commit -m "feat: corpus manifest, deterministic subsets, CoW seeder, verifier"
 ```
 
 ---
@@ -986,44 +1034,43 @@ git add tools tests/unit/test_corpus_tools.py tests/corpus/manifest.json Makefil
 ### Task 12: End-to-end harness, invariant and smoke/standard suites
 
 **Files:**
-- Create: `tests/lib/stack.py`, `tests/lib/invariant.py`, `tests/lib/expectations.py`, `tests/lib/snapshot.py`, `tests/e2e/conftest.py`, `tests/e2e/test_smoke.py`, `tests/e2e/test_standard.py`, `tests/e2e/golden/smoke_tree.txt`
-- Modify: `Makefile` (`test-smoke`, `test-standard`, `update-golden`; each runs `corpus-verify` before and after)
+- Create: `tests/lib/stack.ts`, `tests/lib/invariant.ts`, `tests/lib/expectations.ts`, `tests/lib/snapshot.ts`, `tests/e2e/smoke.test.ts`, `tests/e2e/standard.test.ts`, `tests/e2e/golden/smoke_tree.txt`
+- Modify: `Makefile` (`test-smoke`, `test-standard`, `update-golden`; each runs `corpus-verify` before and after), `package.json` (`test:e2e`)
 - Test: the files above
 
 **Interfaces:**
-- Consumes: `seed.py`, the manifest (Task 11); the compose files (Task 2); `cli stage` (Task 10)
+- Consumes: `seed` and the manifest (Task 11); the compose files (Task 2); `cli stage` (Task 9)
 - Produces:
-  - `Stack(run_id: str, data_dir: Path)` with methods `up()`, `down(keep: bool)`, `kill(service)`, `restart(service)`, `kill_all()`, `wait_idle(timeout_s) -> None`, `stage()`, `db_url`
-  - `check_invariant(db_url: str, data_dir: Path, seed_manifest: dict) -> list[str]` (violations; empty means it passed)
-  - `tree_snapshot(data_dir: Path, db_url: str) -> list[str]`: lines of `dest\tsha256`, with entries of `copy_ambiguous` contents shown as `AMBIGUOUS\t<sha256>`
-  - `diff_expectations(db_url: str, seed_manifest: dict, manifest: dict) -> list[str]`
+  - `class Stack { constructor(runId: string, dataDir: string) }` with methods `up()`, `down(keep: boolean)`, `kill(svc)`, `restart(svc)`, `pause(svc, ms)`, `killAll()`, `waitIdle(timeoutMs)`, `stage()`, and the property `dbUrl`
+  - `checkInvariant(dbUrl: string, dataDir: string, seedManifest: SeedManifest): Promise<string[]>` (violations; empty means it passed)
+  - `treeSnapshot(dataDir: string, dbUrl: string): Promise<string[]>`: lines of `dest\tsha256`, with entries of `copy_ambiguous` contents shown as `AMBIGUOUS\t<sha256>`
+  - `diffExpectations(dbUrl: string, seedManifest: SeedManifest, manifest: Manifest): Promise<string[]>`
+  - `partitions(dbUrl: string): Promise<{ similar: Set<string>; copy: Set<string> }>` (the copy partition excludes ambiguous contents)
 
-- [ ] **Step 1: Write the e2e tests** (markers `e2e`, plus `smoke` or `standard`)
+- [ ] **Step 1: Write the e2e tests** (vitest project `e2e`, tier selected by `TIER` env)
 
-```python
-def test_smoke_invariant_and_golden(stack_smoke):
-    assert check_invariant(*stack_smoke.ctx) == []
-    assert diff_expectations(*stack_smoke.exp_ctx) == []
-    assert tree_snapshot(*stack_smoke.snap_ctx) == read_golden("smoke_tree.txt")
-
-def test_pinned_cases(stack_smoke):
-    db = stack_smoke.db
-    assert kind_of(db, "IMG_E8719.HEIC") == "still" and mime_of(db, "IMG_E8719.HEIC") == "image/jpeg"
-    assert kind_of(db, "IMG_0004.MOV") == "motion"
-    assert same_copy_group(db, "IMG_0034.HEIC", "IMG_0034.JPG")
-    assert not same_copy_group(db, "IMG_2834.HEIC", "IMG_2834 1.HEIC")
-    assert states(db, ["PSWU5412.MP4", "PSWU5412 1.MP4"]) == {"INGESTED", "COPY"}
-    assert beside(stack_smoke.staging, "IMG_2834 1.MOV", "IMG_2834 1.HEIC")
-
-def test_no_burst_pair_shares_a_copy_group(stack_standard):
-    for a, b in stack_standard.manifest["relations"]["burst"]:
-        assert not same_copy_group(stack_standard.db, a, b), (a, b)
-
-def test_every_live_pair_staged_together(stack_standard): ...
-def test_junk_never_discovered(stack_smoke): ...           # --extras junk
-def test_corrupt_extras_quarantined(stack_smoke): ...      # --extras corrupt → expected reasons
-def test_reseed_under_new_paths_is_all_copy(stack_smoke): ...
-def test_nested_unicode_layout(stack_smoke_nested): ...
+```ts
+test('smoke: invariant, expectations, golden tree', async () => {
+  expect(await checkInvariant(...ctx)).toEqual([]); expect(await diffExpectations(...exp)).toEqual([]);
+  expect(await treeSnapshot(...snap)).toEqual(await readGolden('smoke_tree.txt'));
+});
+test('pinned cases', async () => {
+  expect(await kindOf('IMG_E8719.HEIC')).toBe('still'); expect(await mimeOf('IMG_E8719.HEIC')).toBe('image/jpeg');
+  expect(await kindOf('IMG_0004.MOV')).toBe('motion');
+  expect(await sameCopyGroup('IMG_0034.HEIC', 'IMG_0034.JPG')).toBe(true);
+  expect(await sameCopyGroup('IMG_2834.HEIC', 'IMG_2834 1.HEIC')).toBe(false);
+  expect(new Set(await states(['PSWU5412.MP4', 'PSWU5412 1.MP4']))).toEqual(new Set(['INGESTED', 'COPY']));
+  expect(await beside('IMG_2834 1.MOV', 'IMG_2834 1.HEIC')).toBe(true);
+});
+test('standard: no burst pair shares a copy group', async () => {
+  for (const [a, b] of manifest.relations.burst) expect(await sameCopyGroup(a, b), `${a} ${b}`).toBe(false);
+});
+test('standard: synthetic resized/re-encoded variants join their seed’s copy group', async () => {});
+test('every Live Photo pair staged together', async () => {});
+test('junk never discovered', async () => {});
+test('corrupt extras quarantined with expected reasons', async () => {});
+test('re-seed under new paths is all COPY', async () => {});
+test('nested Unicode layout works', async () => {});
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
@@ -1033,15 +1080,15 @@ Expected: FAIL (the golden file doesn't exist yet), with a readable per-file dif
 
 - [ ] **Step 3: Implement the harness, generate the golden file and review it by hand**
 
-- Isolation: `COMPOSE_PROJECT_NAME=pmtest_<run_id>`, `DATA_DIR=data-test/<run_id>`, and `docker-compose.test.yml`.
-- `wait_idle`: two consecutive 5 s polls in which running workflows = 0 and the drop zone has no eligible files. Then call `stage()`.
+- Isolation: `COMPOSE_PROJECT_NAME=pmtest_<runId>`, `DATA_DIR=data-test/<runId>`, and `docker-compose.test.yml`. The test reads the mapped ports via `docker compose port`.
+- `waitIdle`: two consecutive 5 s polls in which running workflows = 0 and the drop zone has no eligible files. Then call `stage()`.
 - On failure: keep the stack and dump per-state counts and the last 200 log lines from each service.
 
 Run `make update-golden`, then **read `smoke_tree.txt` and confirm every pinned case lands in the expected bucket before committing it.**
 
-- [ ] **Step 4: Run the suites to verify they pass**
+- [ ] **Step 4: Run gates G2–G8**
 
-Run: `make test-smoke && make test-standard`
+Run: `npm test && npm run test:coverage && npm run test:corpus && make corpus-verify && make test-smoke && make test-standard`
 Expected: PASS. Smoke takes ≤ 5 min. `corpus-verify` passes before and after.
 
 - [ ] **Step 5: Commit**
@@ -1055,28 +1102,28 @@ git add -A && git commit -m "test: corpus-driven e2e harness, golden invariant, 
 ### Task 13: Chaos proof
 
 **Files:**
-- Create: `tests/chaos/test_chaos.py`
-- Modify: `Makefile` (`chaos`)
-- Test: `tests/chaos/test_chaos.py`
+- Create: `tests/chaos/chaos.test.ts`
+- Modify: `Makefile` (`chaos`), `package.json` (`test:chaos`)
+- Test: `tests/chaos/chaos.test.ts`
 
 **Interfaces:**
-- Consumes: `Stack`, `check_invariant`, `tree_snapshot`, `diff_expectations` (Task 12)
+- Consumes: `Stack`, `checkInvariant`, `treeSnapshot`, `diffExpectations`, `partitions` (Task 12)
 
-- [ ] **Step 1: Write the chaos test** (marker `chaos`)
+- [ ] **Step 1: Write the chaos test**
 
-```python
-def test_chaos_equals_calm(tmp_run_factory):
-    calm = tmp_run_factory("standard", shuffle=1); calm.run_to_idle()
-    storm = tmp_run_factory("standard", shuffle=1)
-    storm.run_with_chaos(seed=42, actions=[
-        ("kill", "worker"), ("kill", "worker-extra"), ("restart", "temporal"), ("restart", "postgres"),
-        ("kill_all", None), ("sleep_mac_like_pause", "worker")],   # docker pause 120 s, then unpause
-        every_s=(15, 45), until_progress=0.9)
-    storm.run_to_idle()
-    assert check_invariant(*storm.ctx) == []
-    assert partitions(storm.db) == partitions(calm.db)         # similar sets exactly; copy groups excluding ambiguous
-    assert tree_snapshot(*storm.snap_ctx) == tree_snapshot(*calm.snap_ctx)
-    assert diff_expectations(*storm.exp_ctx) == []
+```ts
+test('chaos equals calm', async () => {
+  const calm = await runTier('standard', { shuffle: 1 }); await calm.runToIdle();
+  const storm = await runTier('standard', { shuffle: 1 });
+  await storm.runWithChaos({ seed: 42, everyS: [15, 45], untilProgress: 0.9, actions: [
+    ['kill', 'worker'], ['kill', 'worker-extra'], ['restart', 'temporal'], ['restart', 'postgres'],
+    ['killAll'], ['pause', 'worker', 120_000]] });                         // pause ≈ Mac sleep
+  await storm.runToIdle();
+  expect(await checkInvariant(...storm.ctx)).toEqual([]);
+  expect(await partitions(storm.dbUrl)).toEqual(await partitions(calm.dbUrl));
+  expect(await treeSnapshot(...storm.snap)).toEqual(await treeSnapshot(...calm.snap));
+  expect(await diffExpectations(...storm.exp)).toEqual([]);
+}, 3 * 60 * 60 * 1000);
 ```
 
 - [ ] **Step 2: Run it**
@@ -1084,10 +1131,10 @@ def test_chaos_equals_calm(tmp_run_factory):
 Run: `make chaos`
 Expected: PASS. Any failure is a real defect: stop, use superpowers:systematic-debugging, add a regression unit test in the owning module, fix it, and re-run.
 
-- [ ] **Step 3: Confirm it passes three times in a row**
+- [ ] **Step 3: Confirm it passes three times in a row (G8)**
 
-Run: `for i in 1 2 3; do make chaos || break; done`
-Expected: 3 PASS
+Run: `for i in 1 2 3; do make chaos || break; done && make test-standard`
+Expected: 3 PASS, and standard still green
 
 - [ ] **Step 4: Commit**
 
