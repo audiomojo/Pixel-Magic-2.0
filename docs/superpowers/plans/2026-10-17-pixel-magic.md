@@ -6,7 +6,7 @@
 
 **Architecture:** One Python package (`pixelmagic`) runs as Temporal workers on the task queues `main` (workflows), `io`, `cpu` and `cluster`. Postgres holds the facts (`files`, `contents`, `groups`). Temporal holds progress. Staging is computed from the database and swapped in with an atomic symlink rename. Compose runs postgres, temporal, temporal-ui, migrate, worker, worker-extra and grafana.
 
-**Tech Stack:** Python 3.12, uv, temporalio, psycopg 3 (async + pool), Alembic/SQLAlchemy (migrations only), pydantic-settings, Pillow, pillow-heif, rawpy, imagehash, NumPy ≥ 2.0, PyExifTool (+ exiftool binary), pebble, structlog. Tests use pytest, pytest-asyncio, hypothesis and testcontainers[postgres]. Lint and types use ruff and mypy (strict on `src/`).
+**Tech Stack:** Python 3.12, uv, temporalio, psycopg 3 (async + pool), Alembic/SQLAlchemy (migrations only), pydantic-settings, Pillow, pillow-heif, rawpy, imagehash, NumPy ≥ 2.0, PyExifTool (+ exiftool binary), pebble, structlog. Tests use pytest, pytest-asyncio, pytest-cov, hypothesis and testcontainers[postgres]. Lint and types use ruff and mypy (strict on `src/`).
 
 **Spec:** `docs/superpowers/specs/2026-10-17-pixel-magic-design.md` (including §12 "Revisions during planning")
 
@@ -20,6 +20,23 @@
 - Published ports are `127.0.0.1` only: Grafana 3000, Temporal UI 8080, Postgres 5432, Temporal 7233.
 - The corpus `test-automation/sample-images/` is never written to. It stays git-ignored, and tests reach it only by cloning with `cp -c`.
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+
+## Between-Task Gate (mandatory)
+
+No task is complete, and no next task starts, until **all** of the following pass on the committed tree. The reviewer re-runs them itself; it does not trust the implementer's report.
+
+| Gate | Command | Applies from |
+|------|---------|--------------|
+| G1 Red first | The task's new tests were seen failing before the implementation (the implementer pastes the failing output) | Task 1 |
+| G2 Full regression | `uv run pytest tests/unit tests/workflow -q` with **every** test from earlier tasks, 0 failures, 0 unexpected skips | Task 1 |
+| G3 Static | `uv run ruff check . && uv run ruff format --check . && uv run mypy src` | Task 1 |
+| G4 Coverage | `uv run pytest tests/unit tests/workflow --cov=pixelmagic --cov-fail-under=85` (branch coverage), and every module the task touched is ≥ 85% | Task 2 |
+| G5 Corpus unit | `uv run pytest -m corpus -q` passes (runs real sample files read-only) | Task 5 |
+| G6 Live stack | `make down && make up && make fs-check`, then the Task 9 Step 5 trickle (IMG_0034 HEIC/JPG lands in `unique/` + `copies/`) | Task 9 |
+| G7 Corpus safety | `make corpus-verify` exits 0 | Task 11 |
+| G8 E2E | `make test-smoke` (and `make test-standard` after Tasks 12 and 13) | Task 12 |
+
+**If any gate fails,** fix it inside the current task with superpowers:systematic-debugging. Never weaken or skip a test to get past a gate. A test from an earlier task that fails now is a regression in the current task.
 
 ## Review Focus
 
