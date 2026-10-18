@@ -3,7 +3,7 @@ import { basename, dirname, join } from 'node:path';
 import { Context, heartbeat } from '@temporalio/activity';
 import type pg from 'pg';
 import { withTx } from '../db.js';
-import { fsyncDir, linkIntoVault, sha256File, vaultRel } from '../fsops.js';
+import { fsyncDir, linkIntoVault, sameFile, sha256File, vaultRel } from '../fsops.js';
 import type { Metadata } from '../metadata.js';
 import type { FileRef, IngestResult } from '../types.js';
 import type { Deps } from './index.js';
@@ -70,17 +70,17 @@ export function makeIngestFile(deps: Deps) {
     if (r.rowCount !== 1) throw new StaleAttemptError(`file ${id}: not in ${allowed.join('|')}`);
   }
 
-  /** Tail of steps 6–7 (also re-run on replay): drop claimed/<id> only if the bytes' inode is held at `keep`. */
-  async function finish(id: string, keep: string): Promise<void> {
-    const [c, k] = await Promise.all([statOrNull(claimedPath(id)), statOrNull(keep)]);
+  /** Tail of steps 6–7 (also re-run on replay): drop claimed/<id> only if it is the file held at `keep` (`sameFile`). */
+  async function finish(id: string, keep: string, sha: string): Promise<void> {
+    const k = await statOrNull(keep);
     if (!k) return;
-    if (c && c.dev === k.dev && c.ino === k.ino) await unlink(claimedPath(id));
+    if (await sameFile(claimedPath(id), keep, sha)) await unlink(claimedPath(id));
     if ((k.mode & 0o777) !== 0o444) await chmod(keep, 0o444);
   }
 
   async function commitCopy(row: Row, sha: string, ext: string): Promise<IngestResult> {
     await guarded(pool, row.id, `state = 'COPY'`, ['CLAIMED']);
-    await finish(row.id, copiesPath(row.id, ext));
+    await finish(row.id, copiesPath(row.id, ext), sha);
     return { fileId: row.id, sha256: sha, ext, state: 'COPY', isNew: false, kind: null };
   }
 
@@ -114,7 +114,7 @@ export function makeIngestFile(deps: Deps) {
       );
       await guarded(c, row.id, `state = 'INGESTED'`, ['CLAIMED']);
     });
-    await finish(row.id, vaultPath(sha, ext));
+    await finish(row.id, vaultPath(sha, ext), sha);
     return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', isNew: true, kind: meta.kind };
   }
 
@@ -140,6 +140,7 @@ export function makeIngestFile(deps: Deps) {
       await finish(
         id,
         row.state === 'COPY' ? copiesPath(id, row.ext) : vaultPath(row.sha256, row.ext),
+        row.sha256,
       );
     return {
       fileId: id,
@@ -181,8 +182,7 @@ export function makeIngestFile(deps: Deps) {
     const row = r.rows[0];
     if (row?.sha256 && row.ext) {
       const keep = row.state === 'COPY' ? copiesPath(id, row.ext) : vaultPath(row.sha256, row.ext);
-      const k = await statOrNull(keep);
-      if (k && k.dev === c.dev && k.ino === c.ino) return;
+      if (await sameFile(claimed, keep, row.sha256)) return;
     }
     const dest = join(layout.dropzone, ref.relPath);
     await mkdir(dirname(dest), { recursive: true });

@@ -384,7 +384,7 @@ describe('seed', () => {
     const corpus = sm.files.filter((f) => f.origin === 'corpus');
     expect(corpus.map((f) => f.name).sort()).toEqual(['a.jpg', 'b.jpg', 'c.jpg', 'e.heic']);
     for (const f of corpus) {
-      expect(f.relPath).toMatch(/^d\d\/e\d\//);
+      expect(f.relPath).toMatch(/^d\d Été\/e\d 写真\//); // nested Unicode directories
       expect(f.sha256).toBe(truth.get(f.name)!.sha256);
       expect(f.mtimeNs).toBe(truth.get(f.name)!.mtimeNs);
     }

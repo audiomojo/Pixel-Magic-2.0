@@ -1,4 +1,5 @@
-.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle corpus-manifest corpus-verify
+.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle corpus-manifest corpus-verify \
+	test-smoke test-standard update-golden golden-smoke
 
 CORPUS := test-automation/sample-images
 
@@ -45,3 +46,23 @@ corpus-manifest:
 # G7: the corpus still matches its manifest (size+mtime; DEEP=1 re-hashes every file).
 corpus-verify:
 	npx tsx tools/corpus/verify.ts $(if $(DEEP),--deep,)
+
+# G8: an e2e tier on its own compose project (pmtest_<runId>) and data-test/<runId>, with
+# corpus-verify before and after (the after-check runs even when the tier fails).
+define e2e
+	$(MAKE) corpus-verify
+	status=0; TIER=$(1) $(2) npm run test:e2e || status=$$?; $(MAKE) corpus-verify && exit $$status
+endef
+
+test-smoke:
+	$(call e2e,smoke,)
+
+test-standard:
+	$(call e2e,standard,)
+
+# Writes tests/e2e/golden/smoke_tree.txt locally. It is git-ignored: staged names come from
+# personal photos (dates + original names), so every machine generates its own golden.
+update-golden:
+	$(call e2e,smoke,UPDATE_GOLDEN=1)
+
+golden-smoke: update-golden

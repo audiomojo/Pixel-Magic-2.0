@@ -138,6 +138,14 @@ export async function truncatedJpeg(dir: string): Promise<string> {
   return p;
 }
 
+/** A real JPEG's first 200 bytes, then 4 KiB of random bytes: a JPEG whose header is corrupt. */
+export async function garbageJpeg(dir: string): Promise<string> {
+  const full = await readFile(await photo(dir, 'jpg'));
+  const p = nextPath(dir, 'jpg');
+  await writeFile(p, Buffer.concat([full.subarray(0, 200), cryptoRandomBytes(4096)]));
+  return p;
+}
+
 /** 4 KiB of random bytes: no image format at all. */
 export async function randomBytes(dir: string): Promise<string> {
   const p = nextPath(dir, 'jpg');

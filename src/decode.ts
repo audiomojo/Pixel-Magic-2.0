@@ -165,7 +165,8 @@ function toQuarantine(err: unknown): unknown {
   const msg = err.message;
   if (/pixel limit/i.test(msg)) return new QuarantineError('decompression_bomb', msg);
   if (/premature end|truncated/i.test(msg)) return new QuarantineError('truncated', msg);
-  if (/unsupported image format/i.test(msg)) return new QuarantineError('decode_error', msg);
+  if (/unsupported image format|corrupt header/i.test(msg))
+    return new QuarantineError('decode_error', msg);
   return err;
 }
 

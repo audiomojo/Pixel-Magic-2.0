@@ -13,7 +13,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run --project unit --project workflow",
     "test:coverage": "vitest run --project unit --project workflow --coverage",
-    "test:corpus": "vitest run --project corpus"
+    "test:corpus": "vitest run --project corpus",
+    "test:e2e": "vitest run --project e2e"
   },
   "dependencies": {
     "@temporalio/activity": "^1.24.0",

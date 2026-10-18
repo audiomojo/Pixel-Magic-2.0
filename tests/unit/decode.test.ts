@@ -15,6 +15,7 @@ import { hamming } from '../../src/hashing.js';
 import {
   bmpFile,
   bombPng,
+  garbageJpeg,
   HEIC_SCENE0,
   JPEG_A,
   photo,
@@ -79,6 +80,7 @@ test('QuarantineError keeps name and reason as own properties', () => {
 test.each([
   [truncatedJpeg, 'truncated'],
   [randomBytes, 'decode_error'],
+  [garbageJpeg, 'decode_error'], // libvips: "corrupt header" is permanent
   [bombPng, 'decompression_bomb'],
 ] as const)('quarantine reason %#', async (make, reason) =>
   expect(computeImageFacts(await make(await tmpDir()), 'jpg')).rejects.toMatchObject({ reason }),

@@ -13,6 +13,16 @@ export default defineConfig({
       },
       { test: { name: 'workflow', include: ['tests/workflow/**/*.test.ts'] } },
       { test: { name: 'corpus', include: ['tests/**/*.corpus.test.ts'] } },
+      {
+        // The real compose stack against a seeded corpus subset; TIER picks the suite.
+        test: {
+          name: 'e2e',
+          include: [`tests/e2e/${process.env['TIER'] ?? 'smoke'}.test.ts`],
+          fileParallelism: false,
+          testTimeout: 30 * 60_000,
+          hookTimeout: 60 * 60_000,
+        },
+      },
     ],
     coverage: {
       provider: 'v8',

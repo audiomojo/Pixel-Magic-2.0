@@ -72,6 +72,31 @@ export async function sha256File(path: string, onChunk?: () => void): Promise<st
   return h.digest('hex');
 }
 
+async function statOrNull(path: string) {
+  try {
+    return await stat(path, { bigint: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+/**
+ * Whether `a` and `b` are names of one file. Equal `(dev, ino)` decides. Docker Desktop's
+ * virtiofs renumbers an inode when its cache evicts it, though, so two names of one file can
+ * report different numbers. On a mismatch, two multiply-linked files with equal size and mtime
+ * whose bytes both hash to `sha256` count as the same file.
+ */
+export async function sameFile(a: string, b: string, sha256: string | null): Promise<boolean> {
+  const [x, y] = await Promise.all([statOrNull(a), statOrNull(b)]);
+  if (!x || !y) return false;
+  if (x.dev === y.dev && x.ino === y.ino) return true;
+  if (sha256 === null || x.nlink < 2n || y.nlink < 2n) return false;
+  if (x.size !== y.size || x.mtimeNs !== y.mtimeNs) return false;
+  const [ha, hb] = await Promise.all([sha256File(a), sha256File(b)]);
+  return ha === sha256 && hb === sha256;
+}
+
 export type LinkOutcome = 'LINKED' | 'ALREADY_LINKED' | 'EXISTS_OTHER';
 
 /** fsync a directory so a link or rename inside it survives power loss. */

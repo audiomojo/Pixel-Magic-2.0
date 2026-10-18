@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
-import { stat, writeFile } from 'node:fs/promises';
-import { expect, test } from 'vitest';
+import { link, stat, utimes, writeFile } from 'node:fs/promises';
+import { describe, expect, test } from 'vitest';
 import {
   DataLayout,
   SameDeviceError,
   checkSameDevice,
   isIgnored,
   linkIntoVault,
+  sameFile,
   sha256File,
   vaultRel,
 } from '../../src/fsops.js';
@@ -86,4 +87,46 @@ test('checkSameDevice throws SameDeviceError when a dir is on another device', a
   };
   await expect(checkSameDevice(l, fake)).rejects.toBeInstanceOf(SameDeviceError);
   await expect(checkSameDevice(l, fake)).rejects.toThrow(/staging/);
+});
+
+describe('sameFile', () => {
+  const sha = (body: string) => createHash('sha256').update(body).digest('hex');
+
+  test('hardlinks of one inode', async () => {
+    const d = await tmpDir();
+    await writeFile(`${d}/a`, 'bytes');
+    await link(`${d}/a`, `${d}/b`);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(true);
+  });
+
+  test('a lone file with equal bytes is not the same file', async () => {
+    const d = await tmpDir();
+    await writeFile(`${d}/a`, 'bytes');
+    await writeFile(`${d}/b`, 'bytes');
+    for (const f of ['a', 'b']) await utimes(`${d}/${f}`, 1_700_000_000, 1_700_000_000);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(false);
+  });
+
+  // Docker Desktop's virtiofs renumbers inodes when its cache evicts them, so two names of one
+  // file can report different inode numbers. Multiply-linked, equal size and mtime, bytes hashing
+  // to the expected sha256: the same file.
+  test('renumbered inode: multiply-linked twins with the expected bytes', async () => {
+    const d = await tmpDir();
+    await writeFile(`${d}/a`, 'bytes');
+    await writeFile(`${d}/b`, 'bytes');
+    await link(`${d}/a`, `${d}/a2`);
+    await link(`${d}/b`, `${d}/b2`);
+    for (const f of ['a', 'b']) await utimes(`${d}/${f}`, 1_700_000_000, 1_700_000_000);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(true);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('other'))).toBe(false);
+    expect(await sameFile(`${d}/a`, `${d}/b`, null)).toBe(false);
+    await utimes(`${d}/b`, 1_700_000_000, 1_700_000_005);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(false);
+  });
+
+  test('a missing path is never the same file', async () => {
+    const d = await tmpDir();
+    await writeFile(`${d}/a`, 'bytes');
+    expect(await sameFile(`${d}/a`, `${d}/nope`, sha('bytes'))).toBe(false);
+  });
 });

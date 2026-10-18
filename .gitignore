@@ -6,6 +6,8 @@ tests/reports/
 # Corpus ground truth (personal capture metadata and hashes) — generated, never commit
 tests/corpus/.hash-cache.json
 tests/corpus/manifest.json
+# Golden staging trees hold staged names from personal photos — generated locally, never commit
+tests/e2e/golden/
 
 # Python / tooling
 __pycache__/

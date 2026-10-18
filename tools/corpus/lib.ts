@@ -699,11 +699,11 @@ export async function assertOutsideCorpus(corpusDir: string, dest: string): Prom
   }
 }
 
-/** Stable small bucket for the nested layout. */
+/** Stable small bucket for the nested layout: non-ASCII directory names with spaces, on purpose. */
 function bucketOf(name: string): string {
   let h = 0x811c9dc5;
   for (const c of Buffer.from(name)) h = Math.imul(h ^ c, 0x01000193) >>> 0;
-  return `d${h % 8}/e${(h >>> 3) % 4}`;
+  return `d${h % 8} Été/e${(h >>> 3) % 4} 写真`;
 }
 
 async function seedFileOf(
@@ -803,7 +803,11 @@ async function writeJunk(dest: string, prefix: string): Promise<Item[]> {
   return Object.keys(files).map((relPath) => ({ relPath, origin: 'junk' }));
 }
 
-/** A truncated JPEG and random bytes named `.jpg`, with the quarantine reason each must get. */
+/**
+ * A truncated JPEG and a JPEG whose header is followed by random bytes, with the quarantine
+ * reason each must get. (Bare random bytes have no detectable type: they are filed under
+ * `other/`, not decoded.)
+ */
 async function writeCorrupt(dest: string, prefix: string): Promise<Item[]> {
   const full = await sharp({
     create: { width: 256, height: 192, channels: 3, background: { r: 30, g: 120, b: 200 } },
@@ -814,9 +818,11 @@ async function writeCorrupt(dest: string, prefix: string): Promise<Item[]> {
   const rnd = prng(4096);
   for (let i = 0; i < random.length; i++) random[i] = Math.floor(rnd() * 256);
   const truncated = `${prefix}corrupt-truncated.jpg`;
-  const garbage = `${prefix}corrupt-random.jpg`;
+  const garbage = `${prefix}corrupt-garbage.jpg`;
   await writeFile(join(dest, truncated), full.subarray(0, full.length >> 1), { flag: 'wx' });
-  await writeFile(join(dest, garbage), random, { flag: 'wx' });
+  await writeFile(join(dest, garbage), Buffer.concat([full.subarray(0, 200), random]), {
+    flag: 'wx',
+  });
   return [
     { relPath: truncated, origin: 'corrupt', reason: 'truncated' },
     { relPath: garbage, origin: 'corrupt', reason: 'decode_error' },
