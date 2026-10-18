@@ -14,7 +14,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname, join, relative, sep } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
-import { fsyncDir, vaultRel } from '../fsops.js';
+import { fsyncDir } from '../fsops.js';
 import { planStaging, type Entry, type StageContent, type StageFile } from '../stagingPlan.js';
 import type { BuildResult } from '../types.js';
 import type { Deps } from './index.js';
@@ -135,6 +135,7 @@ export function makeStaging(deps: Deps) {
               g.similar_set_id, c.copy_ambiguous
          FROM contents c LEFT JOIN groups g ON g.id = c.copy_group_id`,
     );
+    // COPY files only name contents (and pair Live Photos); their bytes are never staged.
     const fs = await c.query<{
       id: bigint;
       rel_path: string;
@@ -142,9 +143,8 @@ export function makeStaging(deps: Deps) {
       mtime_ns: bigint;
       sha256: string;
       state: string;
-      ext: string;
     }>(
-      `SELECT id, rel_path, original_name, mtime_ns, sha256, state, ext FROM files
+      `SELECT id, rel_path, original_name, mtime_ns, sha256, state FROM files
         WHERE state IN ('INGESTED', 'COPY') AND sha256 IS NOT NULL AND ext IS NOT NULL`,
     );
     const num = (v: bigint | null) => (v === null ? null : Number(v));
@@ -173,10 +173,6 @@ export function makeStaging(deps: Deps) {
         mtimeNs: r.mtime_ns,
         sha256: r.sha256,
         state: r.state,
-        srcRel:
-          r.state === 'COPY'
-            ? layout.rel(join(layout.vaultCopies, `${String(r.id)}.${r.ext}`))
-            : vaultRel(r.sha256, r.ext),
       })),
     };
   }

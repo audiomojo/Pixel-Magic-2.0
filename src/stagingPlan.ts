@@ -19,7 +19,11 @@ export interface StageContent {
   ambiguous: boolean;
 }
 
-/** One `files` row holding bytes (`INGESTED` or `COPY`). `srcRel` is its bytes' path under DATA_DIR. */
+/**
+ * One `INGESTED` or `COPY` files row. Every file of a content names it (the lowest
+ * `(relPath, mtimeNs, fileId)` does, spec §6.4), but its bytes are always staged from the vault:
+ * a byte-identical COPY file is never staged itself (staging choice (a), spec §6.5).
+ */
 export interface StageFile {
   fileId: bigint;
   relPath: string;
@@ -27,7 +31,6 @@ export interface StageFile {
   mtimeNs: bigint;
   sha256: string;
   state: string;
-  srcRel: string;
 }
 
 /** One hardlink: `dest` relative to the generation directory, `src` relative to DATA_DIR. */
@@ -253,22 +256,21 @@ export function planStaging(
   const requests: Request[] = [];
   /** Each content's own placement (the request carrying its naming file), for Live MOVs. */
   const placementOf = new Map<string, Request>();
-  const fileRequest = (folder: string, name: string, f: StageFile): Request => ({
+  /** One link of content `c`'s vault file, named after (and ordered by) its naming file `f`. */
+  const fileRequest = (folder: string, name: string, c: StageContent, f: StageFile): Request => ({
     folder,
     name,
     sha: f.sha256,
     relPath: f.relPath,
     mtimeNs: f.mtimeNs,
     fileId: f.fileId,
-    src: f.srcRel,
+    src: vaultRel(c.sha256, c.ext),
   });
-  /** The content's placement from the vault, and every other file of it into `copiesFolder`. */
-  const place = (c: StageContent, folder: string, name: string, copiesFolder: string) => {
-    const [first, ...rest] = filesOf(c);
-    const r = { ...fileRequest(folder, name, first!), src: vaultRel(c.sha256, c.ext) };
+  /** The content's one placement; its other files are byte-identical copies, never staged. */
+  const place = (c: StageContent, folder: string, name: string) => {
+    const r = fileRequest(folder, name, c, namingFile(c));
     requests.push(r);
     placementOf.set(c.sha256, r);
-    for (const f of rest) requests.push(fileRequest(copiesFolder, f.originalName, f));
   };
 
   // Copy groups and similar sets of CLUSTERED stills.
@@ -294,25 +296,18 @@ export function planStaging(
     const folder = sb
       ? `similar/${dateOf(sb).dir}/s-${sha8(sb.sha256)}`
       : `unique/${dateOf(best!).dir}`;
-    place(best!, folder, `${dateOf(best!).stamp}_${namingFile(best!).originalName}`, copies);
-    for (const o of others) {
-      const [first, ...rest] = filesOf(o);
-      const r = fileRequest(copies, first!.originalName, first!);
-      requests.push(r);
-      placementOf.set(o.sha256, r);
-      for (const f of rest) requests.push(fileRequest(copies, f.originalName, f));
-    }
+    place(best!, folder, `${dateOf(best!).stamp}_${namingFile(best!).originalName}`);
+    // The group's other contents: different files of the same shot.
+    for (const o of others) place(o, copies, namingFile(o).originalName);
   }
 
   // Quarantine, FAILED, and INGESTED motion / other.
   const stillsOf = new Map<string, string[]>();
   for (const [still, motion] of pairs) push(stillsOf, motion, still);
-  const vcopies = (c: StageContent) => `copies/v-${sha8(c.sha256)}`;
   for (const c of staged) {
     const name = namingFile(c).originalName;
-    if (c.state === 'QUARANTINED')
-      place(c, `quarantine/${reasonDir(c.quarantineReason)}`, name, vcopies(c));
-    else if (c.state === 'FAILED') place(c, 'quarantine/failed', name, vcopies(c));
+    if (c.state === 'QUARANTINED') place(c, `quarantine/${reasonDir(c.quarantineReason)}`, name);
+    else if (c.state === 'FAILED') place(c, 'quarantine/failed', name);
   }
   // Every still placement is known now, so a motion's home never depends on sha order.
   const besideMotions: StageContent[] = [];
@@ -322,7 +317,7 @@ export function planStaging(
       besideMotions.push(c);
     else {
       const dir = dirOf(namingFile(c).relPath);
-      place(c, dir === '' ? 'other' : `other/${dir}`, namingFile(c).originalName, vcopies(c));
+      place(c, dir === '' ? 'other' : `other/${dir}`, namingFile(c).originalName);
     }
   }
 
@@ -333,8 +328,8 @@ export function planStaging(
   // Paired MOVs: beside every placement of their stills, under the still's final base name.
   const beside: Request[] = [];
   for (const m of besideMotions) {
-    const [first, ...rest] = filesOf(m);
-    const ext = extOf(first!.originalName) || `.${m.ext}`;
+    const first = namingFile(m);
+    const ext = extOf(first.originalName) || `.${m.ext}`;
     for (const still of stillsOf.get(m.sha256)!) {
       const p = placementOf.get(still);
       if (!p) continue;
@@ -342,11 +337,11 @@ export function planStaging(
       const r = fileRequest(
         dest.slice(0, lastSlash(dest)),
         stemOf(dest.slice(lastSlash(dest) + 1)) + ext,
-        first!,
+        m,
+        first,
       );
-      beside.push({ ...r, relPath: dest, src: vaultRel(m.sha256, m.ext) });
+      beside.push({ ...r, relPath: dest });
     }
-    for (const f of rest) beside.push(fileRequest(`copies/v-${sha8(m.sha256)}`, f.originalName, f));
   }
   for (const r of beside.sort(cmpRequest)) namer.place(r);
 

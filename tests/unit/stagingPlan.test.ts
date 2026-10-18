@@ -44,11 +44,45 @@ const Fl = (
     mtimeNs: 1_600_000_000_000_000_000n,
     sha256: c.sha256,
     state,
-    srcRel: state === 'COPY' ? `vault/.copies/${fileId}.${c.ext}` : vaultRel(c.sha256, c.ext),
     ...o,
   };
 };
 const dests = (entries: Entry[]): string[] => entries.map((e) => e.dest).sort();
+
+// Staging choice (a), 2026-10-18: copies/ shows only different files of the same shot. A
+// byte-identical COPY file is never staged (removed from .copies or not); it is only counted.
+test('byte-identical COPY files are never staged; every link comes from the vault', () => {
+  const heic = C('h'.repeat(64), { ext: 'heic', width: 4032, height: 3024 });
+  const jpg = C('j'.repeat(64), { ext: 'jpg', width: 2016, height: 1512 });
+  const files = [
+    Fl(1n, 'IMG_0034.HEIC', heic),
+    Fl(2n, 'again/IMG_0034.HEIC', heic, { state: 'COPY' }),
+    Fl(3n, 'IMG_0034.JPG', jpg),
+    Fl(4n, 'again/IMG_0034.JPG', jpg, { state: 'COPY' }),
+    Fl(5n, 'more/IMG_0034.JPG', jpg, { state: 'COPY' }),
+  ];
+  expect(planStaging([heic, jpg], files, 5)).toEqual([
+    { dest: 'copies/g-hhhhhhhh/IMG_0034.JPG', src: vaultRel(jpg.sha256, 'jpg') },
+    {
+      dest: 'unique/2021/2021-10/20211003_140211_IMG_0034.HEIC',
+      src: vaultRel(heic.sha256, 'heic'),
+    },
+  ]);
+});
+
+test('a content named by a COPY file still links from the vault', () => {
+  const c = C('a'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
+  const best = C('b'.repeat(64));
+  const files = [
+    Fl(1n, 'z/B.HEIC', best),
+    Fl(2n, 'z/A.JPG', c),
+    Fl(3n, 'a/A.JPG', c, { state: 'COPY' }),
+  ];
+  expect(planStaging([best, c], files, 5)[0]).toEqual({
+    dest: 'copies/g-bbbbbbbb/A.JPG',
+    src: vaultRel(c.sha256, 'jpg'),
+  });
+});
 
 test('unique best copy and content-named copies folder', () => {
   const heic = C('h'.repeat(64), { ext: 'heic', width: 4032, height: 3024, copyGroup: 1 });
@@ -122,7 +156,7 @@ test('Live MOV beside still with same base name', () => {
   ]); // MOV keeps its own extension
 });
 
-test('Live MOV links from the vault, and its byte copies go to copies/v-', () => {
+test('Live MOV links from the vault, and its byte copies are never staged', () => {
   const s = C('5'.repeat(64), { liveContentId: 'L1' });
   const m = C('6'.repeat(64), {
     kind: 'motion',
@@ -137,7 +171,6 @@ test('Live MOV links from the vault, and its byte copies go to copies/v-', () =>
     5,
   );
   expect(out).toEqual([
-    { dest: 'copies/v-66666666/IMG_9.MOV', src: 'vault/.copies/3.mov' },
     { dest: 'unique/2021/2021-10/20211003_140211_IMG_9.HEIC', src: vaultRel(s.sha256, 'heic') },
     { dest: 'unique/2021/2021-10/20211003_140211_IMG_9.MOV', src: vaultRel(m.sha256, 'mov') },
   ]);
@@ -213,7 +246,6 @@ test('naming file: lowest (relPath, mtimeNs, fileId) — a re-drop with an older
     [2n, 1n],
   ] as const)
     expect(planStaging([c], files(n, o), 5)).toEqual([
-      { dest: 'copies/g-aaaaaaaa/N.HEIC', src: vaultRel(c.sha256, 'heic') },
       { dest: 'unique/2020/2020-01/20200101_000000_N.HEIC', src: vaultRel(c.sha256, 'heic') },
     ]);
 });
@@ -257,15 +289,24 @@ test('content-id pairing picks the lowest motion sha and ignores duration', () =
 });
 
 test('collision gets _sha8, then _2', () => {
-  const best = C('a'.repeat(64)),
-    j = C('b'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
+  // Three different contents of one shot, all named IMG_1.JPG; two share their first 8 hex.
+  const best = C('a'.repeat(64));
+  const small = (sha: string) => C(sha, { ext: 'jpg', width: 10, height: 10 });
+  const [j, k, l] = [
+    'b'.repeat(64),
+    'b'.repeat(8) + 'c'.repeat(56),
+    'b'.repeat(8) + 'd'.repeat(56),
+  ];
+  const [cj, ck, cl] = [small(j), small(k), small(l)];
   const files = [
     Fl(1n, 'IMG_1.HEIC', best),
-    Fl(2n, 'x/IMG_1.JPG', j),
-    Fl(3n, 'y/IMG_1.JPG', j, { state: 'COPY' }),
-    Fl(4n, 'z/IMG_1.JPG', j, { state: 'COPY' }),
+    Fl(2n, 'x/IMG_1.JPG', cj),
+    Fl(3n, 'y/IMG_1.JPG', ck),
+    Fl(4n, 'z/IMG_1.JPG', cl),
   ];
-  expect(dests(planStaging([best, j], files, 5)).filter((d) => d.startsWith('copies/'))).toEqual([
+  expect(
+    dests(planStaging([best, cj, ck, cl], files, 5)).filter((d) => d.startsWith('copies/')),
+  ).toEqual([
     'copies/g-aaaaaaaa/IMG_1.JPG',
     'copies/g-aaaaaaaa/IMG_1_bbbbbbbb.JPG',
     'copies/g-aaaaaaaa/IMG_1_bbbbbbbb_2.JPG',
@@ -276,21 +317,23 @@ test('collisions are case-insensitive and suffix names without an extension', ()
   const best = C('a'.repeat(64));
   const j = C('b'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
   const k = C('c'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
+  const r1 = C('1'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
+  const r2 = C('2'.repeat(64), { ext: 'jpg', width: 10, height: 10 });
   const files = [
     Fl(1n, 'IMG_1.HEIC', best),
     Fl(2n, 'x/img_1.jpg', j),
     Fl(3n, 'y/IMG_1.JPG', k),
-    Fl(4n, 'p/README', j, { state: 'COPY' }),
-    Fl(5n, 'q/README', j, { state: 'COPY' }),
+    Fl(4n, 'p/README', r1),
+    Fl(5n, 'q/README', r2),
   ];
-  expect(dests(planStaging([best, j, k], files, 5)).filter((d) => d.startsWith('copies/'))).toEqual(
-    [
-      'copies/g-aaaaaaaa/IMG_1_cccccccc.JPG',
-      'copies/g-aaaaaaaa/README',
-      'copies/g-aaaaaaaa/README_bbbbbbbb',
-      'copies/g-aaaaaaaa/img_1.jpg',
-    ],
-  );
+  expect(
+    dests(planStaging([best, j, k, r1, r2], files, 5)).filter((d) => d.startsWith('copies/')),
+  ).toEqual([
+    'copies/g-aaaaaaaa/IMG_1_cccccccc.JPG',
+    'copies/g-aaaaaaaa/README',
+    'copies/g-aaaaaaaa/README_22222222',
+    'copies/g-aaaaaaaa/img_1.jpg',
+  ]);
 });
 
 test('two Live pairs with one base name do not collide', () => {
@@ -392,7 +435,7 @@ test('quarantine, failed and other buckets', () => {
   ).toEqual(['other/d/e/IMG_1.AAE', 'quarantine/failed/HANG.JPG', 'quarantine/truncated/BAD.JPG']);
 });
 
-test('quarantine byte copies go to copies/v-, an odd reason is made path-safe', () => {
+test('quarantine byte copies are not staged, an odd reason is made path-safe', () => {
   const q = C('e'.repeat(64), {
     state: 'QUARANTINED',
     quarantineReason: '../bad reason',
@@ -407,11 +450,7 @@ test('quarantine byte copies go to copies/v-, an odd reason is made path-safe', 
         5,
       ),
     ),
-  ).toEqual([
-    'copies/v-eeeeeeee/BAD.JPG',
-    'quarantine/.._bad_reason/BAD.JPG',
-    'quarantine/unknown/N.JPG',
-  ]);
+  ).toEqual(['quarantine/.._bad_reason/BAD.JPG', 'quarantine/unknown/N.JPG']);
 });
 
 test('names are independent of group ids', () => {
@@ -438,7 +477,7 @@ test('name comes from lowest (relPath, fileId), not arrival order', () => {
     5,
   );
   expect(dests(a)).toEqual(dests(b));
-  expect(dests(a)).toEqual(['copies/v-11111111/PSWU5412.MP4', 'other/PSWU5412 1.MP4']);
+  expect(dests(a)).toEqual(['other/PSWU5412 1.MP4']);
 });
 
 test('dated names are UTC', () => {
@@ -572,13 +611,7 @@ const world: fc.Arbitrary<World> = fc
 function permute(w: World, order: number[], shift: number): World {
   const files = order.map((k, i) => {
     const f = w.files[k]!;
-    const c = w.contents.find((x) => x.sha256 === f.sha256)!;
-    const fileId = BigInt(i + 1);
-    return {
-      ...f,
-      fileId,
-      srcRel: f.state === 'COPY' ? `vault/.copies/${fileId}.${c.ext}` : f.srcRel,
-    };
+    return { ...f, fileId: BigInt(i + 1) };
   });
   const contents = [...w.contents].reverse().map((c) => ({
     ...c,
@@ -590,8 +623,8 @@ function permute(w: World, order: number[], shift: number): World {
 
 /** The tree as a viewer sees it: every dest with the bytes (content sha) it links to. */
 function tree(w: World, entries: Entry[]): [string, string][] {
-  const byCopy = new Map(w.files.map((f) => [f.srcRel, f.sha256]));
-  return entries.map((e) => [e.dest, byCopy.get(e.src)!]);
+  const bySrc = new Map(w.contents.map((c) => [vaultRel(c.sha256, c.ext), c.sha256]));
+  return entries.map((e) => [e.dest, bySrc.get(e.src)!]);
 }
 
 test('the tree is independent of arrival order and group ids (property)', () => {

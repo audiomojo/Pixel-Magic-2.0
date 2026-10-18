@@ -155,7 +155,7 @@ async function file(relPath: string, s: string, ext: string, state = 'INGESTED')
 }
 
 /** A Live still with a byte copy, a smaller JPEG copy, its MOV and an AAE sidecar. */
-async function seedPipelineRows(): Promise<{ a: string }> {
+async function seedPipelineRows(): Promise<{ a: string; copyId: bigint }> {
   const [ba, bb, bm, bx] = [1, 2, 3, 4].map(() => randomBytes(64));
   await pool.query(`INSERT INTO groups (id, kind) VALUES (1, 'copy')`);
   const a = await content(ba!, {
@@ -179,15 +179,15 @@ async function seedPipelineRows(): Promise<{ a: string }> {
   await put(vaultRel(b, 'jpg'), bb!);
   await put(vaultRel(m, 'mov'), bm!);
   await put(vaultRel(x, 'aae'), bx!);
-  return { a };
+  return { a, copyId };
 }
 
 test('build stages the planned tree', async () => {
   const { a } = await seedPipelineRows();
   const r = await build(true);
-  expect(r).toEqual({ gen: 1, entries: 5, skipped: false });
+  expect(r).toEqual({ gen: 1, entries: 4, skipped: false });
+  // The byte-identical COPY of IMG_1.HEIC is not staged (staging choice (a)).
   expect((await tree(join(layout.staging, 'current'))).map(([p]) => p)).toEqual([
-    `copies/g-${a.slice(0, 8)}/IMG_1.HEIC`,
     `copies/g-${a.slice(0, 8)}/IMG_1.JPG`,
     'other/p/IMG_1.AAE',
     'unique/2021/2021-10/20211003_140211_IMG_1.HEIC',
@@ -196,7 +196,22 @@ test('build stages the planned tree', async () => {
   const row = await pool.query<{ gen: bigint; cluster_version: bigint; entries: bigint }>(
     'SELECT gen, cluster_version, entries FROM staging_builds',
   );
-  expect(row.rows).toEqual([{ gen: 1n, cluster_version: 0n, entries: 5n }]);
+  expect(row.rows).toEqual([{ gen: 1n, cluster_version: 0n, entries: 4n }]);
+});
+
+test('a removed duplicate never breaks a build, and no staged file is a .copies inode', async () => {
+  const { copyId } = await seedPipelineRows();
+  const copy = join(layout.vaultCopies, `${String(copyId)}.heic`);
+  const copyIno = (await stat(copy)).ino;
+  await build(true);
+  for (const f of await walk(join(layout.staging, 'current')))
+    expect((await stat(f)).ino, f).not.toBe(copyIno);
+  await rm(copy, { force: true });
+  await pool.query(
+    `UPDATE files SET copy_removed_at = now(), copy_reclaimed_bytes = 64 WHERE id = $1`,
+    [copyId],
+  );
+  expect(await build(false)).toMatchObject({ gen: 2, entries: 4, skipped: false });
 });
 
 test('build swaps atomically and is repeatable', async () => {
@@ -334,14 +349,20 @@ test('a missing source fails the build and leaves current untouched', async () =
 });
 
 test('heartbeats every 1,000 links', async () => {
-  const bytes = randomBytes(16);
-  const s = await content(bytes, { ext: 'aae', kind: 'other', state: 'INGESTED' });
-  await put(vaultRel(s, 'aae'), bytes);
+  // 2,001 different contents (byte copies of one content would stage once).
+  const shas = Array.from({ length: 2001 }, (_, i) => (i + 1).toString(16).padStart(64, '0'));
+  await pool.query(
+    `INSERT INTO contents (sha256, ext, kind, size_bytes, state)
+     SELECT s, 'aae', 'other', 1, 'INGESTED' FROM unnest($1::text[]) s`,
+    [shas],
+  );
   await pool.query(
     `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state)
-     SELECT 'd' || i || '/X.AAE', 'X.AAE', 1, 0, 'aae', $1, 'INGESTED' FROM generate_series(1, 2001) i`,
-    [s],
+     SELECT 'd' || i || '/X.AAE', 'X.AAE', 1, 0, 'aae', s, 'INGESTED'
+       FROM unnest($1::text[]) WITH ORDINALITY AS t(s, i)`,
+    [shas],
   );
+  for (const s of shas) await put(vaultRel(s, 'aae'), Buffer.from(s));
   let beats = 0;
   const r = await runActivity(acts.maybeBuildStaging, [true], { onHeartbeat: () => beats++ });
   expect(r.entries).toBe(2001);
