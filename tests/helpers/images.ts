@@ -196,13 +196,9 @@ export async function bombPng(dir: string): Promise<string> {
 export const HEIC_SCENE0 = fileURLToPath(new URL('../fixtures/scene0.heic', import.meta.url));
 
 /**
- * A stand-in RAW: a TIFF of scene 3 named `.dng` whose embedded PreviewImage is scene 0.
- * With `orientation: 6`, IFD0 carries Orientation 6 and the preview (like a camera's) carries
- * no orientation tag and holds the pixels un-rotated (270°), so it displays as scene 0 upright.
- */
-/**
- * A TIFF-based DNG: the main image ("sensor", `size`, default 640×480) plus a 640×480 JPEG
- * preview. With `orientation: 6` both are stored rotated, as a camera stores a portrait shot.
+ * A stand-in RAW: a TIFF-based `.dng` whose main image ("sensor") is scene 3 at `size` (default
+ * 640×480), with a 640×480 JPEG PreviewImage of scene 0. With `orientation: 6` both are stored
+ * rotated and IFD0 carries Orientation 6, as a camera stores a portrait shot.
  */
 export async function rawWithPreview(
   dir: string,

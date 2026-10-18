@@ -224,10 +224,6 @@ class Namer {
   }
 }
 
-/**
- * The full staged tree (spec §6.4, §12 R5/R8) from database facts, sorted by `dest`. Only facts
- * decide it — never group ids, file ids beyond the last tie-break, or input order.
- */
 /** Appends `v` to `map[k]` in place (linear, unlike rebuilding the list on every push). */
 function push<K, V>(map: Map<K, V[]>, k: K, v: V): void {
   let list = map.get(k);
@@ -235,6 +231,10 @@ function push<K, V>(map: Map<K, V[]>, k: K, v: V): void {
   list.push(v);
 }
 
+/**
+ * The full staged tree (spec §6.4, §12 R5/R8) from database facts, sorted by `dest`. Only facts
+ * decide it — never group ids, file ids beyond the last tie-break, or input order.
+ */
 export function planStaging(
   contents: readonly StageContent[],
   files: readonly StageFile[],
