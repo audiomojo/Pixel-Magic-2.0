@@ -1,4 +1,4 @@
-import { appendFile, chmod, mkdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { WorkflowExecutionAlreadyStartedError, type Client } from '@temporalio/client';
 import type pg from 'pg';
@@ -306,4 +306,21 @@ test('scan needs a Temporal client', async () => {
 test('scan of an empty drop zone starts nothing', async () => {
   const r = await scan();
   expect(r).toEqual({ started: 0, pendingFiles: 0, pendingBytes: '0' });
+});
+
+test('scan warns once per scan about symlinks (aliases) it will never ingest', async () => {
+  await writeFile(join(layout.dropzone, 'ok.jpg'), JPEG_A);
+  await symlink('ok.jpg', join(layout.dropzone, 'alias.jpg'));
+  await mkdir(join(layout.dropzone, 'real'));
+  await symlink('../real', join(layout.dropzone, 'linked-folder'));
+  for (let i = 0; i < 2; i++) {
+    const warnings: string[] = [];
+    await runActivity(actsWithFakeClient.scanAndStart, [], {
+      onLog: (level, m) => {
+        if (level === 'WARN') warnings.push(m);
+      },
+    });
+    expect(warnings).toEqual([expect.stringMatching(/ 2 symlinks\b.*drop real files/)]);
+  }
+  expect(fakeClient.startedRelPaths()).toEqual(['ok.jpg', 'ok.jpg']); // one start per scan
 });

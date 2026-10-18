@@ -1,7 +1,12 @@
 import { availableParallelism, totalmem } from 'node:os';
 import { z } from 'zod';
 
-const int = (def: number) => z.coerce.number().int().default(def);
+/** compose forwards an unset variable as `''` (`${NAME:-}`): that means "use the default". */
+const unsetIfEmpty = (v: unknown): unknown => (v === '' ? undefined : v);
+
+/** An integer ≥ `min` (1 unless 0 is meaningful: a 0 queue size or poison cap breaks the pipeline). */
+const int = (def: number, min = 1) =>
+  z.preprocess(unsetIfEmpty, z.coerce.number().int().min(min).default(def));
 
 const schema = z.object({
   DATA_DIR: z.string().default('/data'),
@@ -13,17 +18,31 @@ const schema = z.object({
   STABLE_SECONDS: int(5),
   MAX_IN_FLIGHT: int(5000),
   IO_CONCURRENCY: int(8),
-  CPU_CONCURRENCY: z.coerce.number().int().positive().optional(),
-  DECODE_MEM_BUDGET_MB: z.coerce.number().int().positive().default(1280),
+  CPU_CONCURRENCY: z.preprocess(unsetIfEmpty, z.coerce.number().int().min(1).optional()),
+  DECODE_MEM_BUDGET_MB: int(1280),
   DECODE_TIMEOUT_S: int(60),
   POISON_ATTEMPTS: int(5),
-  LOOK_ALIKE_PHASH: int(8),
-  LOOK_ALIKE_DHASH: int(10),
-  COPY_PHASH: int(4),
-  COPY_DHASH: int(6),
+  LOOK_ALIKE_PHASH: int(8, 0),
+  LOOK_ALIKE_DHASH: int(10, 0),
+  COPY_PHASH: int(4, 0),
+  COPY_DHASH: int(6, 0),
   LIVE_MAX_DURATION_S: int(5),
   STAGE_MAX_STALENESS_S: int(900),
 });
+
+/** Not forwarded: compose sets these itself (paths, addresses, queues per service, the namespace it creates). */
+const SET_BY_COMPOSE = new Set([
+  'DATA_DIR',
+  'DATABASE_URL',
+  'TEMPORAL_ADDRESS',
+  'TEMPORAL_NAMESPACE',
+  'WORKER_QUEUES',
+]);
+
+/** Every tunable env name, which docker-compose.yml forwards to the workers as `${NAME:-}`. */
+export const TUNABLE_ENV: readonly string[] = Object.keys(schema.shape).filter(
+  (n) => !SET_BY_COMPOSE.has(n),
+);
 
 export interface Settings {
   dataDir: string;

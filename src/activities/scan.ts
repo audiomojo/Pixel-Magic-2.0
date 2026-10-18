@@ -2,7 +2,7 @@ import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { heartbeat } from '@temporalio/activity';
+import { heartbeat, log } from '@temporalio/activity';
 import {
   type Client,
   WorkflowExecutionAlreadyStartedError,
@@ -41,15 +41,17 @@ async function statOrNull(path: string) {
 export function makeScan(deps: Deps) {
   const { pool, layout, settings } = deps;
 
-  async function snapshot(): Promise<Snapshot> {
+  /** The drop zone's files, plus how many symlinks it skipped (they are never followed). */
+  async function snapshot(): Promise<{ files: Snapshot; symlinks: number }> {
     const out: Snapshot = new Map();
     let entries: Dirent[];
     try {
       entries = await readdir(layout.dropzone, { recursive: true, withFileTypes: true });
     } catch (e) {
-      if (isEnoent(e)) return out;
+      if (isEnoent(e)) return { files: out, symlinks: 0 };
       throw e;
     }
+    const symlinks = entries.filter((d) => d.isSymbolicLink()).length;
     const files = entries.filter((d) => d.isFile() && !isIgnored(d.name));
     // Bounded parallel stats: a bind-mounted drop zone answers each one slowly.
     for (let i = 0; i < files.length; i += STAT_BATCH) {
@@ -62,7 +64,7 @@ export function makeScan(deps: Deps) {
         out.set(rel, { size: st.size, mtimeNs: st.mtimeNs });
       });
     }
-    return out;
+    return { files: out, symlinks };
   }
 
   /** Waits `stableSeconds`, heartbeating so a long wait never looks like a dead worker. */
@@ -83,10 +85,14 @@ export function makeScan(deps: Deps) {
   }
 
   async function scan(temporal: Client): Promise<ScanResult> {
-    const first = await snapshot();
+    const { files: first } = await snapshot();
     await settle();
-    const second = await snapshot();
+    const { files: second, symlinks } = await snapshot();
     heartbeat('snapshots taken');
+    if (symlinks > 0)
+      log.warn(
+        `drop zone holds ${String(symlinks)} symlinks, which are never ingested: drop real files, not links or aliases`,
+      );
 
     let pendingBytes = 0n;
     for (const f of second.values()) pendingBytes += f.size;

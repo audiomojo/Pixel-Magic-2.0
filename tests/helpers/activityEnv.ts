@@ -18,17 +18,31 @@ const silent: NonNullable<MockActivityEnvironmentOptions['logger']> = {
   error: noop,
 };
 
+/** A logger reporting warnings and errors to `onLog` (everything else stays quiet). */
+const reporting = (
+  onLog: (level: string, message: string) => void,
+): NonNullable<MockActivityEnvironmentOptions['logger']> => ({
+  ...silent,
+  log: (level, message) => onLog(level, message),
+  warn: (message) => onLog('WARN', message),
+  error: (message) => onLog('ERROR', message),
+});
+
 /** Runs an activity function inside a mock Activity Context whose workflow run id is `runId`. */
 export async function runActivity<A extends unknown[], R>(
   fn: (...a: A) => Promise<R>,
   args: A,
-  opts: { runId?: string; onHeartbeat?: (d: unknown) => void } = {},
+  opts: {
+    runId?: string;
+    onHeartbeat?: (d: unknown) => void;
+    onLog?: (level: string, message: string) => void;
+  } = {},
 ): Promise<R> {
   const env = new MockActivityEnvironment(
     {
       workflowExecution: { workflowId: 'test', runId: opts.runId ?? 'test-run' },
     },
-    { logger: silent },
+    { logger: opts.onLog ? reporting(opts.onLog) : silent },
   );
   const onHeartbeat = opts.onHeartbeat;
   if (onHeartbeat) env.on('heartbeat', (d: unknown) => onHeartbeat(d));
