@@ -71,3 +71,13 @@ Four more small fixes followed: an idle timeout on the cluster transaction, a st
 - The "copy-if-tight" check is strict only for PNG variants. The other lossy kinds are counted and printed but do not fail the test.
 - There is a narrow, already-failing path in staging cleanup where putting an entry back is not atomic.
 - Run `make verify-vault` periodically. A writer that still holds a file open after ingest can change vault bytes, and only verification detects it.
+
+## Follow-up: removing confirmed duplicates (2026-10-18)
+
+The user decided the vault holds each distinct file once (spec §6.5, R9; migration 0004).
+
+- **Removal.** A `COPY` file's `.copies` twin is unlinked only after a fresh re-hash of it and of its vault file both equal `files.sha256`. The unlink is fsynced before the row is marked. It runs in FileWorkflow (behind `patched('reclaim-copy')`) and in a bounded 15-minute sweep (`pm-copies`).
+- **Deletes nothing otherwise.** A mismatch, a missing file or a non-regular file flags `copy_mismatch` and is never retried. A `.copies` file with another link (an old staging generation) is deferred. A file that changes during the re-hash is retried.
+- **Staging choice (a).** `copies/` shows only different files of the same shot; `copies/v-` is gone. The smoke golden lost exactly one line.
+- **Found while building.** Comparing inode numbers to detect change would retry forever on virtiofs, so the check uses size and mtime. Upgrading needs two forced staging builds before old-generation links let the sweep reclaim (README, Upgrading).
+- **Results.** 479 unit and workflow tests pass. Smoke, standard and chaos pass, with corpus-verify showing 0 drift.
