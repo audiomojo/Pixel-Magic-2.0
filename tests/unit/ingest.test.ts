@@ -24,7 +24,9 @@ import { startPg, type PgHandle } from '../helpers/pg.js';
 class SimulatedCrash extends Error {}
 
 /** Every `fsyncDir` the activity makes, with what was already on disk / committed at that moment. */
-const fsyncs = vi.hoisted(() => [] as { dir: string; copies: string[]; states: string[] }[]);
+const fsyncs = vi.hoisted(
+  () => [] as { dir: string; entries: string[]; claimed: string[]; states: string[] }[],
+);
 let pool: pg.Pool;
 vi.mock('../../src/fsops.js', async (orig) => {
   const real = await orig<typeof import('../../src/fsops.js')>();
@@ -34,7 +36,12 @@ vi.mock('../../src/fsops.js', async (orig) => {
     fsyncDir: async (dir: string) => {
       const states = (await pool.query<{ state: string }>('SELECT state FROM files ORDER BY id'))
         .rows;
-      fsyncs.push({ dir, copies: await ls(dir), states: states.map((r) => r.state) });
+      fsyncs.push({
+        dir,
+        entries: await ls(dir),
+        claimed: await ls(layout.claimed),
+        states: states.map((r) => r.state),
+      });
       await real.fsyncDir(dir);
     },
   };
@@ -382,11 +389,17 @@ test('the .copies rename is fsynced before the COPY commit', async () => {
   const b = await runActivity(acts.ingestFile, [await drop('b.jpg', JPEG_A)], { runId: 'r2' });
   expect(b.state).toBe('COPY');
   expect(fsyncs).toEqual([
-    { dir: layout.vaultCopies, copies: [`${b.fileId}.jpg`], states: ['INGESTED', 'CLAIMED'] },
+    {
+      dir: layout.vaultCopies,
+      entries: [`${b.fileId}.jpg`],
+      claimed: [],
+      states: ['INGESTED', 'CLAIMED'],
+    },
   ]);
 });
 
 test('a stale attempt that claimed a re-drop puts it back in the drop zone', async () => {
+  fsyncs.length = 0;
   const ref = await drop('a.jpg', JPEG_A);
   const redrop = Buffer.concat([JPEG_A, Buffer.from('re-drop')]);
   let second: IngestResult | undefined;
@@ -407,6 +420,10 @@ test('a stale attempt that claimed a re-drop puts it back in the drop zone', asy
   expect(await readdir(layout.claimed)).toEqual([]);
   expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(redrop);
   expect(await count('files')).toBe(1);
+  // The link back into the drop zone was made durable while claimed/<id> still held the bytes.
+  expect(fsyncs.filter((f) => f.dir === layout.dropzone)).toEqual([
+    { dir: layout.dropzone, entries: ['a.jpg'], claimed: ['1'], states: ['INGESTED'] },
+  ]);
 });
 
 test('a put-back onto an occupied drop-zone path fails loudly and keeps the bytes', async () => {
@@ -472,4 +489,55 @@ test('put-back never returns bytes the row already committed (no double count)',
   expect(existsSync(join(layout.dropzone, 'a.jpg'))).toBe(false);
   expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(second);
   expect(await readdir(layout.claimed)).toEqual([]);
+});
+
+test('the claim-step .copies shortcut fsyncs .copies before committing COPY', async () => {
+  await runActivity(acts.ingestFile, [await drop('first.jpg', JPEG_A)], { runId: 'r0' });
+  const ref = await drop('a.jpg', JPEG_A);
+  await expect(
+    runActivity(createActivities(crashAt('copies_rename')).ingestFile, [ref], { runId: 'r1' }),
+  ).rejects.toThrow(SimulatedCrash);
+  fsyncs.length = 0;
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r.state).toBe('COPY');
+  expect(fsyncs).toEqual([
+    {
+      dir: layout.vaultCopies,
+      entries: [`${r.fileId}.jpg`],
+      claimed: [],
+      states: ['INGESTED', 'CLAIMED'],
+    },
+  ]);
+});
+
+test('a stale unhashed attempt cannot re-hash a re-drop over a parked copy', async () => {
+  await runActivity(acts.ingestFile, [await drop('first.jpg', JPEG_A)], { runId: 'r0' });
+  const ref = await drop('a.jpg', JPEG_A);
+  const redrop = Buffer.concat([JPEG_A, Buffer.from('re-drop')]);
+  let parked = false;
+  const stale = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      // X stalls after its upsert (sha null); Y parks the bytes in .copies and dies before its
+      // commit; the user drops new bytes at the same path.
+      if (n === 'upsert' && !parked) {
+        parked = true;
+        await expect(
+          runActivity(createActivities(crashAt('copies_rename')).ingestFile, [ref], {
+            runId: 'r1',
+          }),
+        ).rejects.toThrow(SimulatedCrash);
+        await drop('a.jpg', redrop);
+      }
+    },
+  });
+  await expect(runActivity(stale.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(
+    StaleAttemptError,
+  );
+  expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(redrop);
+  expect(await readdir(layout.claimed)).toEqual([]);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r.state).toBe('COPY');
+  expect(await readdir(layout.vaultCopies)).toEqual([`${r.fileId}.jpg`]);
+  expect([await count('files'), await count('contents')]).toEqual([2, 1]);
 });

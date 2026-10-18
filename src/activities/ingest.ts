@@ -196,6 +196,7 @@ export function makeIngestFile(deps: Deps) {
         );
       throw e;
     }
+    await fsyncDir(dirname(dest)); // the put-back link is durable before claimed/<id> goes
     await unlink(claimed);
   }
 
@@ -250,8 +251,10 @@ export function makeIngestFile(deps: Deps) {
     // waits for the next scan), and a copy already parked in .copies is committed as such.
     let claimedHere = false;
     if (!(await statOrNull(claimed))) {
-      if (row.sha256 && row.ext && (await statOrNull(copiesPath(row.id, row.ext))))
+      if (row.sha256 && row.ext && (await statOrNull(copiesPath(row.id, row.ext)))) {
+        await fsyncDir(layout.vaultCopies); // durable before COPY is committed
         return commitCopy(row, row.sha256, row.ext);
+      }
       try {
         await rename(join(layout.dropzone, ref.relPath), claimed);
         claimedHere = true;
@@ -266,12 +269,15 @@ export function makeIngestFile(deps: Deps) {
     const size = BigInt((await stat(claimed)).size);
     const sha = await sha256File(claimed, () => heartbeat());
     try {
+      // A row already hashed to other bytes belongs to an earlier claim (e.g. parked in .copies by
+      // a newer attempt): this attempt must not re-attribute it to whatever it claimed.
       await guarded(
         pool,
         row.id,
         `state = 'CLAIMED', sha256 = $3`,
         ['DISCOVERED', 'CLAIMED'],
         [sha],
+        '(sha256 IS NULL OR sha256 = $3)',
       );
     } catch (e) {
       if (e instanceof StaleAttemptError && claimedHere) await putBack(ref, row.id);
