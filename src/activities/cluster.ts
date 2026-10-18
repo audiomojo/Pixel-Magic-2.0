@@ -200,9 +200,11 @@ export function makeClusterContent(deps: Deps) {
   async function clusterOnce(sha256: string): Promise<number> {
     try {
       const out = await withTx(pool, async (c) => {
-        // A cache reload is pure JS while this transaction sits idle: never let the server's
-        // idle-in-transaction timeout kill it (the activity heartbeats and has its own timeout).
-        await c.query('SET LOCAL idle_in_transaction_session_timeout = 0');
+        // A cache reload is pure JS while this transaction sits idle, so the pool's 120 s
+        // idle-in-transaction bound is too short here. Bound it just above the activity's
+        // 15-minute startToCloseTimeout instead of not at all: a half-open holder then releases
+        // the cluster lock within 16 min rather than when TCP keepalive gives up (about 2 h).
+        await c.query(`SET LOCAL idle_in_transaction_session_timeout = '16min'`);
         await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
         const row = (
           await c.query<ContentRow>(`SELECT ${COLS} FROM contents WHERE sha256 = $1`, [sha256])

@@ -358,6 +358,38 @@ test('concurrent clusterContent calls serialise', async () => {
   expect(await count('groups', `kind = 'copy' AND merged_into IS NULL`)).toBe(1);
 });
 
+test('the cluster transaction bounds idle-in-transaction just above the 15-minute activity timeout', async () => {
+  const seen: string[] = [];
+  // Reads the session setting on the cluster transaction's own connection, under the lock.
+  const spy = new Proxy(pool, {
+    get(target, prop, recv) {
+      if (prop !== 'connect') return Reflect.get(target, prop, recv) as unknown;
+      return async () => {
+        const c = await target.connect();
+        const query = c.query.bind(c) as (sql: string, v?: unknown[]) => Promise<pg.QueryResult>;
+        return new Proxy(c, {
+          get(ct, p, r) {
+            if (p !== 'query') return Reflect.get(ct, p, r) as unknown;
+            return async (sql: string, v?: unknown[]) => {
+              const out = await query(sql, v);
+              if (typeof sql === 'string' && sql.includes('pg_advisory_xact_lock')) {
+                const s = await query(
+                  `SELECT current_setting('idle_in_transaction_session_timeout') AS t`,
+                );
+                seen.push(String((s.rows[0] as { t: string }).t));
+              }
+              return out;
+            };
+          },
+        });
+      };
+    },
+  });
+  const [a] = await seedHashed(F('a'));
+  await runActivity(createActivities({ ...deps, pool: spy }).clusterContent, [a!]);
+  expect(seen).toEqual(['16min']);
+});
+
 test('concurrent calls on one worker share its cache safely', async () => {
   const [a, c, d] = await seedHashed(
     F('a'),
