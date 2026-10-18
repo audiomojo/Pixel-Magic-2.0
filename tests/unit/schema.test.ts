@@ -1,6 +1,7 @@
-import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import type pg from 'pg';
 import { withTx } from '../../src/db.js';
+import { logger } from '../../src/logger.js';
 import { startPg } from '../helpers/pg.js';
 
 let pool: pg.Pool;
@@ -106,4 +107,22 @@ test('pool sessions bound hung statements and idle transactions', async () => {
             current_setting('idle_in_transaction_session_timeout') AS idle`,
   );
   expect(s).toEqual({ st: '1min', idle: '2min' });
+});
+
+test('an idle pooled client losing its backend is logged, not fatal', async () => {
+  const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+  try {
+    const victim = await pool.connect();
+    const killer = await pool.connect();
+    const { pid } = (await victim.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+      .rows[0]!;
+    victim.release(); // now idle in the pool, as during a Postgres restart
+    await killer.query('SELECT pg_terminate_backend($1)', [pid]);
+    killer.release();
+    // Without a pool 'error' listener the idle client's socket error is an uncaught exception.
+    await vi.waitFor(() => expect(warn).toHaveBeenCalled(), { timeout: 5000 });
+    expect((await pool.query<{ one: number }>('SELECT 1 AS one')).rows[0]!.one).toBe(1);
+  } finally {
+    warn.mockRestore();
+  }
 });

@@ -46,37 +46,49 @@ async function main(): Promise<void> {
   const layout = new DataLayout(settings.dataDir);
   await layout.ensure();
   await checkSameDevice(layout);
-  const metadata = new MetadataReader();
-  await metadata.read(fileURLToPath(import.meta.url)); // exiftool works before any file is claimed
-  const pool = createPool(settings.databaseUrl, settings.ioConcurrency + 4);
-  const decodePool = serves('cpu')
-    ? createDecodePool(here('./decodeWorker.js'), settings.cpuConcurrency)
-    : noDecodePool;
-
-  const clientConnection = await Connection.connect({ address: settings.temporalAddress });
-  const temporal = new Client({
-    connection: clientConnection,
-    namespace: settings.temporalNamespace,
-  });
-  const connection = await NativeConnection.connect({ address: settings.temporalAddress });
-  const activities = createActivities({ pool, settings, layout, metadata, decodePool, temporal });
-
-  const base = { connection, namespace: settings.temporalNamespace, shutdownGraceTime: '60s' };
-  const perQueue: Record<Queue, Partial<WorkerOptions>> = {
-    main: { workflowsPath: here('./workflows.js') },
-    io: { activities, maxConcurrentActivityTaskExecutions: settings.ioConcurrency },
-    cpu: { activities, maxConcurrentActivityTaskExecutions: settings.cpuConcurrency },
-    // One per worker; the advisory lock makes clustering single-active across workers.
-    cluster: { activities, maxConcurrentActivityTaskExecutions: 1 },
-  };
-  const workers: Worker[] = [];
-  for (const q of QUEUES)
-    if (serves(q)) workers.push(await Worker.create({ ...base, taskQueue: q, ...perQueue[q] }));
-
-  if (serves('cluster')) await ensureSchedules(temporal, settings);
-  logger.info({ queues, dataDir: settings.dataDir }, 'worker started');
-
+  // Everything opened from here on is closed on every exit path, startup failures included.
+  const cleanup: (() => Promise<unknown>)[] = [];
   try {
+    const metadata = new MetadataReader();
+    cleanup.push(() => metadata.end());
+    await metadata.read(fileURLToPath(import.meta.url)); // exiftool works before any claim
+    const pool = createPool(settings.databaseUrl, settings.ioConcurrency + 4);
+    cleanup.push(() => pool.end());
+    let decodePool = noDecodePool;
+    if (serves('cpu')) {
+      const p = createDecodePool(here('./decodeWorker.js'), settings.cpuConcurrency);
+      cleanup.push(async () => {
+        await p.terminate();
+      }); // runs the child's onTerminate (ends its exiftool)
+      decodePool = p;
+    }
+
+    const clientConnection = await Connection.connect({ address: settings.temporalAddress });
+    cleanup.push(() => clientConnection.close());
+    const temporal = new Client({
+      connection: clientConnection,
+      namespace: settings.temporalNamespace,
+    });
+    const connection = await NativeConnection.connect({ address: settings.temporalAddress });
+    cleanup.push(() => connection.close());
+    const activities = createActivities({ pool, settings, layout, metadata, decodePool, temporal });
+
+    // Under compose's stop_grace_period (60 s), so cleanup runs before a SIGKILL.
+    const base = { connection, namespace: settings.temporalNamespace, shutdownGraceTime: '50s' };
+    const perQueue: Record<Queue, Partial<WorkerOptions>> = {
+      main: { workflowsPath: here('./workflows.js') },
+      io: { activities, maxConcurrentActivityTaskExecutions: settings.ioConcurrency },
+      cpu: { activities, maxConcurrentActivityTaskExecutions: settings.cpuConcurrency },
+      // One per worker; the advisory lock makes clustering single-active across workers.
+      cluster: { activities, maxConcurrentActivityTaskExecutions: 1 },
+    };
+    const workers: Worker[] = [];
+    for (const q of QUEUES)
+      if (serves(q)) workers.push(await Worker.create({ ...base, taskQueue: q, ...perQueue[q] }));
+
+    if (serves('cluster')) await ensureSchedules(temporal, settings);
+    logger.info({ queues, dataDir: settings.dataDir }, 'worker started');
+
     // SIGTERM/SIGINT shut every worker down (Runtime's default signals), so each run() returns.
     // If one worker fails, stop the rest too.
     await Promise.all(
@@ -88,13 +100,7 @@ async function main(): Promise<void> {
       ),
     );
   } finally {
-    await Promise.allSettled([
-      pool.end(),
-      metadata.end(),
-      decodePool === noDecodePool ? Promise.resolve() : decodePool.terminate(),
-      connection.close(),
-      clientConnection.close(),
-    ]);
+    await Promise.allSettled(cleanup.reverse().map((close) => close()));
     logger.info('worker stopped');
   }
 }

@@ -2,7 +2,7 @@ import { appendFile, chmod, mkdir, rm, stat, unlink, writeFile } from 'node:fs/p
 import { join } from 'node:path';
 import { WorkflowExecutionAlreadyStartedError, type Client } from '@temporalio/client';
 import type pg from 'pg';
-import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import type { Settings } from '../../src/config.js';
 import type { DataLayout } from '../../src/fsops.js';
@@ -11,6 +11,21 @@ import type { FileRef } from '../../src/types.js';
 import { runActivity, testDeps } from '../helpers/activityEnv.js';
 import { JPEG_A } from '../helpers/images.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
+
+/** Test seam: when set, the scanner's readdir awaits this first (a slow drop-zone listing). */
+const slowReaddir = vi.hoisted(() => ({ gate: null as (() => Promise<void>) | null }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readdir: async (...a: Parameters<typeof actual.readdir>) => {
+      const gate = slowReaddir.gate;
+      slowReaddir.gate = null;
+      if (gate) await gate();
+      return actual.readdir(...a);
+    },
+  };
+});
 
 interface Start {
   workflowType: unknown;
@@ -171,6 +186,32 @@ test('scan heartbeats between its snapshots', async () => {
   await runActivity(actsWithFakeClient.scanAndStart, [], { onHeartbeat: (d) => beats.push(d) });
   expect(beats.length).toBeGreaterThan(0);
 });
+
+test('scan keeps heartbeating through a slow drop-zone listing', async () => {
+  await writeFile(join(layout.dropzone, 'a.jpg'), JPEG_A);
+  // The listing only finishes once a heartbeat arrives while it is pending (or after 20 s,
+  // which is well past the 30 s heartbeat timeout's comfort zone and fails the assertion).
+  let pending = false;
+  let beatDuringListing = false;
+  let release: () => void = () => undefined;
+  slowReaddir.gate = () =>
+    new Promise<void>((resolve) => {
+      pending = true;
+      release = () => {
+        if (!pending) return;
+        pending = false;
+        beatDuringListing = true;
+        resolve();
+      };
+      setTimeout(() => {
+        pending = false;
+        resolve();
+      }, 20_000);
+    });
+  await runActivity(actsWithFakeClient.scanAndStart, [], { onHeartbeat: () => release() });
+  expect(beatDuringListing).toBe(true);
+  expect(fakeClient.startedRelPaths()).toEqual(['a.jpg']);
+}, 30_000);
 
 test('scan tolerates WorkflowExecutionAlreadyStartedError', async () => {
   await writeFile(join(layout.dropzone, 'a.jpg'), JPEG_A);

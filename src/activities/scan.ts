@@ -4,6 +4,7 @@ import { join, relative, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { heartbeat } from '@temporalio/activity';
 import {
+  type Client,
   WorkflowExecutionAlreadyStartedError,
   WorkflowIdConflictPolicy,
   WorkflowIdReusePolicy,
@@ -16,7 +17,9 @@ import type { Deps } from './index.js';
 
 export const RUNNING_FILE_WORKFLOWS = "WorkflowType='FileWorkflow' AND ExecutionStatus='Running'";
 const HEARTBEAT_MS = 1000;
-const HEARTBEAT_EVERY = 1000;
+/** Heartbeats run on a timer for the whole scan: one recursive readdir can outlast the timeout. */
+export const HEARTBEAT_INTERVAL_MS = 5000;
+const STAT_BATCH = 64;
 
 /** rel_path → (size, mtime_ns) of every non-ignored regular file under the drop zone. */
 type Snapshot = Map<string, { size: bigint; mtimeNs: bigint }>;
@@ -47,15 +50,17 @@ export function makeScan(deps: Deps) {
       if (isEnoent(e)) return out;
       throw e;
     }
-    let n = 0;
-    for (const d of entries) {
-      if (++n % HEARTBEAT_EVERY === 0) heartbeat(`stat ${String(n)}`);
-      if (!d.isFile() || isIgnored(d.name)) continue;
-      const abs = join(d.parentPath, d.name);
-      const st = await statOrNull(abs); // a file can be claimed between readdir and stat
-      if (!st) continue;
-      const rel = relative(layout.dropzone, abs).split(sep).join('/');
-      out.set(rel, { size: st.size, mtimeNs: st.mtimeNs });
+    const files = entries.filter((d) => d.isFile() && !isIgnored(d.name));
+    // Bounded parallel stats: a bind-mounted drop zone answers each one slowly.
+    for (let i = 0; i < files.length; i += STAT_BATCH) {
+      const batch = files.slice(i, i + STAT_BATCH).map((d) => join(d.parentPath, d.name));
+      const stats = await Promise.all(batch.map((abs) => statOrNull(abs)));
+      batch.forEach((abs, j) => {
+        const st = stats[j]; // null: claimed between readdir and stat
+        if (!st) return;
+        const rel = relative(layout.dropzone, abs).split(sep).join('/');
+        out.set(rel, { size: st.size, mtimeNs: st.mtimeNs });
+      });
     }
     return out;
   }
@@ -77,13 +82,7 @@ export function makeScan(deps: Deps) {
     return st !== null && st.isFile() && st.size === size && st.mtimeNs === mtimeNs;
   }
 
-  /**
-   * Queue `io`. Two snapshots `stableSeconds` apart; a file whose size and mtime held still is
-   * stable and gets a FileWorkflow, up to `maxInFlight` running ones (spec §4.3).
-   */
-  return async function scanAndStart(): Promise<ScanResult> {
-    const temporal = deps.temporal;
-    if (!temporal) throw new Error('scanAndStart needs a Temporal client');
+  async function scan(temporal: Client): Promise<ScanResult> {
     const first = await snapshot();
     await settle();
     const second = await snapshot();
@@ -129,5 +128,20 @@ export function makeScan(deps: Deps) {
       heartbeat(`started ${String(started)}`);
     }
     return { started, pendingFiles: second.size, pendingBytes: String(pendingBytes) };
+  }
+
+  /**
+   * Queue `io`. Two snapshots `stableSeconds` apart; a file whose size and mtime held still is
+   * stable and gets a FileWorkflow, up to `maxInFlight` running ones (spec §4.3).
+   */
+  return async function scanAndStart(): Promise<ScanResult> {
+    const temporal = deps.temporal;
+    if (!temporal) throw new Error('scanAndStart needs a Temporal client');
+    const beat = setInterval(() => heartbeat('scanning'), HEARTBEAT_INTERVAL_MS);
+    try {
+      return await scan(temporal);
+    } finally {
+      clearInterval(beat);
+    }
   };
 }
