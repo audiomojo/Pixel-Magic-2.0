@@ -16,11 +16,32 @@ import {
 import { dirname, join, relative } from 'node:path';
 import type { Client } from '@temporalio/client';
 import type pg from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import { vaultRel, type DataLayout } from '../../src/fsops.js';
 import { runActivity, testDeps } from '../helpers/activityEnv.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
+
+/** Test seams: when set, `rmdir` / `lstat` call these first (they may throw). */
+const fsHooks = vi.hoisted(() => ({
+  rmdir: null as ((path: string) => void) | null,
+  lstat: null as ((path: string) => void) | null,
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rmdir: async (...a: Parameters<typeof actual.rmdir>) => {
+      fsHooks.rmdir?.(String(a[0]));
+      return actual.rmdir(...a);
+    },
+    lstat: async (...a: Parameters<typeof actual.lstat>) => {
+      fsHooks.lstat?.(String(a[0]));
+      return actual.lstat(...a);
+    },
+  };
+});
+const fsError = (code: string) => Object.assign(new Error(`${code}: test`), { code });
 
 let pgh: PgHandle;
 let pool: pg.Pool;
@@ -44,6 +65,11 @@ beforeEach(async () => {
   for (const d of [layout.vault, layout.staging]) await rm(d, { recursive: true, force: true });
   await layout.ensure();
   acts = createActivities(deps);
+});
+
+afterEach(() => {
+  fsHooks.rmdir = null;
+  fsHooks.lstat = null;
 });
 
 const build = (force: boolean) => runActivity(acts.maybeBuildStaging, [force]);
@@ -379,4 +405,43 @@ test('files the user saved inside staging are rescued when their generation goes
     'unique/my-edit.jpg',
     'unique/my-edit.jpg.1',
   ]);
+});
+
+test('a generation directory that gains an entry during cleanup is left for the next build', async () => {
+  await seedPipelineRows();
+  const g1 = (await build(true)).gen!;
+  await build(true);
+  let once = true;
+  fsHooks.rmdir = (p) => {
+    if (p === genDir(g1) && once) {
+      once = false;
+      throw fsError('ENOTEMPTY');
+    }
+  };
+  await build(true); // removing g1 meets ENOTEMPTY: tolerated
+  expect(existsSync(genDir(g1))).toBe(true);
+  await build(true); // the next build's sweep finishes it
+  expect(existsSync(genDir(g1))).toBe(false);
+});
+
+test('any other failure while removing a generation fails the build (retryable), keeping files', async () => {
+  await seedPipelineRows();
+  const g1 = (await build(true)).gen!;
+  await writeFile(join(genDir(g1), 'unique', 'mine.txt'), 'keep me');
+  await build(true);
+  fsHooks.lstat = (p) => {
+    if (p.includes('.rescued')) throw fsError('EACCES');
+  };
+  await expect(build(true)).rejects.toMatchObject({ code: 'EACCES' });
+  expect(await readFile(join(genDir(g1), 'unique', 'mine.txt'), 'utf8')).toBe('keep me');
+  fsHooks.lstat = null;
+  fsHooks.rmdir = (p) => {
+    if (p === genDir(g1)) throw fsError('EBUSY');
+  };
+  await expect(build(true)).rejects.toMatchObject({ code: 'EBUSY' });
+  fsHooks.rmdir = null;
+  await build(true);
+  expect(
+    await readFile(join(layout.staging, '.rescued', String(g1), 'unique', 'mine.txt'), 'utf8'),
+  ).toBe('keep me');
 });

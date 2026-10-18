@@ -38,6 +38,16 @@ test('a client whose ROLLBACK failed is discarded, never returned to the pool mi
     }),
   ).rejects.toThrow('boom');
   expect(released).toEqual([expect.objectContaining({ message: 'connection lost' })]);
+  // A non-Error rejection still discards the client.
+  released.length = 0;
+  const odd = {
+    ...client,
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the point: a non-Error rejection
+    query: (sql: string) => (sql === 'ROLLBACK' ? Promise.reject('gone') : Promise.resolve({})),
+  };
+  const pool3 = { connect: () => Promise.resolve(odd) } as unknown as pg.Pool;
+  await expect(withTx(pool3, () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+  expect(released).toEqual([expect.objectContaining({ message: 'gone' })]);
   // A clean rollback hands the client back for reuse.
   const ok = { ...client, query: () => Promise.resolve({}) };
   released.length = 0;
