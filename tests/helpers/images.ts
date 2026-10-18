@@ -230,3 +230,23 @@ export const JPEG_A: Buffer = Buffer.from(
   ].join(''),
   'base64',
 );
+
+/** QuickTime box: 32-bit size, 4-char type, payload. */
+const qtBox = (type: string, payload: Buffer): Buffer => {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(8 + payload.length, 0);
+  head.write(type, 4, 'latin1');
+  return Buffer.concat([head, payload]);
+};
+
+/**
+ * A minimal QuickTime movie: a `ftyp` box (major brand `qt  `, minor 0, compatible `qt  `)
+ * followed by an empty `mdat`. exiftool reports `FileType MOV`, `MIMEType video/quicktime`.
+ */
+export const MOV_BYTES: Buffer = Buffer.concat([
+  qtBox(
+    'ftyp',
+    Buffer.concat([Buffer.from('qt  ', 'latin1'), Buffer.alloc(4), Buffer.from('qt  ', 'latin1')]),
+  ),
+  qtBox('mdat', Buffer.alloc(0)),
+]);
