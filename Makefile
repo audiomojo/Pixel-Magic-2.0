@@ -1,4 +1,4 @@
-.PHONY: test fs-check build up down stage trickle
+.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle
 
 CORPUS := test-automation/sample-images
 
@@ -20,6 +20,18 @@ fs-check:
 # Rebuild staging now (FORCE=1 rebuilds even when nothing changed).
 stage:
 	docker compose exec -T worker node dist/cli.js stage $(if $(FORCE),--force,)
+
+# Reset FAILED contents and start a ContentWorkflow for each.
+retry-failed:
+	docker compose exec -T worker node dist/cli.js retry-failed
+
+# Re-hash vault files (SAMPLE=1000 checks a random 1000); lists mismatches, never repairs.
+verify-vault:
+	docker compose exec -T worker node dist/cli.js verify-vault $(if $(SAMPLE),--sample $(SAMPLE),)
+
+# Orphaned work/claimed files and stuck retries.
+doctor:
+	docker compose exec -T worker node dist/cli.js doctor
 
 # Live end-to-end check (G6): a HEIC/JPG copy pair lands one in unique/, the other in copies/g-…/.
 # The corpus is only ever cloned from (cp -c), never written.
