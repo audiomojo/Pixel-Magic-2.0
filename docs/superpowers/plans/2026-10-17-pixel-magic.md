@@ -49,7 +49,7 @@ No task is complete, and no next task starts, until **all** of the following pas
 | G3 Static | `npm run lint && npm run format:check && npm run typecheck && npm run build` | Task 1 |
 | G4 Coverage | `npm run test:coverage` (v8 coverage over `src/**` and `tools/corpus/lib.ts`, excluding the entry modules `src/fscheck.ts`, `src/worker.ts`, `src/decodeWorker.ts` and the CLI wrappers `tools/corpus/{buildManifest,seed,verify,synth}.ts`; thresholds lines 85 / branches 85), and every covered file the task touched is ≥ 85%. Keep logic out of entry files. | Task 2 |
 | G5 Corpus unit | `npm run test:corpus` passes (real sample files, read-only) | Task 4 |
-| G6 Live stack | `make down && make up && make fs-check && make trickle` (the self-checking trickle from Task 9: IMG_0034 HEIC/JPG lands in `unique/` + `copies/`) | Task 9 |
+| G6 Live stack | `make down && make up && make fs-check && make trickle` (the self-checking trickle from Task 9: the `IMG_6941 1.HEIC` / `IMG_E6941.JPG` copy pair lands one in `unique/`, one in `copies/g-…/`) | Task 9 |
 | G7 Corpus safety | `make corpus-verify` exits 0 | Task 11 |
 | G8 E2E | `make test-smoke` (and `make test-standard` after Tasks 12 and 13) | Task 12 |
 
@@ -580,7 +580,8 @@ test('a Live Photo pair shares a content id', async () => {
   expect(h.liveContentId).not.toBeNull(); expect(m.liveContentId).toBe(h.liveContentId);
 });
 test('HEIC/JPG twin share capturedAt', async () => {
-  const [h, j] = [await reader.read(C('IMG_0034.HEIC')), await reader.read(C('IMG_0034.JPG'))];
+  // IMG_0034.HEIC/.JPG are NOT twins (different phones, years apart) — ruling after Task 4
+  const [h, j] = [await reader.read(C('IMG_6941 1.HEIC')), await reader.read(C('IMG_E6941.JPG'))];
   expect(h.capturedAt).not.toBeNull(); expect(j.capturedAt?.getTime()).toBe(h.capturedAt?.getTime());
 });
 ```
@@ -1152,10 +1153,10 @@ Expected: PASS, `fs-check OK`
 
 - [ ] **Step 5: Verify a real end-to-end trickle (G6)**
 
-Add the Makefile target `trickle`: `cp -c test-automation/sample-images/IMG_0034.* data/dropzone/ && sleep 60 && $(MAKE) stage FORCE=1 && find data/staging/current/ -type f && test -n "$$(find data/staging/current/unique -name '*_IMG_0034.HEIC')" && test -n "$$(find data/staging/current/copies -path '*/g-*/IMG_0034.JPG')"`. Later tasks' G6 runs it as-is (a re-drop adds `COPY` files but keeps both checks true).
+Add the Makefile target `trickle`: `cp -c "test-automation/sample-images/IMG_6941 1.HEIC" test-automation/sample-images/IMG_E6941.JPG data/dropzone/ && sleep 60 && $(MAKE) stage FORCE=1 && find data/staging/current/ -type f && test -n "$$(find data/staging/current/unique -name '*6941*')" && test -n "$$(find data/staging/current/copies -path '*/g-*/*6941*')"` (which of the two is the best copy depends on pixels/format rank; the check only requires one in each place). Later tasks' G6 runs it as-is (a re-drop adds `COPY` files but keeps both checks true).
 
 Run: `make trickle`
-Expected: exit 0; `IMG_0034.HEIC` under `unique/…`, `IMG_0034.JPG` under `copies/g-…/`, and the workflows Completed in the Temporal UI
+Expected: exit 0; one of `IMG_6941 1.HEIC` / `IMG_E6941.JPG` under `unique/…`, the other under `copies/g-…/`, and the workflows Completed in the Temporal UI
 
 - [ ] **Step 6: Commit**
 
@@ -1275,7 +1276,7 @@ git add -A && git commit -m "feat: operator CLI and Postgres-backed Grafana dash
   - `verify(corpusDir: string, m: Manifest, deep: boolean): Promise<string[]>` (the drift list)
 - `interface ManifestRecord`: `name: string`, `size: string` and `mtimeNs: string` (**decimal strings**: JSON can't hold `bigint`, and sizes/mtimes are never `number`), `sha256: string`, `kind: 'still' | 'motion' | 'other'`, `extMismatch: boolean`, `width: number | null`, `height: number | null`, `capturedAt: string | null` (ISO), `subsec: string | null`, `camera: string | null`, `burstUuid: string | null`, `contentId: string | null`, `durationS: number | null`
 - Manifest relations (each a list of sorted name pairs, `exactGroups` a list of name lists): `exactGroups`, `heicJpgTwin`, `editOf`, `spaceSuffixCopy`, `burst` (same `BurstUUID`, or captures ≤ 2 s apart from the same camera with different subsec), `livePhoto` (content ID, or same stem with a MOV ≤ 5 s). `spaceSuffixCopy` is a **name-only** relation (`"X 1"` vs `"X"`); it never implies "copy" (`IMG_2834.HEIC` 8116×3808 and `"IMG_2834 1.HEIC"` 4032×3024 are different shots).
-- `PINNED` (both subsets; spec §10.3, only files that exist): `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4`, `PSWU5412 1.MP4`, `IMG_0034.HEIC`, `IMG_0034.JPG`, `IMG_0433.HEIC`, `IMG_E0433.HEIC`, `IMG_2834.HEIC`, `IMG_2834 1.HEIC`, `IMG_2834 1.MOV`, `VERP1022.TIF`, `AUXA4949.BMP` (there is no `IMG_2834.MOV`), plus ≥ 20 Live Photo pairs and ≥ 5 burst sets chosen by `selectSubsets`
+- `PINNED` (both subsets; spec §10.3, only files that exist): `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4`, `PSWU5412 1.MP4`, `IMG_0034.HEIC`, `IMG_0034.JPG` (same name, different photos — must stay separate), `IMG_6941 1.HEIC`, `IMG_E6941.JPG` (the real HEIC/JPG copy pair), `IMG_0433.HEIC`, `IMG_E0433.HEIC`, `IMG_2834.HEIC`, `IMG_2834 1.HEIC`, `IMG_2834 1.MOV`, `VERP1022.TIF`, `AUXA4949.BMP` (there is no `IMG_2834.MOV`), plus ≥ 20 Live Photo pairs and ≥ 5 burst sets chosen by `selectSubsets`
 - CLIs:
   - `tsx tools/corpus/seed.ts --subset smoke|standard|full --dest DIR [--layout flat|nested] [--shuffle N] [--extras junk,corrupt] [--synthetic]` writes `DIR/../seed-manifest.json`
   - `synth.ts` generates variants from real seeds with sharp: resize 50% keeping EXIF (`withMetadata`), re-encode q60 with EXIF stripped, PNG conversion, and an EXIF-stripped export of one burst frame (the bridge case). Ground truth lands in the seed manifest.
@@ -1382,7 +1383,8 @@ test('smoke: invariant, expectations, golden tree', async () => {
 test('pinned cases', async () => {
   expect(await kindOf('IMG_E8719.HEIC')).toBe('still'); expect(await mimeOf('IMG_E8719.HEIC')).toBe('image/jpeg');
   expect(await kindOf('IMG_0004.MOV')).toBe('motion');
-  expect(await sameCopyGroup('IMG_0034.HEIC', 'IMG_0034.JPG')).toBe(true);
+  expect(await sameCopyGroup('IMG_6941 1.HEIC', 'IMG_E6941.JPG')).toBe(true);
+  expect(await sameCopyGroup('IMG_0034.HEIC', 'IMG_0034.JPG')).toBe(false); // same name, different photos
   expect(await sameCopyGroup('IMG_2834.HEIC', 'IMG_2834 1.HEIC')).toBe(false);
   expect(new Set(await states(['PSWU5412.MP4', 'PSWU5412 1.MP4']))).toEqual(new Set(['INGESTED', 'COPY']));
   expect(await beside('IMG_2834 1.MOV', 'IMG_2834 1.HEIC')).toBe(true);

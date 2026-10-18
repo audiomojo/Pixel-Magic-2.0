@@ -259,7 +259,7 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
    - `tools/corpus` builds `tests/corpus/manifest.json` (git-ignored: it holds personal capture metadata) from an independent pass: full SHA-256, `sips` dimensions, exiftool capture fields, and relations (exact groups, HEIC/JPG twins, `IMG_E`/`IMG_O`, `"X 1"` copies, bursts, Live Photo pairs).
    - `tools/corpus/seed.ts` clones a subset with `cp -c` into `data-test/<run_id>/dropzone`, under Compose project `pmtest_<run_id>`.
    - Tiers: `smoke` (~150 files, ≤ 5 min, before every commit), `standard` (~2k files plus synthetic variants, at milestones), `full` (on demand).
-   - Pinned files: `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4` + `"PSWU5412 1.MP4"`, `IMG_0034.HEIC/.JPG`, `IMG_0433` + `IMG_E0433`, `IMG_2834.HEIC` + `"IMG_2834 1.HEIC"` with its MOV (`"IMG_2834 1.MOV"`; there is no `IMG_2834.MOV`), `VERP1022.TIF`, `AUXA4949.BMP`, ≥ 20 Live Photo pairs, ≥ 5 burst sets.
+   - Pinned files: `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4` + `"PSWU5412 1.MP4"`, `IMG_0034.HEIC/.JPG` (same name, different photos — kept apart), `"IMG_6941 1.HEIC"` + `IMG_E6941.JPG` (HEIC/JPG copy pair), `IMG_0433` + `IMG_E0433`, `IMG_2834.HEIC` + `"IMG_2834 1.HEIC"` with its MOV (`"IMG_2834 1.MOV"`; there is no `IMG_2834.MOV`), `VERP1022.TIF`, `AUXA4949.BMP`, ≥ 20 Live Photo pairs, ≥ 5 burst sets.
    - A **golden staging snapshot** (`tests/e2e/golden/smoke_tree.txt`) is regenerated only by `make update-golden`.
    - `make corpus-verify` runs before and after every run.
 4. **Chaos (the resilience proof):**
