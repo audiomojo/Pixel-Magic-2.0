@@ -3,6 +3,9 @@ test-automation/sample-images/
 data/
 data-test/
 tests/reports/
+# Corpus ground truth (personal capture metadata and hashes) — generated, never commit
+tests/corpus/.hash-cache.json
+tests/corpus/manifest.json
 
 # Python / tooling
 __pycache__/

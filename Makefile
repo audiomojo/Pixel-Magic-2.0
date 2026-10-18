@@ -1,4 +1,4 @@
-.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle
+.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle corpus-manifest corpus-verify
 
 CORPUS := test-automation/sample-images
 
@@ -37,3 +37,11 @@ doctor:
 # The corpus is only ever cloned from (cp -c), never written.
 trickle:
 	mkdir -p data/dropzone && cp -c "$(CORPUS)/IMG_6941 1.HEIC" $(CORPUS)/IMG_E6941.JPG data/dropzone/ && sleep 60 && $(MAKE) stage FORCE=1 && find data/staging/current/ -type f && test -n "$$(find data/staging/current/unique -name '*6941*')" && test -n "$$(find data/staging/current/copies -path '*/g-*/*6941*')"
+
+# Ground-truth manifest of the corpus (git-ignored; reruns reuse tests/corpus/.hash-cache.json).
+corpus-manifest:
+	npx tsx tools/corpus/buildManifest.ts
+
+# G7: the corpus still matches its manifest (size+mtime; DEEP=1 re-hashes every file).
+corpus-verify:
+	npx tsx tools/corpus/verify.ts $(if $(DEEP),--deep,)
