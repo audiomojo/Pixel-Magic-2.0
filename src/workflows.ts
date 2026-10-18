@@ -11,7 +11,7 @@ import {
   type RetryPolicy,
 } from '@temporalio/workflow';
 import type { Activities } from './activities/index.js';
-import type { BuildResult, FileRef, ScanResult } from './types.js';
+import type { BuildResult, DecodeKilledType, FileRef, ScanResult } from './types.js';
 
 /** Spec §7 transient retry: 1 s, ×2, capped at 5 min, unlimited attempts (no `maximumAttempts`). */
 export const TRANSIENT_RETRY: RetryPolicy = {
@@ -30,12 +30,15 @@ export const ACTIVITY_OPTIONS = {
     heartbeatTimeout: '30s',
     retry: TRANSIENT_RETRY,
   },
-  /** Only decode is capped (it has no database access, so its failures are never outages). */
-  decodeContent: (poisonAttempts: number): ActivityOptions => ({
+  /**
+   * Only decode is capped (it has no database access, so its failures are never outages). Each
+   * activity call is one attempt: `runContentSteps` retries and counts attempts across kinds.
+   */
+  decodeContent: {
     taskQueue: 'cpu',
     startToCloseTimeout: '2m',
-    retry: { ...TRANSIENT_RETRY, maximumAttempts: poisonAttempts },
-  }),
+    retry: { ...TRANSIENT_RETRY, maximumAttempts: 1 },
+  },
   recordHash: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
   clusterContent: { taskQueue: 'cluster', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
   markFailed: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
@@ -51,7 +54,7 @@ export const ACTIVITY_OPTIONS = {
     heartbeatTimeout: '30s',
     retry: TRANSIENT_RETRY,
   },
-} satisfies Record<keyof Activities, ActivityOptions | ((n: number) => ActivityOptions)>;
+} satisfies Record<keyof Activities, ActivityOptions>;
 
 const { ingestFile } = proxyActivities<Activities>(ACTIVITY_OPTIONS.ingestFile);
 const { recordHash } = proxyActivities<Activities>(ACTIVITY_OPTIONS.recordHash);
@@ -60,42 +63,46 @@ const { markFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.markFailed);
 const { maybeBuildStaging } = proxyActivities<Activities>(ACTIVITY_OPTIONS.maybeBuildStaging);
 const { scanAndStart } = proxyActivities<Activities>(ACTIVITY_OPTIONS.scanAndStart);
 
-/** Error type of a decode whose child was killed by a signal: transient, never FAILED. */
-export const DECODE_KILLED = 'DecodeKilled';
-const MAX_KILLED_BACKOFF_S = 300;
+const DECODE_KILLED: DecodeKilledType = 'DecodeKilled';
+/** Decode attempts in all (kills included) before a content is FAILED `decode_killed`. */
+export const MAX_DECODE_ATTEMPTS = 10;
+const MAX_BACKOFF_S = 300;
 
 export type ContentOutcome = 'CLUSTERED' | 'QUARANTINED' | 'FAILED';
 
 /**
- * decode (cpu) → record (io) → cluster (cluster). Decode exhausting its attempts is poison:
- * `markFailed`, then `FAILED`. Any other activity failure (only non-retryable ones can reach
- * here, e.g. `UnexpectedState`) fails the workflow, visibly.
+ * decode (cpu) → record (io) → cluster (cluster). Decode is retried here, one attempt per call,
+ * with the transient backoff (1 s ×2, max 5 min). `poisonAttempts` failures other than a killed
+ * child are poison; `MAX_DECODE_ATTEMPTS` attempts of any kind (a child killed again and again
+ * by the OOM killer) are `decode_killed`. Either way: `markFailed`, then `FAILED`, which
+ * `retry-failed` can reset. Any other activity failure (only non-retryable ones can reach here,
+ * e.g. `UnexpectedState`) fails the workflow, visibly.
  */
 export async function runContentSteps(
   sha256: string,
   ext: string,
   poisonAttempts: number,
 ): Promise<ContentOutcome> {
-  const { decodeContent } = proxyActivities<Activities>(
-    ACTIVITY_OPTIONS.decodeContent(poisonAttempts),
-  );
+  const { decodeContent } = proxyActivities<Activities>(ACTIVITY_OPTIONS.decodeContent);
+  const maxAttempts = Math.max(MAX_DECODE_ATTEMPTS, poisonAttempts);
   let decoded;
-  for (let round = 0; ; round++) {
+  for (let attempts = 1, poison = 0; ; attempts++) {
     try {
       decoded = await decodeContent(sha256, ext);
       break;
     } catch (e) {
       if (!(e instanceof ActivityFailure) || isCancellation(e)) throw e;
       const error = e.cause?.message ?? e.message;
-      if (e.cause instanceof ApplicationFailure && e.cause.type === DECODE_KILLED) {
-        // A child killed by a signal (OOM) says nothing about the file: back off, decode again.
-        log.warn('decode child killed; retrying', { sha256, error, round });
-        await sleep(Math.min(2 ** round, MAX_KILLED_BACKOFF_S) * 1000);
-        continue;
+      const killed = e.cause instanceof ApplicationFailure && e.cause.type === DECODE_KILLED;
+      if (!killed) poison++;
+      if (poison >= poisonAttempts || attempts >= maxAttempts) {
+        const reason = poison >= poisonAttempts ? error : `decode_killed: ${error}`;
+        log.warn('decode attempts exhausted; marking FAILED', { sha256, error: reason, attempts });
+        await markFailed(sha256, reason);
+        return 'FAILED';
       }
-      log.warn('decode attempts exhausted; marking FAILED', { sha256, error });
-      await markFailed(sha256, error);
-      return 'FAILED';
+      log.warn('decode failed; retrying', { sha256, error, attempts, killed });
+      await sleep(Math.min(2 ** (attempts - 1), MAX_BACKOFF_S) * 1000);
     }
   }
   if ((await recordHash(sha256, decoded)) === 'QUARANTINED') return 'QUARANTINED';

@@ -391,6 +391,22 @@ test('a bridge that arrived first is flagged when the conflicting frame arrives'
   expect(r.rows.map((row) => row.sha256)).toEqual([x]);
 });
 
+test('a reloaded cluster cache still flags a copy of a bridge when the bridge is flagged', async () => {
+  const [x, r, f1, f2] = await seedHashed(
+    F('x', { phash: 1n, ...NOEXIF }),
+    F('r', { phash: 0b1111001n, width: 2000, ...NOEXIF }), // tight to x only
+    F('f1', { captured: { s: 1_600_000_000, sub: '1' } }),
+    F('f2', { phash: 0b111n, captured: { s: 1_600_000_000, sub: '2' } }),
+  );
+  for (const sha of [x!, r!, f1!]) await cluster(sha);
+  // Another worker (empty cache) clusters the conflicting frame: copy edges come from the index.
+  await runActivity(createActivities(deps).clusterContent, [f2!]);
+  const flagged = await pool.query<{ sha256: string }>(
+    'SELECT sha256 FROM contents WHERE copy_ambiguous ORDER BY sha256',
+  );
+  expect(flagged.rows.map((row) => row.sha256)).toEqual([x!, r!].sort());
+});
+
 test('cluster refuses content that is not HASHED, without bumping the version', async () => {
   const sha = await seedContent({ state: 'INGESTED' });
   await expect(cluster(sha)).rejects.toMatchObject({ nonRetryable: true });

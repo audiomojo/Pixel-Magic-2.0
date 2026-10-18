@@ -1,9 +1,10 @@
 // Smoke tier (spec §10.3): ~150 corpus files through the real compose stack, then the golden
 // invariant, ground-truth expectations, the pinned cases and the golden staging tree.
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
+import { components } from '../../tools/corpus/lib.js';
 import { diffExpectations, queries } from '../lib/expectations.js';
 import { checkInvariant } from '../lib/invariant.js';
-import { readGolden, treeSnapshot, writeGolden } from '../lib/snapshot.js';
+import { readGolden, stagedEntries, treeSnapshot, writeGolden } from '../lib/snapshot.js';
 import { runTier, type TierRun } from '../lib/stack.js';
 
 let run: TierRun;
@@ -48,4 +49,39 @@ test('pinned cases', async () => {
     new Set(['INGESTED', 'COPY']),
   );
   expect(await q.beside('IMG_2834 1.MOV', 'IMG_2834 1.HEIC')).toBe(true);
+});
+
+/** A dated primary placement (spec §6.4): `unique/` or a similar set, `<YYYYMMDD_HHMMSS>_<name>`. */
+const primary = (name: string) =>
+  new RegExp(
+    String.raw`^(unique/\d{4}/\d{4}-\d{2}|similar/\d{4}/\d{4}-\d{2}/s-[0-9a-f]{8})/\d{8}_\d{6}_` +
+      name.replace(/[.]/g, '\\.') +
+      '$',
+  );
+
+// Spec §10.3 pins, asserted wherever the tier's subset (from the manifest) holds them.
+test('spec-pinned destinations and burst sets', async () => {
+  const seeded = new Set(run.seedManifest.files.map((f) => f.name));
+  const has = (...names: string[]) =>
+    names.every((n) => seeded.has(n) && run.manifest.records.some((r) => r.name === n));
+  for (const n of ['VERP1022.TIF', 'AUXA4949.BMP'])
+    if (has(n)) expect(await q.stagedOf(n), n).toEqual([expect.stringMatching(primary(n))]);
+  if (has('IMG_0433.HEIC', 'IMG_E0433.HEIC')) {
+    // An edit and its original, same capture key: one copy group, the best copy placed by date
+    // and the other under the group's copies folder (named after the best copy's sha8).
+    expect(await q.sameCopyGroup('IMG_0433.HEIC', 'IMG_E0433.HEIC')).toBe(true);
+    const names = ['IMG_0433.HEIC', 'IMG_E0433.HEIC'];
+    const placed = (await stagedEntries(run.dataDir)).filter((e) =>
+      names.some((n) => e.dest.endsWith(n)),
+    );
+    const best = placed.filter((e) => /^(unique|similar)\//.test(e.dest));
+    expect(best.length, JSON.stringify(placed)).toBe(1);
+    const other = names.find((n) => !best[0]!.dest.endsWith(n))!;
+    expect(best[0]!.dest).toMatch(primary(names.find((n) => n !== other)!));
+    expect(placed.map((e) => e.dest)).toContain(`copies/g-${best[0]!.sha256.slice(0, 8)}/${other}`);
+  }
+  const bursts = components(run.manifest.relations.burst).filter(
+    (g) => g.filter((n) => seeded.has(n)).length >= 2,
+  );
+  expect(bursts.length).toBeGreaterThanOrEqual(5);
 });

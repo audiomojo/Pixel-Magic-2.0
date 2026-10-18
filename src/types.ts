@@ -35,3 +35,10 @@ export interface ScanResult {
   pendingFiles: number;
   pendingBytes: string;
 }
+
+/**
+ * `ApplicationFailure.type` of a decode whose child process was killed by a signal (OOM, an
+ * operator, a crash): transient, retried by the workflow up to its total decode-attempt cap. A
+ * type (not a value) so workflow code can share it through a type-only import.
+ */
+export type DecodeKilledType = 'DecodeKilled';

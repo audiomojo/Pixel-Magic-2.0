@@ -109,15 +109,19 @@ export async function fsyncDir(dir: string): Promise<void> {
   }
 }
 
-/** Hardlink src to dest (never overwrites, never unlinks). */
-export async function linkIntoVault(src: string, dest: string): Promise<LinkOutcome> {
+/** Hardlink src to dest (never overwrites, never unlinks); `sha256` is the bytes' hash. */
+export async function linkIntoVault(
+  src: string,
+  dest: string,
+  sha256: string,
+): Promise<LinkOutcome> {
   await mkdir(dirname(dest), { recursive: true });
   try {
     await link(src, dest);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    const [a, b] = await Promise.all([stat(src), stat(dest)]);
-    return a.dev === b.dev && a.ino === b.ino ? 'ALREADY_LINKED' : 'EXISTS_OTHER';
+    // `sameFile`, not a bare inode compare: virtiofs may have renumbered the vault link.
+    return (await sameFile(src, dest, sha256)) ? 'ALREADY_LINKED' : 'EXISTS_OTHER';
   }
   await fsyncDir(dirname(dest));
   return 'LINKED';

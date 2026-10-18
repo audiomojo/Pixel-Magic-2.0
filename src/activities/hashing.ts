@@ -4,7 +4,7 @@ import workerpool, { type Pool } from 'workerpool';
 import type { WireFacts } from '../decode.js';
 import { vaultRel } from '../fsops.js';
 import { toSigned } from '../hashing.js';
-import type { DecodeResult } from '../types.js';
+import type { DecodeKilledType, DecodeResult } from '../types.js';
 import type { Deps } from './index.js';
 
 export type WorkerPool = Pool;
@@ -69,7 +69,7 @@ export function makeHashing(deps: Deps) {
       if (e.name !== 'TimeoutError' && isSignalDeath(e))
         throw ApplicationFailure.retryable(
           `decode ${sha256}.${ext}: ${String(e.message)}`,
-          'DecodeKilled', // workflows.ts DECODE_KILLED
+          'DecodeKilled' satisfies DecodeKilledType,
         );
       if (isPoolFailure(e))
         throw ApplicationFailure.retryable(

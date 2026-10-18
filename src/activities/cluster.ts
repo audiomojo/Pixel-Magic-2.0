@@ -116,6 +116,13 @@ export function makeClusterContent(deps: Deps) {
     }
     const index = new HashIndex();
     index.append(facts, copyGroups);
+    // Copy verdicts of key-less contents, so a later flag can propagate to copies of a bridge.
+    for (const f of facts) {
+      if (f.captured !== null || f.burstUuid !== null) continue;
+      for (const m of index.matches(f, t))
+        if (m.sha256 !== f.sha256 && classify(f, m, t) === 'copy')
+          grouper.loadCopyEdge(f.sha256, m.sha256);
+    }
     return { version, grouper, index };
   }
 

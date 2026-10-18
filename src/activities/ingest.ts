@@ -290,7 +290,7 @@ export function makeIngestFile(deps: Deps) {
     await guarded(pool, row.id, `ext = $3`, ['CLAIMED'], [ext]);
 
     // Step 5: vault link. A different inode already there means a byte-identical copy.
-    const outcome = await linkIntoVault(claimed, vaultPath(sha, ext));
+    const outcome = await linkIntoVault(claimed, vaultPath(sha, ext), sha);
     await checkpoint('link');
     if (outcome === 'EXISTS_OTHER') {
       await rename(claimed, copiesPath(row.id, ext));

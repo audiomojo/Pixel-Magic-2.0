@@ -82,12 +82,18 @@ export function queries(dbUrl: string, dataDir: string | undefined = dataDirs.ge
       );
       return Number(r.rows[0]!.n);
     },
+    /** Every staged path of the content this original name holds, sorted. */
+    stagedOf: async (name: string) => {
+      if (dataDir === undefined) throw new Error(`no data dir registered for ${dbUrl}`);
+      const sha = shaOfName(await world(), name);
+      return (await stagedEntries(dataDir)).filter((e) => e.sha256 === sha).map((e) => e.dest);
+    },
     /** Some staged path of the MOV has the dirname and stem of a staged path of the still's content. */
     beside: async (movName: string, stillName: string) => {
       if (dataDir === undefined) throw new Error(`no data dir registered for ${dbUrl}`);
       const w = await world();
       const [mov, still] = [shaOfName(w, movName), shaOfName(w, stillName)];
-      const staged = await stagedEntries(dataDir, dbUrl);
+      const staged = await stagedEntries(dataDir);
       const key = (dest: string) => `${dirOf(dest)}\0${stemOf(baseOf(dest))}`;
       const stillKeys = new Set(staged.filter((e) => e.sha256 === still).map((e) => key(e.dest)));
       return staged.some((e) => e.sha256 === mov && stillKeys.has(key(e.dest)));
@@ -97,8 +103,8 @@ export function queries(dbUrl: string, dataDir: string | undefined = dataDirs.ge
 
 /**
  * The manifest's Live Photo pairs with both files seeded, keeping each MOV's real partner only.
- * The manifest also pairs by stem, so one MOV can have several stills (`IMG_0185.HEIC` and an
- * unrelated `IMG_0185.JPG`): a still sharing the MOV's content identifier wins, and otherwise
+ * The manifest also pairs by stem, so one MOV can have several stills (`IMG_9999.HEIC` and an
+ * unrelated `IMG_9999.JPG`): a still sharing the MOV's content identifier wins, and otherwise
  * the pair counts only when the MOV has a single candidate (spec §6.4 pairing).
  */
 export function livePairs(manifest: Manifest, seeded: Set<string>): Array<[string, string]> {

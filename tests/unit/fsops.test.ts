@@ -31,15 +31,32 @@ test('linkIntoVault outcomes', async () => {
   await writeFile(`${d}/a`, '1');
   await writeFile(`${d}/b`, '1');
   const dest = `${d}/v/ab/cd/x.jpg`;
-  expect(await linkIntoVault(`${d}/a`, dest)).toBe('LINKED');
-  expect(await linkIntoVault(`${d}/a`, dest)).toBe('ALREADY_LINKED');
-  expect(await linkIntoVault(`${d}/b`, dest)).toBe('EXISTS_OTHER');
+  const sha = createHash('sha256').update('1').digest('hex');
+  expect(await linkIntoVault(`${d}/a`, dest, sha)).toBe('LINKED');
+  expect(await linkIntoVault(`${d}/a`, dest, sha)).toBe('ALREADY_LINKED');
+  expect(await linkIntoVault(`${d}/b`, dest, sha)).toBe('EXISTS_OTHER');
   expect((await stat(`${d}/a`)).ino).toBe((await stat(dest)).ino);
 });
 
 test('linkIntoVault rethrows non-EEXIST errors', async () => {
   const d = await tmpDir();
-  await expect(linkIntoVault(`${d}/missing`, `${d}/v/x`)).rejects.toThrow(/ENOENT/);
+  await expect(linkIntoVault(`${d}/missing`, `${d}/v/x`, 'x')).rejects.toThrow(/ENOENT/);
+});
+
+// The same premise as `sameFile`: virtiofs may renumber the vault link's inode, so a replayed
+// ingest of the owner must still see its own link (multiply-linked, equal bytes) and not a copy.
+test('linkIntoVault: a renumbered inode of the owner is ALREADY_LINKED, not EXISTS_OTHER', async () => {
+  const d = await tmpDir();
+  const sha = createHash('sha256').update('bytes').digest('hex');
+  for (const f of ['a', 'v']) {
+    await writeFile(`${d}/${f}`, 'bytes');
+    await link(`${d}/${f}`, `${d}/${f}2`);
+    await utimes(`${d}/${f}`, 1_700_000_000, 1_700_000_000);
+  }
+  expect(await linkIntoVault(`${d}/a`, `${d}/v`, sha)).toBe('ALREADY_LINKED');
+  await writeFile(`${d}/lone`, 'bytes'); // a fresh drop: one link only
+  await utimes(`${d}/lone`, 1_700_000_000, 1_700_000_000);
+  expect(await linkIntoVault(`${d}/lone`, `${d}/v`, sha)).toBe('EXISTS_OTHER');
 });
 
 test('sha256File streams and calls onChunk per MiB', async () => {
@@ -122,6 +139,16 @@ describe('sameFile', () => {
     expect(await sameFile(`${d}/a`, `${d}/b`, null)).toBe(false);
     await utimes(`${d}/b`, 1_700_000_000, 1_700_000_005);
     expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(false);
+  });
+
+  test('mixed link counts: a multiply-linked file and a lone one are never the same file', async () => {
+    const d = await tmpDir();
+    await writeFile(`${d}/a`, 'bytes');
+    await link(`${d}/a`, `${d}/a2`);
+    await writeFile(`${d}/b`, 'bytes');
+    for (const f of ['a', 'b']) await utimes(`${d}/${f}`, 1_700_000_000, 1_700_000_000);
+    expect(await sameFile(`${d}/a`, `${d}/b`, sha('bytes'))).toBe(false);
+    expect(await sameFile(`${d}/b`, `${d}/a`, sha('bytes'))).toBe(false);
   });
 
   test('a missing path is never the same file', async () => {

@@ -76,6 +76,8 @@ export class Grouper {
   /** Contents with neither a capture key nor a burst: the only ones that can be flagged. */
   private readonly keyless = new Set<string>();
   private readonly flaggedSet = new Set<string>();
+  /** Copy-verdict neighbours of each key-less content (both directions), for flag propagation. */
+  private readonly copyEdges = new Map<string, Set<string>>();
 
   constructor(private readonly newId: (kind: GroupKind) => number) {}
 
@@ -112,6 +114,7 @@ export class Grouper {
     this.claim(f.sha256, gid);
     const keyless = f.captured === null && f.burstUuid === null;
     if (keyless) this.keyless.add(f.sha256);
+    for (const [, verdict, m] of resolved) if (verdict === 'copy') this.loadCopyEdge(f.sha256, m);
     this.copy.set(gid, {
       parent: gid,
       members: [f.sha256],
@@ -141,6 +144,9 @@ export class Grouper {
       this.mergeCopy(root, target, asg, pendingSets);
     }
 
+    // A key-less copy reaching only flagged bridges (a resize of one) is flagged too.
+    if (keyless && !this.flaggedSet.has(f.sha256)) this.flagIfOnlyBridged(f.sha256, asg, true);
+
     const root = this.findCopy(gid);
     asg.copyGroup = root;
     const similarTargets = [...new Set(resolved.map(([r]) => this.findCopy(r)))].filter(
@@ -165,15 +171,60 @@ export class Grouper {
     asg: Assignment,
   ): void {
     if (keyless) {
-      asg.ambiguous = true;
-      this.flaggedSet.add(sha);
+      if (!this.flaggedSet.has(sha)) this.flag(sha, true, asg);
       return;
     }
     for (const [root, verdict, m] of resolved) {
       if (root !== target || verdict !== 'copy' || !this.keyless.has(m)) continue;
-      if (this.flaggedSet.has(m)) continue;
-      this.flaggedSet.add(m);
-      asg.flagged.push(m);
+      if (!this.flaggedSet.has(m)) this.flag(m, false, asg);
+    }
+  }
+
+  /**
+   * Flags `sha` (the new content when `self`, else an existing one reported in `asg.flagged`),
+   * then propagates to the key-less copies that now reach only flagged bridges.
+   */
+  private flag(sha: string, self: boolean, asg: Assignment): void {
+    this.flaggedSet.add(sha);
+    if (self) asg.ambiguous = true;
+    else asg.flagged.push(sha);
+    for (const n of this.copyEdges.get(sha) ?? [])
+      if (this.keyless.has(n) && !this.flaggedSet.has(n)) this.flagIfOnlyBridged(n, asg, false);
+  }
+
+  /**
+   * `start`'s component: the unflagged key-less contents linked to it by copy verdicts. If every
+   * copy verdict leaving it lands on a flagged content (and at least one does), the component is
+   * only copies of bridges, whenever they arrived: flag all of it. A copy verdict to a content
+   * with a key keeps the component a copy of that photo, unflagged.
+   */
+  private flagIfOnlyBridged(start: string, asg: Assignment, startIsNew: boolean): void {
+    const comp = new Set([start]);
+    let bridged = false;
+    for (const x of comp)
+      for (const n of this.copyEdges.get(x) ?? []) {
+        if (this.flaggedSet.has(n)) bridged = true;
+        else if (this.keyless.has(n)) comp.add(n);
+        else return; // a copy of a keyed photo
+      }
+    if (!bridged) return;
+    for (const x of comp) {
+      this.flaggedSet.add(x);
+      if (startIsNew && x === start) asg.ambiguous = true;
+      else asg.flagged.push(x);
+    }
+  }
+
+  /** Records a copy verdict between two contents (for loaded state: from the hash index). */
+  loadCopyEdge(a: string, b: string): void {
+    for (const [x, y] of [
+      [a, b],
+      [b, a],
+    ] as const) {
+      if (!this.keyless.has(x)) continue;
+      let set = this.copyEdges.get(x);
+      if (set === undefined) this.copyEdges.set(x, (set = new Set()));
+      set.add(y);
     }
   }
 

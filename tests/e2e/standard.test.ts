@@ -70,7 +70,7 @@ test('junk never discovered', async () => {
   expect(await q.fileRowCount(ignored.map((f) => f.relPath))).toBe(0);
   for (const f of ignored)
     expect(existsSync(join(run.dataDir, 'dropzone', f.relPath)), f.relPath).toBe(true);
-  const staged = await stagedEntries(run.dataDir, run.dbUrl);
+  const staged = await stagedEntries(run.dataDir);
   for (const f of junk.filter((f) => !isIgnored(f.name))) {
     expect(await q.stateOf(f.relPath), f.relPath).toBe('INGESTED');
     expect(

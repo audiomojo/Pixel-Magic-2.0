@@ -22,6 +22,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => {
   return {
     ...actual,
     log: { warn: () => undefined },
+    sleep: () => Promise.resolve(),
     proxyActivities: (opts: unknown) =>
       new Proxy(
         {},
@@ -95,7 +96,7 @@ test('a new still runs every step, each with its queue, timeouts and retry polic
   expect(optsOf('decodeContent')).toEqual({
     taskQueue: 'cpu',
     startToCloseTimeout: '2m',
-    retry: { ...forever, maximumAttempts: 5 },
+    retry: { ...forever, maximumAttempts: 1 }, // the workflow retries and counts attempts
   });
   expect(optsOf('recordHash')).toEqual({
     taskQueue: 'io',
@@ -111,10 +112,7 @@ test('a new still runs every step, each with its queue, timeouts and retry polic
 
 test('every activity has a start-to-close timeout; only decode caps its attempts', () => {
   const o = wf.ACTIVITY_OPTIONS;
-  const all: [string, ActivityOptions][] = Object.entries(o).map(([k, v]) => [
-    k,
-    typeof v === 'function' ? v(5) : v,
-  ]);
+  const all: [string, ActivityOptions][] = Object.entries(o);
   expect(all.map(([k]) => k).sort()).toEqual([
     'clusterContent',
     'decodeContent',
@@ -141,9 +139,24 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
   });
 });
 
-test('poisonAttempts reaches the decode retry policy', async () => {
-  await wf.FileWorkflow(REF, { poisonAttempts: 3 });
-  expect(optsOf('decodeContent').retry?.maximumAttempts).toBe(3);
+test('poisonAttempts caps poison decode attempts', async () => {
+  h.impl['decodeContent'] = () => {
+    throw activityFailure(ApplicationFailure.retryable('timed out', 'Poison'));
+  };
+  expect(await wf.FileWorkflow(REF, { poisonAttempts: 3 })).toBe('FAILED');
+  expect(names().filter((n) => n === 'decodeContent')).toHaveLength(3);
+});
+
+test('a decode killed every time is FAILED decode_killed after MAX_DECODE_ATTEMPTS', async () => {
+  h.impl['decodeContent'] = () => {
+    throw activityFailure(ApplicationFailure.retryable('SIGKILL', 'DecodeKilled'));
+  };
+  expect(await wf.ContentWorkflow(SHA, 'jpg')).toBe('FAILED');
+  expect(names().filter((n) => n === 'decodeContent')).toHaveLength(wf.MAX_DECODE_ATTEMPTS);
+  expect(h.calls.at(-1)).toMatchObject({
+    name: 'markFailed',
+    args: [SHA, 'decode_killed: SIGKILL'],
+  });
 });
 
 test('decode exhaustion marks FAILED with the cause', async () => {

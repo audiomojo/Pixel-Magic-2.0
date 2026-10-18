@@ -220,16 +220,42 @@ test('decode poison marks FAILED after 5', async () => {
   expect(error).toContain('decode timed out');
 });
 
-test('a decode child killed by a signal (OOM) is retried past the poison cap, never FAILED', async () => {
-  let left = 12;
-  const killed = () => {
-    if (left-- > 0) throw ApplicationFailure.retryable('child got SIGKILL', 'DecodeKilled');
+/** Throws the scripted decode failures in order ('K' killed by a signal, 'P' poison), then decodes. */
+function scripted(script: string): () => DecodeResult {
+  let i = 0;
+  return () => {
+    const step = script[i++];
+    if (step === 'K') throw ApplicationFailure.retryable('child got SIGKILL', 'DecodeKilled');
+    if (step === 'P') throw ApplicationFailure.retryable('decode timed out', 'Poison');
     return DECODED;
   };
-  const f = fakes({ ingest: INGESTED_STILL, decode: killed });
+}
+
+test('a killed decode child is transient: a kill, then success, clusters', async () => {
+  const f = fakes({ ingest: INGESTED_STILL, decode: scripted('KKK') });
   expect(await runFile(f)).toBe('CLUSTERED');
-  expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(13);
+  expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(4);
   expect(f.calls).not.toContain('markFailed');
+});
+
+test('decode kills are capped: 10 attempts in all, then FAILED decode_killed', async () => {
+  const f = fakes({ ingest: INGESTED_STILL, decode: scripted('K'.repeat(30)) });
+  expect(await runFile(f)).toBe('FAILED');
+  expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(10);
+  expect(f.calls.at(-1)).toBe('markFailed');
+  expect(f.args['markFailed']![0]![1]).toMatch(/^decode_killed: /);
+});
+
+test('mixed kills and poison never reset the caps: FAILED within 10 attempts', async () => {
+  // Four poison, then a kill, repeated: the fifth poison (attempt 6) ends it.
+  const f = fakes({ ingest: INGESTED_STILL, decode: scripted('PPPPK'.repeat(6)) });
+  expect(await runFile(f)).toBe('FAILED');
+  expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(6);
+  expect(f.args['markFailed']![0]![1]).toContain('decode timed out');
+  // Kills and poison alternating: total attempts hit 10 before poison reaches 5.
+  const g = fakes({ ingest: INGESTED_STILL, decode: scripted('KPKPKPKPKKKKK') });
+  expect(await runFile(g)).toBe('FAILED');
+  expect(g.calls.filter((c) => c === 'decodeContent').length).toBeLessThanOrEqual(10);
 });
 
 test('poisonAttempts option caps decode attempts', async () => {

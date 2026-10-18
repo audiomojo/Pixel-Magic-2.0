@@ -1,5 +1,6 @@
 // The staged tree as `dest → content sha256`, and the (local, git-ignored) golden trees.
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, readlink, writeFile } from 'node:fs/promises';
+import { hashFiles } from '../../tools/corpus/lib.js';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { poolFor } from './db.js';
@@ -27,36 +28,32 @@ async function walkFiles(root: string): Promise<string[]> {
 
 const posixRel = (from: string, to: string) => relative(from, to).split(sep).join('/');
 
+const cache = new Map<string, StagedEntry[]>();
+
 /**
- * Every file under `staging/current/` with the sha256 of the bytes it links to. Staged files are
- * hardlinks, so the inode identifies the vault file (named by its sha256) or the `.copies` file
- * (named by its file id) it came from; a staged inode found in neither is a defect, reported as
- * sha256 `UNKNOWN`.
+ * Every file under `staging/current/` with the sha256 of its bytes, hashed (not matched by
+ * inode: Docker Desktop's virtiofs may renumber inodes). Cached per staging generation, since
+ * `current` names a new `.gen-<n>` on every build.
  */
-export async function stagedEntries(dataDir: string, dbUrl: string): Promise<StagedEntry[]> {
-  const vault = join(dataDir, 'vault');
-  const copies = join(vault, '.copies');
-  const shaOfIno = new Map<bigint, string>();
-  const shaOfId = new Map(
-    (
-      await poolFor(dbUrl).query<{ id: bigint; sha256: string }>(
-        'SELECT id, sha256 FROM files WHERE sha256 IS NOT NULL',
-      )
-    ).rows.map((r) => [String(r.id), r.sha256]),
-  );
-  for (const p of await walkFiles(vault)) {
-    const base = p.slice(p.lastIndexOf('/') + 1);
-    const stem = base.slice(0, base.indexOf('.') < 0 ? base.length : base.indexOf('.'));
-    const sha = p.startsWith(copies + sep) ? shaOfId.get(stem) : stem;
-    if (sha !== undefined) shaOfIno.set((await stat(p, { bigint: true })).ino, sha);
-  }
+export async function stagedEntries(dataDir: string): Promise<StagedEntry[]> {
   const current = join(dataDir, 'staging', 'current');
-  const out: StagedEntry[] = [];
-  for (const p of await walkFiles(current)) {
-    const ino = (await stat(p, { bigint: true })).ino;
-    out.push({ dest: posixRel(current, p), sha256: shaOfIno.get(ino) ?? 'UNKNOWN' });
+  let gen: string;
+  try {
+    gen = await readlink(current);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw e;
   }
-  return out.sort((a, b) => (a.dest < b.dest ? -1 : a.dest > b.dest ? 1 : 0));
+  const key = `${dataDir}\0${gen}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const paths = await walkFiles(current);
+  const shas = await hashFiles(paths);
+  const out = paths
+    .map((p, i) => ({ dest: posixRel(current, p), sha256: shas[i]! }))
+    .sort((a, b) => (a.dest < b.dest ? -1 : a.dest > b.dest ? 1 : 0));
+  cache.set(key, out);
+  return out;
 }
 
 /**
@@ -71,7 +68,7 @@ export async function treeSnapshot(dataDir: string, dbUrl: string): Promise<stri
       )
     ).rows.map((r) => r.sha256),
   );
-  return (await stagedEntries(dataDir, dbUrl))
+  return (await stagedEntries(dataDir))
     .map((e) => `${ambiguous.has(e.sha256) ? 'AMBIGUOUS' : e.dest}\t${e.sha256}`)
     .sort();
 }

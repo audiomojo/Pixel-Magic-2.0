@@ -453,7 +453,8 @@ test('loaded copy_ambiguous rows stay flagged and are not reported again', () =>
 
 /**
  * Two burst frames A and B, a keyed copy of each (A2, B2: same capture key, other encoding), a
- * key-less copy of A only (Y), and two key-less exports that copy-match both frames (X1, X2).
+ * key-less copy of A only (Y), two key-less exports that copy-match both frames (X1, X2), a
+ * key-less copy of X1 only (R, a resize of the bridge) and a key-less copy of R only (R2).
  */
 const BRIDGED = {
   A: F('A', { captured: { s: 1, sub: '1' }, burstUuid: 'U' }),
@@ -463,6 +464,8 @@ const BRIDGED = {
   Y: F('Y', { ...NOEXIF, width: 1000 }),
   X1: F('X1', { ...NOEXIF, width: 3000 }),
   X2: F('X2', { ...NOEXIF, width: 3000 }),
+  R: F('R', { ...NOEXIF, width: 1500 }),
+  R2: F('R2', { ...NOEXIF, width: 750 }),
 };
 type Bridged = keyof typeof BRIDGED;
 const KEYED: Bridged[] = ['A', 'B', 'A2', 'B2'];
@@ -471,14 +474,16 @@ const bridgedVerdict = (p: Bridged, q: Bridged): 'copy' | 'similar' => {
   const frame = (n: Bridged) =>
     n === 'A' || n === 'A2' ? 'A' : n === 'B' || n === 'B2' ? 'B' : null;
   if (KEYED.includes(p) && KEYED.includes(q)) return frame(p) === frame(q) ? 'copy' : 'similar';
+  if (pair.has('R')) return pair.has('X1') || pair.has('R2') ? 'copy' : 'similar';
+  if (pair.has('R2')) return 'similar';
   if (pair.has('Y')) return [...pair].some((n) => frame(n) === 'A') ? 'copy' : 'similar';
   return KEYED.includes(p) || KEYED.includes(q) ? 'copy' : 'similar'; // X1/X2 vs a frame
 };
 
-test('bridges are flagged and the unflagged copy partition is order-independent', () =>
+test('bridges and copies of bridges are flagged; the unflagged copy partition is order-independent', () =>
   fc.assert(
     fc.property(
-      fc.shuffledSubarray(Object.keys(BRIDGED) as Bridged[], { minLength: 7, maxLength: 7 }),
+      fc.shuffledSubarray(Object.keys(BRIDGED) as Bridged[], { minLength: 9, maxLength: 9 }),
       (order) => {
         const g = new Grouper(counter());
         const seen: Bridged[] = [];
@@ -490,7 +495,7 @@ test('bridges are flagged and the unflagged copy partition is order-independent'
           seen.push(n);
         }
         const flagged = g.ambiguousContents();
-        expect(flagged).toEqual(new Set(['X1', 'X2']));
+        expect(flagged).toEqual(new Set(['X1', 'X2', 'R', 'R2']));
         const unflagged = new Set(
           [...g.copyPartition()]
             .map((grp) =>
@@ -502,8 +507,33 @@ test('bridges are flagged and the unflagged copy partition is order-independent'
             .filter((grp) => grp !== ''),
         );
         expect(unflagged).toEqual(new Set(['A,A2,Y', 'B,B2']));
-        expect(g.similarPartition()).toEqual(new Set(['A,A2,B,B2,X1,X2,Y']));
+        expect(g.similarPartition()).toEqual(new Set(['A,A2,B,B2,R,R2,X1,X2,Y']));
       },
     ),
-    { numRuns: 500 },
+    { numRuns: 2000 },
   ));
+
+test('a reloaded grouper propagates a new flag through loaded copy edges', () => {
+  const g = new Grouper(counter(100));
+  g.load(row('a', 10, null, { s: 1, sub: '1' }));
+  g.load(row('x', 10, null, null));
+  g.load(row('r', 10, null, null));
+  g.loadCopyEdge('x', 'a');
+  g.loadCopyEdge('r', 'x');
+  const asg = g.add(F('b', { captured: { s: 1, sub: '2' } }), [['x', 'copy']]);
+  expect(asg.flagged.sort()).toEqual(['r', 'x']);
+  expect(g.ambiguousContents()).toEqual(new Set(['r', 'x']));
+});
+
+test('a key-less copy of a flagged bridge is flagged on arrival; one with a keyed match is not', () => {
+  const g = new Grouper(counter(100));
+  g.load(row('a', 10, null, { s: 1, sub: '1' }));
+  g.load({ ...row('x', 10, null, null), ambiguous: true });
+  expect(g.add(F('r', NOEXIF), [['x', 'copy']]).ambiguous).toBe(true);
+  expect(
+    g.add(F('y', { ...NOEXIF, width: 10 }), [
+      ['x', 'copy'],
+      ['a', 'copy'],
+    ]).ambiguous,
+  ).toBe(false);
+});

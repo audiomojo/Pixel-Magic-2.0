@@ -178,7 +178,7 @@ test('verify-vault rejects a bad --sample', async () => {
 
 test('retry-failed resets and starts', async () => {
   await seedContent({ state: 'FAILED', lastError: 'x' });
-  await seedContent({ state: 'FAILED', lastError: 'y' });
+  await seedContent({ state: 'FAILED', lastError: 'decode_killed: child got SIGKILL' });
   await seedContent({ state: 'CLUSTERED' });
   const f = recordingClient();
   const out = capture('stdout');
