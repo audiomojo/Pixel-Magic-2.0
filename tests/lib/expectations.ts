@@ -125,6 +125,50 @@ export function livePairs(manifest: Manifest, seeded: Set<string>): Array<[strin
   return out;
 }
 
+type Variant = NonNullable<SeedFile['variant']>;
+
+/**
+ * Synthetic variant kinds (tools/corpus/lib.ts `synthesize`) that are within the copy distances
+ * of their seed by construction, so a `copy-if-tight` one must be a copy whatever its stored
+ * hashes say: a floor under the measured check, which a decode or hash regression would
+ * otherwise pass. `png` is a lossless re-encode of the seed's own decoded pixels at the same
+ * size. The rest are lossy or resized (a screenshot's `resize50` measures dHash 7, its
+ * `q60-noexif` lands outside too), and synthesis makes no byte-level or metadata-only variant.
+ */
+export const TIGHT_BY_CONSTRUCTION: ReadonlySet<Variant> = new Set<Variant>(['png']);
+
+/** What a `copy-if-tight` variant must be: its measured `tight`ness, or a copy if tight by construction. */
+export function resolveCopyIfTight(
+  variant: Variant | undefined,
+  tight: boolean,
+): 'copy' | 'similar' {
+  return tight || (variant !== undefined && TIGHT_BY_CONSTRUCTION.has(variant))
+    ? 'copy'
+    : 'similar';
+}
+
+/** One line for the run's log: how many `copy-if-tight` variants came out similar, and which. */
+export function copyIfTightSummary(
+  resolved: Array<{ variant: Variant | undefined; tight: boolean; at: string }>,
+): string {
+  const loose = resolved
+    .filter((r) => !r.tight)
+    .map((r) => `${String(r.variant)} ${r.at}`)
+    .sort();
+  const head = `copy-if-tight: ${String(loose.length)} of ${String(resolved.length)} variants resolved similar`;
+  if (loose.length === 0) return head;
+  const byKind = new Map<string, number>();
+  for (const r of resolved.filter((x) => !x.tight)) {
+    const k = String(r.variant);
+    byKind.set(k, (byKind.get(k) ?? 0) + 1);
+  }
+  const kinds = [...byKind]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, n]) => `${k} ${String(n)}`)
+    .join(', ');
+  return `${head} (${kinds}): ${loose.join('; ')}`;
+}
+
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
 const sha8 = (s: string) => s.slice(0, 8);
 
@@ -200,16 +244,22 @@ export async function diffExpectations(
   );
   const group = (sha: string) => w.contents.get(sha)?.copyGroup ?? null;
   const same = (a: string, b: string) => a === b || (group(a) !== null && group(a) === group(b));
-  const tight = (a: string, b: string): boolean => {
+  /** The pair's stored hash distances, or null when either lacks hashes. */
+  const distance = (a: string, b: string): { p: number; d: number } | null => {
     const [x, y] = [w.contents.get(a), w.contents.get(b)];
     if (!x || !y || x.phash === null || y.phash === null || x.dhash === null || y.dhash === null)
-      return false;
-    const t = DEFAULT_THRESHOLDS; // the stacks run with the default thresholds
-    return (
-      hamming(toUnsigned(x.phash), toUnsigned(y.phash)) <= t.copyPhash &&
-      hamming(toUnsigned(x.dhash), toUnsigned(y.dhash)) <= t.copyDhash
-    );
+      return null;
+    return {
+      p: hamming(toUnsigned(x.phash), toUnsigned(y.phash)),
+      d: hamming(toUnsigned(x.dhash), toUnsigned(y.dhash)),
+    };
   };
+  const tight = (a: string, b: string): boolean => {
+    const t = DEFAULT_THRESHOLDS; // the stacks run with the default thresholds
+    const x = distance(a, b);
+    return x !== null && x.p <= t.copyPhash && x.d <= t.copyDhash;
+  };
+  const resolved: Parameters<typeof copyIfTightSummary>[0] = [];
   for (const v of seeded.filter((f) => f.origin === 'synthetic')) {
     const c = contentFor(v);
     const s = seedSha.get(v.seedName ?? '');
@@ -222,9 +272,17 @@ export async function diffExpectations(
       continue;
     }
     // Rows 6–8 of §6.3: a copy exactly when the pair is within the copy distances (measured on
-    // the stored hashes), otherwise only similar.
-    const expect =
-      v.expect === 'copy-if-tight' ? (tight(v.sha256, s) ? 'copy' : 'similar') : v.expect;
+    // the stored hashes), otherwise only similar; a kind tight by construction must be a copy.
+    let expect = v.expect;
+    if (v.expect === 'copy-if-tight') {
+      const isTight = tight(v.sha256, s);
+      const x = distance(v.sha256, s);
+      const at = `${sha8(v.sha256)} pHash ${String(x?.p)} dHash ${String(x?.d)}`;
+      resolved.push({ variant: v.variant, tight: isTight, at });
+      expect = resolveCopyIfTight(v.variant, isTight);
+      if (!isTight && expect === 'copy')
+        out.push(`${v.relPath}: a ${String(v.variant)} variant is tight by construction, ${at}`);
+    }
     if (expect === 'copy' && !same(v.sha256, s))
       out.push(`${v.relPath}: expected a copy of ${String(v.seedName)}, not in its copy group`);
     if (expect === 'similar') {
@@ -252,6 +310,9 @@ export async function diffExpectations(
         out.push(`${v.relPath}: neither copy_ambiguous nor a copy of ${String(v.bridges)}`);
     }
   }
+
+  // Printed even when the test passes (vitest shows `console` output of failing tests only).
+  process.stdout.write(`${copyIfTightSummary(resolved)}\n`);
 
   // Burst frames are never copies of each other.
   for (const [a, b] of manifest.relations.burst) {
