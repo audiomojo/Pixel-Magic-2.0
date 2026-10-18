@@ -256,12 +256,16 @@ export interface ChaosOptions {
   seed: number;
   /** Wait before each action, uniform in `[min, max]` seconds. */
   everyS: [min: number, max: number];
-  /** Stop once this fraction of the seeded (non-ignored) files has a final `files` row. */
+  /**
+   * Stop once this fraction of the seeded stills (corpus stills and synthetic variants, by
+   * content) is terminal: CLUSTERED, FAILED or QUARANTINED. A merely ingested file doesn't count,
+   * so the chaos overlaps decode and clustering, not just ingest.
+   */
   untilProgress: number;
   actions: ChaosAction[];
 }
 
-const FINAL_FILE_STATES = ['INGESTED', 'COPY', 'QUARANTINED'];
+const TERMINAL_STILL_STATES = ['CLUSTERED', 'FAILED', 'QUARANTINED'];
 /** How long a killed service stays down before it is started again (as a supervisor would). */
 const KILL_DOWNTIME_MS = 5000;
 
@@ -285,7 +289,7 @@ export interface TierRun {
   reseed(prefix: string): Promise<SeedManifest>;
   /**
    * Scales `worker-extra` to 1, then applies seeded-random `actions` at random `everyS` intervals
-   * until `untilProgress` is reached and every action has been applied at least once (actions are
+   * until `untilProgress` (of the seeded stills, see `ChaosOptions`) is reached and every action has been applied at least once (actions are
    * drawn as shuffled rounds of the whole list). Returns the applied action log.
    */
   runWithChaos(opts: ChaosOptions): Promise<string[]>;
@@ -348,7 +352,7 @@ export async function runTier(tier: Tier, opts: TierOptions = {}): Promise<TierR
       await stack.waitIdle(timeoutMs);
       await stack.stage();
     },
-    runWithChaos: (opts) => runWithChaos(stack, seedManifest, opts),
+    runWithChaos: (opts) => runWithChaos(stack, seededStills(seedManifest, manifest), opts),
     async reseed(prefix) {
       const sm = await seed({
         corpusDir: PATHS.corpus,
@@ -365,15 +369,28 @@ export async function runTier(tier: Tier, opts: TierOptions = {}): Promise<TierR
   };
 }
 
-/** Fraction of the seeded, non-ignored files with a final `files` row; null while the database is down. */
-async function progress(stack: Stack, sm: SeedManifest): Promise<number | null> {
-  const seeded = sm.files.filter((f) => !isIgnored(f.name)).length;
+/** Content SHA-256s of the seeded stills: corpus files the manifest calls stills, and every synthetic variant. */
+function seededStills(sm: SeedManifest, manifest: Manifest): string[] {
+  const still = new Set(manifest.records.filter((r) => r.kind === 'still').map((r) => r.name));
+  return [
+    ...new Set(
+      sm.files
+        .filter((f) => f.origin === 'synthetic' || (f.origin === 'corpus' && still.has(f.name)))
+        .map((f) => f.sha256),
+    ),
+  ];
+}
+
+/** Fraction of `stills` in a terminal content state; null while the database is down. */
+async function stillProgress(stack: Stack, stills: string[]): Promise<number | null> {
   try {
     const r = await poolFor(stack.dbUrl).query<{ n: bigint }>(
-      'SELECT count(*) AS n FROM files WHERE state = ANY($1)',
-      [FINAL_FILE_STATES],
+      // A content the pipeline didn't take for a still has no decode or cluster step left.
+      `SELECT count(*) AS n FROM contents
+        WHERE sha256 = ANY($1) AND (state = ANY($2) OR kind <> 'still')`,
+      [stills, TERMINAL_STILL_STATES],
     );
-    return Number(r.rows[0]!.n) / seeded;
+    return Number(r.rows[0]!.n) / stills.length;
   } catch {
     return null;
   }
@@ -396,8 +413,9 @@ async function apply(stack: Stack, a: ChaosAction): Promise<void> {
   }
 }
 
-async function runWithChaos(stack: Stack, sm: SeedManifest, opts: ChaosOptions): Promise<string[]> {
+async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions): Promise<string[]> {
   if (opts.actions.length === 0) throw new Error('runWithChaos: no actions');
+  if (stills.length === 0) throw new Error('runWithChaos: no seeded stills');
   const rnd = prng(opts.seed);
   const [min, max] = opts.everyS;
   const t0 = Date.now();
@@ -412,21 +430,21 @@ async function runWithChaos(stack: Stack, sm: SeedManifest, opts: ChaosOptions):
   const applied = new Set<number>();
   let round: number[] = [];
   for (;;) {
-    const p = await progress(stack, sm);
+    const p = await stillProgress(stack, stills);
     if (applied.size === opts.actions.length && p !== null && p >= opts.untilProgress) {
-      note(`done at progress ${p.toFixed(3)}`);
+      note(`done at still progress ${p.toFixed(3)}`);
       return log;
     }
     await sleep((min + rnd() * (max - min)) * 1000);
     if (round.length === 0) round = shuffled([...opts.actions.keys()], rnd);
     const i = round.pop()!;
     const action = opts.actions[i]!;
-    const before = await progress(stack, sm);
+    const before = await stillProgress(stack, stills);
     const started = Date.now();
     await apply(stack, action);
     applied.add(i);
     note(
-      `${action.join(' ')} (progress ${before === null ? 'n/a' : before.toFixed(3)}, ` +
+      `${action.join(' ')} (still progress ${before === null ? 'n/a' : before.toFixed(3)}, ` +
         `took ${((Date.now() - started) / 1000).toFixed(1)}s)`,
     );
   }

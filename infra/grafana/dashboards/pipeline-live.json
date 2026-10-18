@@ -226,7 +226,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) AS value FROM groups WHERE kind = 'similar' AND merged_into IS NULL"
+          "rawSql": "SELECT count(*) AS value FROM (SELECT similar_set_id FROM groups WHERE kind = 'copy' AND merged_into IS NULL AND similar_set_id IS NOT NULL GROUP BY similar_set_id HAVING count(*) >= 2) AS sets"
         }
       ],
       "fieldConfig": {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { isIgnored } from '../../src/fsops.js';
 import type { Manifest } from '../../tools/corpus/lib.js';
-import { diffExpectations, livePairs, partitions, queries } from '../lib/expectations.js';
+import { diffExpectations, livePairs, moduloAmbiguity, queries } from '../lib/expectations.js';
 import { checkInvariant } from '../lib/invariant.js';
 import { stagedEntries } from '../lib/snapshot.js';
 import { runTier, type TierRun } from '../lib/stack.js';
@@ -95,7 +95,9 @@ test('nested Unicode layout works', async () => {
       nested.seedManifest.files.some((f) => f.relPath.includes('/') && /[^ -~]/.test(f.relPath)),
     ).toBe(true);
     expect(await checkInvariant(...nested.ctx)).toEqual([]);
-    expect(await partitions(nested.dbUrl)).toEqual(await partitions(run.dbUrl));
+    // Partitions only: a byte twin's staged name comes from its lowest rel_path, which nesting changes.
+    const m = await moduloAmbiguity(nested, run);
+    expect(m.partitions[0]).toEqual(m.partitions[1]);
     ok = true;
   } finally {
     await nested.stack.down(!ok);

@@ -96,7 +96,7 @@ test('queries return the seeded numbers', async () => {
     Number((await pgh.pool.query<{ value: unknown }>(targetByTitle(title).rawSql)).rows[0]!.value);
   expect(await value('Failed')).toBe(1);
   expect(await value('Copy groups')).toBe(1);
-  expect(await value('Similar sets')).toBe(1);
+  expect(await value('Similar sets')).toBe(0); // a similar row with no copy groups is no set (below)
   // backlog = INGESTED + HASHED stills (2); 2 clustered rows in the last 10 min -> ... finite ETA
   expect(Number.isFinite(await value('ETA'))).toBe(true);
   const dz = (await pgh.pool.query<Record<string, unknown>>(targetByTitle('Drop zone').rawSql))
@@ -123,6 +123,25 @@ test('visibility panel queries run against a stub executions_visibility', async 
     await c.query('RESET search_path; DROP SCHEMA vis CASCADE');
     c.release();
   }
+});
+
+// Task 13 chaos: copy groups linked as a similar set can later merge into one copy group. That
+// set holds a single group and stages as unique (stagingPlan), so it is not counted either.
+test('Similar sets counts only sets of two or more root copy groups', async () => {
+  const { pool } = pgh;
+  const id = async (sql: string, args: unknown[] = []) =>
+    (await pool.query<{ id: bigint }>(`${sql} RETURNING id`, args)).rows[0]!.id;
+  const real = await id(`INSERT INTO groups (kind) VALUES ('similar')`);
+  for (let i = 0; i < 2; i++)
+    await id(`INSERT INTO groups (kind, similar_set_id) VALUES ('copy', $1)`, [real]);
+  const lone = await id(`INSERT INTO groups (kind) VALUES ('similar')`);
+  const root = await id(`INSERT INTO groups (kind, similar_set_id) VALUES ('copy', $1)`, [lone]);
+  await id(`INSERT INTO groups (kind, merged_into, similar_set_id) VALUES ('copy', $1, $2)`, [
+    root,
+    lone,
+  ]);
+  const r = await pool.query<{ value: unknown }>(targetByTitle('Similar sets').rawSql);
+  expect(Number(r.rows[0]!.value)).toBe(1);
 });
 
 test('≈ Reclaimable uses the approximate formula', async () => {
