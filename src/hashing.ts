@@ -1,7 +1,7 @@
 const MASK32 = 0xffff_ffffn;
 
 /** Population count of a 32-bit unsigned integer (SWAR). */
-function popcount32(x: number): number {
+export function popcount32(x: number): number {
   x = x - ((x >>> 1) & 0x5555_5555);
   x = (x & 0x3333_3333) + ((x >>> 2) & 0x3333_3333);
   return Math.imul((x + (x >>> 4)) & 0x0f0f_0f0f, 0x0101_0101) >>> 24;

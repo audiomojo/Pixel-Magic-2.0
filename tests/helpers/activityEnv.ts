@@ -1,5 +1,6 @@
 import { MockActivityEnvironment, type MockActivityEnvironmentOptions } from '@temporalio/testing';
 import type pg from 'pg';
+import { createDecodePool } from '../../src/activities/hashing.js';
 import type { Deps } from '../../src/activities/index.js';
 import { loadSettings } from '../../src/config.js';
 import { DataLayout } from '../../src/fsops.js';
@@ -43,10 +44,14 @@ export async function testDeps(
   await layout.ensure();
   const settings = loadSettings({ DATABASE_URL: pg.url, DATA_DIR: layout.root });
   const metadata = new MetadataReader();
-  const deps: Deps = { pool: pg.pool, settings, layout, metadata, ...overrides };
+  // A child can't load `.ts` with NodeNext `.js` specifiers under plain Node: run it under tsx.
+  const decodePool = createDecodePool('src/decodeWorker.ts', 2, { execArgv: ['--import', 'tsx'] });
+  const deps: Deps = { pool: pg.pool, settings, layout, metadata, decodePool, ...overrides };
   return {
     deps,
     layout,
-    close: () => metadata.end(),
+    close: async () => {
+      await Promise.all([metadata.end(), decodePool.terminate()]);
+    },
   };
 }

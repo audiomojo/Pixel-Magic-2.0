@@ -3,6 +3,8 @@ import type pg from 'pg';
 import type { Settings } from '../config.js';
 import type { DataLayout } from '../fsops.js';
 import type { MetadataReader } from '../metadata.js';
+import { makeClusterContent } from './cluster.js';
+import { makeHashing, type WorkerPool } from './hashing.js';
 import { makeIngestFile } from './ingest.js';
 
 export interface Deps {
@@ -10,6 +12,8 @@ export interface Deps {
   settings: Settings;
   layout: DataLayout;
   metadata: MetadataReader;
+  /** Decode child processes; owned (and terminated) by whoever created it, never by activities. */
+  decodePool: WorkerPool;
   temporal?: Client;
   /** Test seam: awaited at named crash points inside activities. */
   checkpoint?: (name: string) => void | Promise<void>;
@@ -18,6 +22,8 @@ export interface Deps {
 export function createActivities(deps: Deps) {
   return {
     ingestFile: makeIngestFile(deps),
+    ...makeHashing(deps),
+    clusterContent: makeClusterContent(deps),
   };
 }
 
