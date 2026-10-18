@@ -572,7 +572,7 @@ export function components(pairs: Pair[]): string[][] {
 // Subsets.
 
 /** Deterministic PRNG (mulberry32). */
-function prng(seed: number): () => number {
+export function prng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -583,7 +583,7 @@ function prng(seed: number): () => number {
   };
 }
 
-function shuffled<T>(items: readonly T[], rnd: () => number): T[] {
+export function shuffled<T>(items: readonly T[], rnd: () => number): T[] {
   const a = [...items];
   for (let i = a.length - 1; i > 0; i--) {
     const j = Math.floor(rnd() * (i + 1));

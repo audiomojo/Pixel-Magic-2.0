@@ -73,6 +73,24 @@ test('burst set keeps every shot in similar/', () => {
   ).toBe(true);
 });
 
+// Chaos (Task 13): copy groups already linked as a similar set can later merge into one copy
+// group, leaving a set that holds only it; had the copies merged first there'd be no set at all.
+test('a similar set holding a single copy group stages as unique', () => {
+  const a = C('a'.repeat(64), { copyGroup: 1, similarSet: 9 });
+  const a2 = C('c'.repeat(64), { copyGroup: 1, similarSet: 9, width: 2016, height: 1512 });
+  const asSet = planStaging([a, a2], [Fl(1n, 'A.HEIC', a), Fl(2n, 'A2.HEIC', a2)], 5);
+  const noSet = planStaging(
+    [a, a2].map((c) => ({ ...c, similarSet: null })),
+    [Fl(1n, 'A.HEIC', a), Fl(2n, 'A2.HEIC', a2)],
+    5,
+  );
+  expect(dests(asSet)).toEqual([
+    'copies/g-aaaaaaaa/A2.HEIC',
+    'unique/2021/2021-10/20211003_140211_A.HEIC',
+  ]);
+  expect(dests(asSet)).toEqual(dests(noSet));
+});
+
 test('similar folder is named and dated after the set best, across months', () => {
   const a = C('a'.repeat(64), { copyGroup: 1, similarSet: 9, width: 10, height: 10 });
   const b = C('b'.repeat(64), {

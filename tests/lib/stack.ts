@@ -10,8 +10,10 @@ import { isIgnored } from '../../src/fsops.js';
 import {
   PATHS,
   loadManifest,
+  prng,
   seed,
   selectSubsets,
+  shuffled,
   type Manifest,
   type SeedManifest,
   type SeedOptions,
@@ -49,6 +51,8 @@ export interface StackStatus {
 export class Stack {
   readonly project: string;
   private url: string | null = null;
+  /** Replica counts that `up` keeps (`docker compose up` would reset them to the file's). */
+  private readonly scales = new Map<string, number>();
 
   constructor(
     readonly runId: string,
@@ -83,8 +87,24 @@ export class Stack {
 
   async up(): Promise<void> {
     await mkdir(join(this.dataDir, 'dropzone'), { recursive: true });
-    await this.compose('up', '-d', '--build', '--wait');
+    const scale = [...this.scales].flatMap(([svc, n]) => ['--scale', `${svc}=${String(n)}`]);
+    await this.compose('up', '-d', '--build', '--wait', ...scale);
     await this.connect();
+  }
+
+  /** Runs `n` replicas of `svc` from now on (kept across `up`). */
+  async scale(svc: string, n: number): Promise<void> {
+    this.scales.set(svc, n);
+    await this.compose(
+      'up',
+      '-d',
+      '--wait',
+      '--no-deps',
+      '--no-recreate',
+      '--scale',
+      `${svc}=${String(n)}`,
+      svc,
+    );
   }
 
   private async connect(): Promise<void> {
@@ -93,7 +113,10 @@ export class Stack {
     if (!/^\d+$/.test(port))
       throw new Error(`no host port for postgres: ${JSON.stringify(mapped)}`);
     const url = `postgres://postgres:${POSTGRES_PASSWORD}@127.0.0.1:${port}/pixelmagic`;
-    if (this.url !== null && this.url !== url) await closePool(this.url);
+    if (this.url !== null && this.url !== url) {
+      await closePool(this.url);
+      await closePool(this.dbUrlFor('temporal_visibility'));
+    }
     this.url = url;
     registerDataDir(url, this.dataDir);
   }
@@ -121,6 +144,11 @@ export class Stack {
 
   async kill(svc: string): Promise<void> {
     await this.compose('kill', '-s', 'SIGKILL', svc);
+  }
+
+  /** Starts a stopped or killed service (a no-op if its restart policy already did). */
+  async start(svc: string): Promise<void> {
+    await this.compose('start', svc);
   }
 
   async restart(svc: string): Promise<void> {
@@ -219,6 +247,24 @@ export class Stack {
 
 export type Tier = 'smoke' | 'standard';
 
+/** One fault: SIGKILL a service, restart it, pause it for `ms` (≈ Mac sleep), or SIGKILL them all. */
+export type ChaosAction =
+  ['kill', string] | ['restart', string] | ['pause', string, number] | ['killAll'];
+
+export interface ChaosOptions {
+  /** PRNG seed: the action order and the waits are reproducible. */
+  seed: number;
+  /** Wait before each action, uniform in `[min, max]` seconds. */
+  everyS: [min: number, max: number];
+  /** Stop once this fraction of the seeded (non-ignored) files has a final `files` row. */
+  untilProgress: number;
+  actions: ChaosAction[];
+}
+
+const FINAL_FILE_STATES = ['INGESTED', 'COPY', 'QUARANTINED'];
+/** How long a killed service stays down before it is started again (as a supervisor would). */
+const KILL_DOWNTIME_MS = 5000;
+
 export interface TierRun {
   tier: Tier;
   runId: string;
@@ -237,6 +283,12 @@ export interface TierRun {
   runToIdle(timeoutMs?: number): Promise<void>;
   /** Seeds the tier's corpus names again under `dropzone/<prefix>`; merges them into `seedManifest`. */
   reseed(prefix: string): Promise<SeedManifest>;
+  /**
+   * Scales `worker-extra` to 1, then applies seeded-random `actions` at random `everyS` intervals
+   * until `untilProgress` is reached and every action has been applied at least once (actions are
+   * drawn as shuffled rounds of the whole list). Returns the applied action log.
+   */
+  runWithChaos(opts: ChaosOptions): Promise<string[]>;
 }
 
 export interface TierOptions {
@@ -296,6 +348,7 @@ export async function runTier(tier: Tier, opts: TierOptions = {}): Promise<TierR
       await stack.waitIdle(timeoutMs);
       await stack.stage();
     },
+    runWithChaos: (opts) => runWithChaos(stack, seedManifest, opts),
     async reseed(prefix) {
       const sm = await seed({
         corpusDir: PATHS.corpus,
@@ -310,4 +363,71 @@ export async function runTier(tier: Tier, opts: TierOptions = {}): Promise<TierR
       return seedManifest;
     },
   };
+}
+
+/** Fraction of the seeded, non-ignored files with a final `files` row; null while the database is down. */
+async function progress(stack: Stack, sm: SeedManifest): Promise<number | null> {
+  const seeded = sm.files.filter((f) => !isIgnored(f.name)).length;
+  try {
+    const r = await poolFor(stack.dbUrl).query<{ n: bigint }>(
+      'SELECT count(*) AS n FROM files WHERE state = ANY($1)',
+      [FINAL_FILE_STATES],
+    );
+    return Number(r.rows[0]!.n) / seeded;
+  } catch {
+    return null;
+  }
+}
+
+async function apply(stack: Stack, a: ChaosAction): Promise<void> {
+  switch (a[0]) {
+    case 'kill':
+      await stack.kill(a[1]);
+      await sleep(KILL_DOWNTIME_MS);
+      await stack.start(a[1]);
+      return;
+    case 'restart':
+      return stack.restart(a[1]);
+    case 'pause':
+      return stack.pause(a[1], a[2]);
+    case 'killAll':
+      await stack.killAll();
+      return stack.up();
+  }
+}
+
+async function runWithChaos(stack: Stack, sm: SeedManifest, opts: ChaosOptions): Promise<string[]> {
+  if (opts.actions.length === 0) throw new Error('runWithChaos: no actions');
+  const rnd = prng(opts.seed);
+  const [min, max] = opts.everyS;
+  const t0 = Date.now();
+  const log: string[] = [];
+  const note = (msg: string) => {
+    const line = `+${((Date.now() - t0) / 1000).toFixed(1)}s ${msg}`;
+    log.push(line);
+    process.stdout.write(`[chaos ${stack.project}] ${line}\n`); // shown even when the test passes
+  };
+  await stack.scale('worker-extra', 1);
+  note('scaled worker-extra to 1');
+  const applied = new Set<number>();
+  let round: number[] = [];
+  for (;;) {
+    const p = await progress(stack, sm);
+    if (applied.size === opts.actions.length && p !== null && p >= opts.untilProgress) {
+      note(`done at progress ${p.toFixed(3)}`);
+      return log;
+    }
+    await sleep((min + rnd() * (max - min)) * 1000);
+    if (round.length === 0) round = shuffled([...opts.actions.keys()], rnd);
+    const i = round.pop()!;
+    const action = opts.actions[i]!;
+    const before = await progress(stack, sm);
+    const started = Date.now();
+    await apply(stack, action);
+    applied.add(i);
+    note(
+      `${action.join(' ')} (progress ${before === null ? 'n/a' : before.toFixed(3)}, ` +
+        `took ${((Date.now() - started) / 1000).toFixed(1)}s)`,
+    );
+  }
 }

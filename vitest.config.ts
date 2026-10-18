@@ -23,6 +23,15 @@ export default defineConfig({
           hookTimeout: 60 * 60_000,
         },
       },
+      {
+        // Task 13: a calm and a chaos standard run on two compose projects.
+        test: {
+          name: 'chaos',
+          include: ['tests/chaos/**/*.test.ts'],
+          fileParallelism: false,
+          testTimeout: 3 * 60 * 60_000,
+        },
+      },
     ],
     coverage: {
       provider: 'v8',

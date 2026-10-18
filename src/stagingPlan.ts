@@ -272,7 +272,14 @@ export function planStaging(
     groups.set(c.copyGroup, [...(groups.get(c.copyGroup) ?? []), c]);
     if (c.similarSet !== null) sets.set(c.similarSet, [...(sets.get(c.similarSet) ?? []), c]);
   }
-  const setBest = new Map([...sets].map(([id, cs]) => [id, [...cs].sort(better)[0]!]));
+  // A set is two or more look-alike copy groups (spec §6.3). One that holds a single copy group
+  // (its groups merged after they were linked) stages as unique: had the copies merged first,
+  // there'd be no set, and the tree must not depend on arrival order.
+  const setBest = new Map(
+    [...sets]
+      .filter(([, cs]) => new Set(cs.map((c) => c.copyGroup)).size > 1)
+      .map(([id, cs]) => [id, [...cs].sort(better)[0]!]),
+  );
   for (const members of groups.values()) {
     const [best, ...others] = [...members].sort(better);
     const copies = `copies/g-${sha8(best!.sha256)}`;

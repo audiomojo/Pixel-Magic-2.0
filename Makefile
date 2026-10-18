@@ -1,5 +1,5 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle corpus-manifest corpus-verify \
-	test-smoke test-standard update-golden golden-smoke
+	test-smoke test-standard update-golden golden-smoke chaos
 
 CORPUS := test-automation/sample-images
 
@@ -47,22 +47,26 @@ corpus-manifest:
 corpus-verify:
 	npx tsx tools/corpus/verify.ts $(if $(DEEP),--deep,)
 
-# G8: an e2e tier on its own compose project (pmtest_<runId>) and data-test/<runId>, with
-# corpus-verify before and after (the after-check runs even when the tier fails).
+# G8: an e2e command on its own compose project (pmtest_<runId>) and data-test/<runId>, with
+# corpus-verify before and after (the after-check runs even when the command fails).
 define e2e
 	$(MAKE) corpus-verify
-	status=0; TIER=$(1) $(2) npm run test:e2e || status=$$?; $(MAKE) corpus-verify && exit $$status
+	status=0; $(1) || status=$$?; $(MAKE) corpus-verify && exit $$status
 endef
 
 test-smoke:
-	$(call e2e,smoke,)
+	$(call e2e,TIER=smoke npm run test:e2e)
 
 test-standard:
-	$(call e2e,standard,)
+	$(call e2e,TIER=standard npm run test:e2e)
+
+# Task 13: a calm and a chaos standard run (kills, restarts, a pause) must end the same.
+chaos:
+	$(call e2e,npm run test:chaos)
 
 # Writes tests/e2e/golden/smoke_tree.txt locally. It is git-ignored: staged names come from
 # personal photos (dates + original names), so every machine generates its own golden.
 update-golden:
-	$(call e2e,smoke,UPDATE_GOLDEN=1)
+	$(call e2e,TIER=smoke UPDATE_GOLDEN=1 npm run test:e2e)
 
 golden-smoke: update-golden

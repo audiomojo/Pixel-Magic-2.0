@@ -21,9 +21,10 @@ export function createPool(url: string, max = 10): pg.Pool {
   });
   // An idle client whose backend goes away (Postgres restart, terminated session) is re-emitted
   // on the pool; unhandled, that 'error' event kills the process. The pool already discarded
-  // the client, and the next query opens a fresh connection.
-  pool.on('error', (err) => {
-    logger.warn({ err }, 'idle postgres client error');
+  // the client, and the next query opens a fresh connection. Only the cause is logged: pg
+  // attaches the whole client to the error.
+  pool.on('error', (err: Error & { code?: string }) => {
+    logger.warn({ err: { code: err.code, message: err.message } }, 'idle postgres client error');
   });
   return pool;
 }

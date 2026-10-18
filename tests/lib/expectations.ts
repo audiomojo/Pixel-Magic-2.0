@@ -2,7 +2,7 @@
 import { isIgnored } from '../../src/fsops.js';
 import type { Manifest, SeedFile, SeedManifest } from '../../tools/corpus/lib.js';
 import { loadWorld, poolFor, type ContentRow, type World } from './db.js';
-import { stagedEntries } from './snapshot.js';
+import { stagedEntries, treeSnapshot } from './snapshot.js';
 
 const dataDirs = new Map<string, string>();
 
@@ -250,21 +250,63 @@ export async function diffExpectations(
 const canon = (groups: Iterable<string[]>): Set<string> =>
   new Set([...groups].map((g) => [...g].sort().join(',')));
 
+export interface Partitions {
+  similar: Set<string>;
+  copy: Set<string>;
+}
+
 /**
  * The similar-set and copy-group partitions of the clustered contents, comparable across runs.
- * `copy` excludes `copy_ambiguous` contents (which group they join depends on arrival order).
+ * `copy` excludes `copy_ambiguous` contents (which group they join depends on arrival order);
+ * both leave out the `exclude` contents.
  */
 export async function partitions(
   dbUrl: string,
-): Promise<{ similar: Set<string>; copy: Set<string> }> {
+  exclude: ReadonlySet<string> = new Set(),
+): Promise<Partitions> {
   const w = await loadWorld(dbUrl);
   const similar = new Map<string, string[]>();
   const copy = new Map<number, string[]>();
   for (const c of w.contents.values()) {
-    if (c.state !== 'CLUSTERED' || c.copyGroup === null) continue;
+    if (c.state !== 'CLUSTERED' || c.copyGroup === null || exclude.has(c.sha256)) continue;
     const s = c.similarSet === null ? `g${String(c.copyGroup)}` : `s${String(c.similarSet)}`;
     similar.set(s, [...(similar.get(s) ?? []), c.sha256]);
     if (!c.ambiguous) copy.set(c.copyGroup, [...(copy.get(c.copyGroup) ?? []), c.sha256]);
   }
   return { similar: canon(similar.values()), copy: canon(copy.values()) };
+}
+
+/** A finished run to compare: its database and its `treeSnapshot(...snap)` arguments. */
+export interface ComparableRun {
+  dbUrl: string;
+  snap: [string, string];
+}
+
+/**
+ * Two runs' partitions and staged trees with every content flagged `copy_ambiguous` in EITHER
+ * run left out (and its staged entries): which EXIF-less copies get flagged can depend on
+ * processing order (spec §12 R3, as amended). `toEqual` the `[a, b]` pairs.
+ */
+export async function moduloAmbiguity(
+  a: ComparableRun,
+  b: ComparableRun,
+): Promise<{
+  partitions: [Partitions, Partitions];
+  tree: [string[], string[]];
+  ambiguous: number;
+}> {
+  const flagged = async (r: ComparableRun) =>
+    (
+      await poolFor(r.dbUrl).query<{ sha256: string }>(
+        'SELECT sha256 FROM contents WHERE copy_ambiguous',
+      )
+    ).rows.map((x) => x.sha256);
+  const either = new Set([...(await flagged(a)), ...(await flagged(b))]);
+  const tree = async (r: ComparableRun) =>
+    (await treeSnapshot(...r.snap)).filter((l) => !either.has(l.slice(l.lastIndexOf('\t') + 1)));
+  return {
+    partitions: [await partitions(a.dbUrl, either), await partitions(b.dbUrl, either)],
+    tree: [await tree(a), await tree(b)],
+    ambiguous: either.size,
+  };
 }
