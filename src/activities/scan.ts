@@ -1,5 +1,5 @@
 import type { Dirent } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { lstat, readdir, rmdir, stat, unlink } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { heartbeat, log } from '@temporalio/activity';
@@ -20,11 +20,20 @@ const HEARTBEAT_MS = 1000;
 /** Heartbeats run on a timer for the whole scan: one recursive readdir can outlast the timeout. */
 export const HEARTBEAT_INTERVAL_MS = 5000;
 const STAT_BATCH = 64;
+/**
+ * An empty drop-zone folder is removed only once unchanged this long: a Finder copy creates a
+ * folder before its files, and an app may be about to save into it.
+ */
+export const EMPTY_DIR_GRACE_S = 60;
+/** Finder litter that alone does not keep a folder: `.DS_Store` and AppleDouble `._*` files. */
+const isLitter = (name: string): boolean => name === '.DS_Store' || name.startsWith('._');
 
 /** rel_path → (size, mtime_ns) of every non-ignored regular file under the drop zone. */
 type Snapshot = Map<string, { size: bigint; mtimeNs: bigint }>;
 
 const isEnoent = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOENT';
+const isNotEmpty = (e: unknown): boolean =>
+  ['ENOTEMPTY', 'EEXIST'].includes((e as NodeJS.ErrnoException).code ?? '');
 /** The path is gone: removed, or a parent directory was replaced by a file. */
 const isGone = (e: unknown): boolean =>
   isEnoent(e) || (e as NodeJS.ErrnoException).code === 'ENOTDIR';
@@ -84,6 +93,57 @@ export function makeScan(deps: Deps) {
     return st !== null && st.isFile() && st.size === size && st.mtimeNs === mtimeNs;
   }
 
+  /**
+   * Removes drop-zone folders (never the drop zone itself) that hold nothing but Finder litter
+   * and have been unchanged for `EMPTY_DIR_GRACE_S`, deepest first so emptied parents go too.
+   * Only litter files are ever unlinked; any other entry (a file, even an ignored partial
+   * download, a link, a folder) keeps the folder. `rmdir` refuses a folder that filled up
+   * meanwhile, and a put-back recreates any folder it needs.
+   */
+  async function pruneEmptyDirs(): Promise<number> {
+    let dirs: Dirent[];
+    try {
+      dirs = (await readdir(layout.dropzone, { recursive: true, withFileTypes: true })).filter(
+        (d) => d.isDirectory(),
+      );
+    } catch (e) {
+      if (isEnoent(e)) return 0;
+      throw e;
+    }
+    const paths = dirs
+      .map((d) => join(d.parentPath, d.name))
+      .sort((a, b) => b.split(sep).length - a.split(sep).length);
+    const cutoff = Date.now() - EMPTY_DIR_GRACE_S * 1000;
+    // Ages are taken before anything is removed: removing a child touches its parent's mtime.
+    const old = new Set<string>();
+    for (const dir of paths) {
+      const st = await lstat(dir).catch((e: unknown) => {
+        if (isGone(e)) return null;
+        throw e;
+      });
+      if (st?.isDirectory() && st.mtimeMs <= cutoff) old.add(dir);
+    }
+    let removed = 0;
+    for (const dir of paths) {
+      if (!old.has(dir)) continue;
+      try {
+        const entries = await readdir(dir, { withFileTypes: true });
+        if (!entries.every((e) => e.isFile() && isLitter(e.name))) continue;
+        for (const e of entries)
+          await unlink(join(dir, e.name)).catch((err: unknown) => {
+            if (!isEnoent(err)) throw err;
+          });
+        await rmdir(dir);
+        removed++;
+      } catch (e) {
+        if (isGone(e) || isNotEmpty(e)) continue; // gone already, or something arrived: keep it
+        throw e;
+      }
+    }
+    if (removed > 0) log.info(`removed ${String(removed)} empty drop-zone folders`);
+    return removed;
+  }
+
   async function scan(temporal: Client): Promise<ScanResult> {
     const { files: first } = await snapshot();
     await settle();
@@ -133,6 +193,7 @@ export function makeScan(deps: Deps) {
       }
       heartbeat(`started ${String(started)}`);
     }
+    await pruneEmptyDirs();
     return { started, pendingFiles: second.size, pendingBytes: String(pendingBytes) };
   }
 

@@ -36,6 +36,10 @@ the `admin` login is only needed to edit.
 Drop real files, not symlinks or aliases: links in the drop zone are never followed or
 ingested (each scan logs a warning while any are there).
 
+Once every file in a dropped folder has been ingested, the scan removes the empty folder
+(and any `.DS_Store` / `._*` litter in it) after it has sat unchanged for 60 s, so the drop
+zone stays clean. A folder still holding anything else, even a partial download, is kept.
+
 Decoding is memory-bound: `CPU_CONCURRENCY` defaults to the CPU count, capped at the
 container's memory ÷ `DECODE_MEM_BUDGET_MB` (1280 MB, about one ~60 MP panorama). Docker
 Desktop's VM defaults to about 8 GB, so about 6 decoders run in parallel. For more, raise the

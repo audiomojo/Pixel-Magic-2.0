@@ -1,4 +1,14 @@
-import { appendFile, chmod, mkdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { WorkflowExecutionAlreadyStartedError, type Client } from '@temporalio/client';
 import type pg from 'pg';
@@ -8,6 +18,7 @@ import type { Settings } from '../../src/config.js';
 import type { DataLayout } from '../../src/fsops.js';
 import { fileWorkflowId } from '../../src/ids.js';
 import type { FileRef } from '../../src/types.js';
+import { EMPTY_DIR_GRACE_S } from '../../src/activities/scan.js';
 import { runActivity, testDeps } from '../helpers/activityEnv.js';
 import { JPEG_A } from '../helpers/images.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
@@ -323,4 +334,62 @@ test('scan warns once per scan about symlinks (aliases) it will never ingest', a
     expect(warnings).toEqual([expect.stringMatching(/ 2 symlinks\b.*drop real files/)]);
   }
   expect(fakeClient.startedRelPaths()).toEqual(['ok.jpg', 'ok.jpg']); // one start per scan
+});
+
+// Empty-folder cleanup: once a dropped folder's files have all been ingested, the scan removes
+// it (and Finder's .DS_Store / AppleDouble litter in it), so the drop zone stays clean.
+const exists = (p: string) =>
+  stat(p).then(
+    () => true,
+    () => false,
+  );
+/** Backdates a directory past the empty-folder grace, as if it had been empty for a while. */
+const age = (p: string) => {
+  const t = new Date(Date.now() - (EMPTY_DIR_GRACE_S + 10) * 1000);
+  return utimes(p, t, t);
+};
+
+test('scan removes empty drop-zone folders, deepest first, but never the drop zone', async () => {
+  const deep = join(layout.dropzone, 'trip', 'day 1', 'ëxtra');
+  await mkdir(deep, { recursive: true });
+  for (const d of [deep, join(layout.dropzone, 'trip', 'day 1'), join(layout.dropzone, 'trip')])
+    await age(d);
+  await age(layout.dropzone);
+  await scan();
+  expect(await exists(join(layout.dropzone, 'trip'))).toBe(false);
+  expect(await exists(layout.dropzone)).toBe(true);
+});
+
+test('scan removes a folder holding only .DS_Store and AppleDouble files', async () => {
+  const d = join(layout.dropzone, 'done');
+  await mkdir(d);
+  await writeFile(join(d, '.DS_Store'), 'x');
+  await writeFile(join(d, '._IMG_9999.HEIC'), 'x');
+  await age(d);
+  await scan();
+  expect(await exists(d)).toBe(false);
+});
+
+test('scan keeps a folder that still holds a file, a link or other ignored files', async () => {
+  const keep = async (name: string, make: (dir: string) => Promise<void>) => {
+    const d = join(layout.dropzone, name);
+    await mkdir(d);
+    await make(d);
+    await age(d);
+    return d;
+  };
+  const withPhoto = await keep('photo', (d) => writeFile(join(d, 'a.jpg'), JPEG_A));
+  const withLink = await keep('link', (d) => symlink('/nonexistent', join(d, 'l')));
+  const withPartial = await keep('partial', (d) => writeFile(join(d, 'b.jpg.part'), 'x'));
+  const withLock = await keep('lock', (d) => writeFile(join(d, '~$doc.docx'), 'x'));
+  await scan();
+  for (const d of [withPhoto, withLink, withPartial, withLock]) expect(await exists(d)).toBe(true);
+  expect(await exists(join(withPhoto, 'a.jpg'))).toBe(true);
+});
+
+test('scan leaves a just-created empty folder alone (a copy may be about to fill it)', async () => {
+  const d = join(layout.dropzone, 'arriving');
+  await mkdir(d);
+  await scan();
+  expect(await exists(d)).toBe(true);
 });
