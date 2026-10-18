@@ -4,9 +4,15 @@ export default defineConfig({
   test: {
     passWithNoTests: true,
     projects: [
-      { test: { name: 'unit', include: ['tests/unit/**/*.test.ts'] } },
+      {
+        test: {
+          name: 'unit',
+          include: ['tests/unit/**/*.test.ts'],
+          exclude: ['tests/**/*.corpus.test.ts'],
+        },
+      },
       { test: { name: 'workflow', include: ['tests/workflow/**/*.test.ts'] } },
-      { test: { name: 'corpus', include: ['tests/corpus/**/*.test.ts'] } },
+      { test: { name: 'corpus', include: ['tests/**/*.corpus.test.ts'] } },
     ],
     coverage: {
       provider: 'v8',
