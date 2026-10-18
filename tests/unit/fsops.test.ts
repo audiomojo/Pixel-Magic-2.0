@@ -186,7 +186,36 @@ test('linkIntoVault fsyncs every directory level it created, and the link on eve
   expect(await linkIntoVault(`${d}/a`, `${d}/v/ab/cd/x.jpg`, sha, { fsync })).toBe(
     'ALREADY_LINKED',
   );
-  expect(synced).toEqual([`${d}/v/ab/cd`]);
+  // The crash may also have come before the new levels' fsyncs: those are redone too.
+  expect(synced).toEqual([`${d}/v`, `${d}/v/ab`, `${d}/v/ab/cd`]);
+});
+
+test('linkIntoVault fsyncs both parent levels on a replay whose mkdir created nothing', async () => {
+  const d = await tmpDir();
+  await writeFile(`${d}/a`, '1');
+  // A crash after mkdir but before the parents' fsyncs: the levels exist, nothing is durable.
+  await mkdir(`${d}/v/ab/cd`, { recursive: true });
+  const sha = createHash('sha256').update('1').digest('hex');
+  const synced: string[] = [];
+  const fsync = (dir: string) => {
+    synced.push(dir);
+    return Promise.resolve();
+  };
+  expect(await linkIntoVault(`${d}/a`, `${d}/v/ab/cd/x.jpg`, sha, { fsync })).toBe('LINKED');
+  expect(synced).toEqual([`${d}/v`, `${d}/v/ab`, `${d}/v/ab/cd`]);
+});
+
+test('linkIntoVault also fsyncs the parent of a vault root it had to create', async () => {
+  const d = await tmpDir();
+  await writeFile(`${d}/a`, '1');
+  const sha = createHash('sha256').update('1').digest('hex');
+  const synced: string[] = [];
+  const fsync = (dir: string) => {
+    synced.push(dir);
+    return Promise.resolve();
+  };
+  expect(await linkIntoVault(`${d}/a`, `${d}/v/ab/cd/x.jpg`, sha, { fsync })).toBe('LINKED');
+  expect(synced).toEqual([d, `${d}/v`, `${d}/v/ab`, `${d}/v/ab/cd`]);
 });
 
 test('sameFile and linkIntoVault report hashing progress (heartbeats for big videos)', async () => {

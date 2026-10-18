@@ -117,9 +117,11 @@ export async function fsyncDir(dir: string): Promise<void> {
 }
 
 /**
- * Hardlink src to dest (never overwrites, never unlinks); `sha256` is the bytes' hash. Every
- * directory level it creates is made durable in its parent, and so is the link, also when a
- * replay finds it already there (the crash may have come before its fsync).
+ * Hardlink src to dest (never overwrites, never unlinks); `sha256` is the bytes' hash. Once
+ * linked (or found already linked), dest's directory and its two parents (`vault/ab/cd`,
+ * `vault/ab`, `vault`) are fsynced on every call, plus the parent of any higher level it had
+ * to create. A replay redoes them all: the crash may have come after `mkdir` or `link` but
+ * before their fsyncs, and on a replay `mkdir` creates nothing to say so.
  */
 export async function linkIntoVault(
   src: string,
@@ -130,24 +132,26 @@ export async function linkIntoVault(
   const sync = opts.fsync ?? fsyncDir;
   const dir = dirname(dest);
   const first = await mkdir(dir, { recursive: true });
-  if (first !== undefined) {
-    const created: string[] = [];
+  /** Directories to fsync, all ancestors-or-self of `dir`: deduplicated, ordered top-down. */
+  const levels = new Set([dirname(dirname(dir)), dirname(dir), dir]);
+  if (first !== undefined)
     for (let d = dir; ; d = dirname(d)) {
-      created.unshift(d);
+      levels.add(dirname(d));
       if (d === first || dirname(d) === d) break;
     }
-    for (const d of created) await sync(dirname(d));
-  }
+  const durable = async (): Promise<void> => {
+    for (const d of [...levels].sort((a, b) => a.length - b.length)) await sync(d);
+  };
   try {
     await link(src, dest);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     // `sameFile`, not a bare inode compare: virtiofs may have renumbered the vault link.
     if (!(await sameFile(src, dest, sha256, opts.onChunk))) return 'EXISTS_OTHER';
-    await sync(dir);
+    await durable();
     return 'ALREADY_LINKED';
   }
-  await sync(dir);
+  await durable();
   return 'LINKED';
 }
 
