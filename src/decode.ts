@@ -241,7 +241,12 @@ async function fromBmp(absPath: string): Promise<ImageFacts> {
   return factsFrom(rgb, { raw: { width, height, channels: 3 } }, 'image/bmp');
 }
 
-/** RAW files are hashed from their embedded preview, extracted to a temp file and removed. */
+/**
+ * RAW files are hashed from their embedded preview, extracted to a temp file and removed.
+ * Previews usually carry no orientation (it lives in the RAW's IFD0), so the RAW's numeric
+ * Orientation is copied onto the preview before the usual `.rotate()` pipeline.
+ * Only a missing preview is permanent; any other exiftool failure (spawn, timeout) is transient.
+ */
 async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts> {
   await stat(absPath); // a missing or unreadable source is transient, not the file's fault
   exiftool ??= new ExifTool({ maxProcs: 1 });
@@ -250,12 +255,37 @@ async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts
     const preview = join(dir, 'preview.jpg');
     try {
       await exiftool.extractPreview(absPath, preview);
-      await stat(preview);
     } catch (err) {
-      throw new QuarantineError('decode_error', `RAW preview: ${String(err)}`);
+      if (err instanceof Error && NO_PREVIEW.test(err.message))
+        throw new QuarantineError('decode_error', `RAW has no preview: ${err.message}`);
+      throw err;
     }
+    if (await isMissing(preview)) throw new QuarantineError('decode_error', 'RAW has no preview');
+    const { Orientation } = await exiftool.readRaw(absPath, { readArgs: ['-Orientation', '-n'] });
+    if (typeof Orientation === 'number' && Orientation !== 1)
+      await exiftool.write(
+        preview,
+        {},
+        {
+          writeArgs: [`-Orientation#=${Orientation}`, '-overwrite_original'],
+        },
+      );
     return { ...(await factsFrom(preview)), mime };
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** exiftool-vendored's explicit "nothing extracted" result for a binary tag. */
+const NO_PREVIEW = /\b0 output files? created/i;
+
+/** True only for ENOENT; any other stat failure propagates (transient). */
+async function isMissing(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw err;
   }
 }

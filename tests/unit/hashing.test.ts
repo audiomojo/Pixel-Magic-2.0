@@ -45,6 +45,19 @@ const gradient32 = (): Uint8Array =>
     return Math.floor(255 * (x / 31) ** 2 * (y / 31) ** 3);
   });
 
+/**
+ * Asymmetric golden: g(x)·h(y) with g = (x/31)² (G signs +,−,+,−,…) and h = √(1 − y/31),
+ * a decreasing concave profile whose H signs are +,+,−,+,−,+,−,+. Bits = sign(G[u]·H[v]) > 0:
+ * rows 0xaa,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa. Unlike 0xaa55…, this pattern changes under
+ * transpose (14 bits) and under bit reversal (16 bits), so it pins axis order and MSB-first.
+ * Independent naive DCT: min |coef − median| = 0.511.
+ */
+const asymmetric32 = (): Uint8Array =>
+  Uint8Array.from({ length: 32 * 32 }, (_, i) => {
+    const [x, y] = [i % 32, Math.floor(i / 32)];
+    return Math.floor(255 * (x / 31) ** 2 * (1 - y / 31) ** 0.5);
+  });
+
 /** 9×8 raster whose every row strictly increases left to right. */
 const rampRows9x8 = (): Uint8Array => Uint8Array.from({ length: 9 * 8 }, (_, i) => (i % 9) * 20);
 
@@ -52,7 +65,16 @@ const GOLDEN_PHASH = 0xaa55aa55aa55aa55n;
 
 test('phash of known gradient is stable (golden)', () =>
   expect(phashFromGray(gradient32())).toBe(GOLDEN_PHASH));
+test('phash golden pins axis order and MSB-first (asymmetric raster)', () =>
+  expect(phashFromGray(asymmetric32())).toBe(0xaaaa55aa55aa55aan));
 test('dhash bit order', () => expect(dhashFromGray(rampRows9x8())).toBe(0xffffffffffffffffn));
+
+test('dhash golden pins row-major order (asymmetric bit positions)', () => {
+  const px = new Uint8Array(9 * 8);
+  px[0 * 9 + 2] = 1; // row 0, x=1 → row-major bit 1 → 1 << 62 (column-major would be bit 8)
+  px[2 * 9 + 1] = 1; // row 2, x=0 → row-major bit 16 → 1 << 47 (column-major would be bit 2)
+  expect(dhashFromGray(px)).toBe((1n << 62n) | (1n << 47n));
+});
 
 test('dhash: first bit is the MSB, row-major', () => {
   const px = new Uint8Array(9 * 8); // all equal → no bit set

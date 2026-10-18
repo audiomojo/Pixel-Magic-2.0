@@ -187,19 +187,30 @@ export async function bombPng(dir: string): Promise<string> {
  */
 export const HEIC_SCENE0 = fileURLToPath(new URL('../fixtures/scene0.heic', import.meta.url));
 
-/** A stand-in RAW: a TIFF of scene 3 named `.dng` whose embedded PreviewImage is scene 0. */
-export async function rawWithPreview(dir: string): Promise<string> {
+/**
+ * A stand-in RAW: a TIFF of scene 3 named `.dng` whose embedded PreviewImage is scene 0.
+ * With `orientation: 6`, IFD0 carries Orientation 6 and the preview (like a camera's) carries
+ * no orientation tag and holds the pixels un-rotated (270°), so it displays as scene 0 upright.
+ */
+export async function rawWithPreview(dir: string, opts: { orientation?: 6 } = {}): Promise<string> {
   const p = nextPath(dir, 'dng');
   await sharp(await readFile(await photo(dir, 'tif', { scene: 3 })))
     .tiff()
     .toFile(p);
+  let preview = await photo(dir, 'jpg');
+  const args = ['-overwrite_original'];
+  if (opts.orientation === 6) {
+    const stored = nextPath(dir, 'jpg');
+    await sharp(await readFile(preview))
+      .rotate(270)
+      .jpeg({ quality: 90 })
+      .toFile(stored);
+    preview = stored;
+    args.push('-IFD0:Orientation#=6');
+  }
   const et = new ExifTool({ maxProcs: 1 });
   try {
-    await et.write(
-      p,
-      {},
-      { writeArgs: [`-PreviewImage<=${await photo(dir, 'jpg')}`, '-overwrite_original'] },
-    );
+    await et.write(p, {}, { writeArgs: [`-PreviewImage<=${preview}`, ...args] });
   } finally {
     await et.end();
   }

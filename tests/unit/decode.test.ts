@@ -1,8 +1,9 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ExifTool } from 'exiftool-vendored';
 import sharp from 'sharp';
-import { afterAll, expect, test } from 'vitest';
+import { afterAll, afterEach, expect, test, vi } from 'vitest';
 import workerpool from 'workerpool';
 import {
   computeImageFacts,
@@ -24,6 +25,7 @@ import {
 import { tmpDir } from '../helpers/layout.js';
 
 afterAll(endDecodeResources);
+afterEach(() => vi.restoreAllMocks());
 
 test('hash stable across format and size', async () => {
   const d = await tmpDir();
@@ -125,6 +127,35 @@ test('RAW is hashed from its embedded preview, not the main image', async () => 
   const f = await computeImageFacts(await rawWithPreview(d), 'dng');
   expect(f).toMatchObject({ width: 640, height: 480, mime: 'image/x-adobe-dng' });
   expect(hamming(preview.phash, f.phash)).toBeLessThanOrEqual(4);
+}, 30_000);
+
+test("RAW preview takes the RAW's IFD0 orientation", async () => {
+  const d = await tmpDir();
+  const upright = await computeImageFacts(await photo(d, 'jpg'), 'jpg');
+  const f = await computeImageFacts(await rawWithPreview(d, { orientation: 6 }), 'dng');
+  expect([f.width, f.height]).toEqual([640, 480]); // preview stored 480×640
+  expect(hamming(upright.phash, f.phash)).toBeLessThanOrEqual(4);
+}, 30_000);
+
+test('a RAW preview extraction that fails for environmental reasons stays transient', async () => {
+  const d = await tmpDir();
+  const raw = await rawWithPreview(d);
+  vi.spyOn(ExifTool.prototype, 'extractPreview').mockRejectedValueOnce(
+    new Error('BatchCluster has ended, cannot enqueue'),
+  );
+  const err: unknown = await computeImageFacts(raw, 'dng').catch((e: unknown) => e);
+  expect(err).toMatchObject({ message: 'BatchCluster has ended, cannot enqueue' });
+  expect(err).not.toBeInstanceOf(QuarantineError);
+}, 30_000);
+
+test('a RAW whose extraction succeeds but writes no preview is a decode_error', async () => {
+  const d = await tmpDir();
+  const raw = await rawWithPreview(d);
+  vi.spyOn(ExifTool.prototype, 'extractPreview').mockResolvedValueOnce(undefined);
+  await expect(computeImageFacts(raw, 'dng')).rejects.toMatchObject({
+    name: 'QuarantineError',
+    reason: 'decode_error',
+  });
 }, 30_000);
 
 test('a missing RAW source is a transient error, not a quarantine', async () => {
