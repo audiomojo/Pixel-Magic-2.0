@@ -46,7 +46,7 @@ Success means:
 | Container | Role |
 |-----------|------|
 | `postgres` (16) | Databases `pixelmagic` (app) and `temporal` (+ `temporal_visibility`). Named volume, defaults for `fsync` and `synchronous_commit`. |
-| `temporal` | Temporal server with Postgres persistence and SQL visibility. The schema is created by a one-shot admin-tools container. |
+| `temporal` | Temporal server with Postgres persistence and SQL visibility. The schema is created by a one-shot admin-tools container (`init.sql` creates the databases), and a second one-shot (`temporal-ns`) registers the `default` namespace once the server is healthy. |
 | `temporal-ui` | Workflow history UI at `127.0.0.1:8080`. |
 | `migrate` | One-shot `node-pg-migrate up` (plain SQL migrations) for `pixelmagic`. |
 | `worker` | TypeScript on Node 24 LTS + Temporal TypeScript SDK. Serves the workflow queue `main` plus `io`, `cpu` and `cluster`. Bind-mounts `DATA_DIR` at `/data`. |
@@ -96,12 +96,13 @@ groups(id bigserial PK, kind text, merged_into bigint NULL, similar_set_id bigin
 
 cluster_state(id int PK = 1, version bigint)            -- bumped by every cluster transaction
 scan_stats(id int PK = 1, pending_files bigint, pending_bytes bigint, scanned_at)
-staging_builds(gen bigint PK, watermark timestamptz, built_at, entries bigint)
+staging_builds(gen bigint PK, watermark timestamptz, cluster_version bigint, built_at, entries bigint)
 ```
 
 - `phash` and `dhash` are stored as signed int64; `toSigned` / `toUnsigned` (`BigInt.asIntN` / `asUintN`) convert. In TypeScript, hashes are always `bigint`.
 - Indexes: `files(state)`, `contents(state)`, `contents(live_content_id)`, `contents(copy_group_id)`.
 - Every path is stored **relative to `DATA_DIR`**, so a native macOS worker with a different mount point sees the same rows.
+- `updated_at` triggers use `clock_timestamp()`, not `now()`, so a long transaction can't commit behind a recorded staging watermark.
 
 ## 6. Pipeline steps
 
@@ -112,24 +113,24 @@ Each step can be retried, and the state left by a crash at any point is handled:
 1. Upsert the `files` row by `(rel_path, size, mtime_ns)` among non-final rows, giving `file_id`.
 2. **Claim:** `rename(dropzone/rel_path, work/claimed/<file_id>)`.
    - If the source is missing but the claimed file exists, continue.
-   - If both are missing and `files.sha256` is set, go to step 5 (the vault step already ran).
+   - If both are missing and `files.sha256` is set, the file is never marked vanished: if `vault/.copies/<file_id>.<ext>` exists, commit `COPY`; else if the vault file exists, commit as its owner (step 6); otherwise fail the attempt as retryable (an anomaly is retried, never hidden).
    - If both are missing and there is no hash, mark `QUARANTINED(vanished)`.
 3. Stream SHA-256 in 1 MiB chunks, heartbeating. **Commit** `state=CLAIMED, sha256`.
-4. Detect the type by content using exiftool `FileType` and `MIMEType`, never by extension. This handles `wide`-atom MOVs and the JPEG named `IMG_E8719.HEIC`. Read metadata through `exiftool-vendored` (one long-lived `-stay_open` exiftool per worker, raw tags with `-G -n`):
+4. Detect the type by content using exiftool `FileType` and `MIMEType`, never by extension. This `MIMEType` is the only source of `contents.mime`. This handles `wide`-atom MOVs and the JPEG named `IMG_E8719.HEIC`. Read metadata through `exiftool-vendored` (one long-lived `-stay_open` exiftool per worker, raw tags with `-G -n`):
    - `DateTimeOriginal`, `SubSecTimeOriginal`, `Make`/`Model`, Apple `BurstUUID` and `ContentIdentifier` (stills)
    - QuickTime `ContentIdentifier` and `Duration` (MOVs)
 5. **Vault:** `link(work/claimed/<file_id>, vault/<ab>/<cd>/<sha256>.<ext>)`.
    - `ext` comes from the detected type, lowercased.
    - If the link fails with EEXIST and the existing file is the same inode (`samefile`), a previous attempt linked it.
    - If EEXIST with a different inode, the file is a byte-identical copy: `rename` it to `vault/.copies/<file_id>.<ext>`.
-6. **Commit** `INSERT contents … ON CONFLICT DO NOTHING` and `files.state = INGESTED` (new content) or `COPY` (content already known). Then `unlink(work/claimed/<file_id>)` if it still exists.
+6. **Commit** `files.state = COPY` exactly when step 5 hit EEXIST with a different inode; otherwise (this file owns the vault inode) `INSERT contents … ON CONFLICT DO NOTHING` and `files.state = INGESTED`. Every state update is guarded by the allowed predecessor states, so a stale attempt can never roll a final row back. Then `unlink(work/claimed/<file_id>)` if it still exists.
 7. `chmod 0444` the vault file. Staging hardlinks share the inode, so an editor saving in place cannot change the original.
 
 Returns `IngestResult(file_id, sha256, is_new, kind)`.
 
 ### 6.2 `decode_content` (queue `cpu`) and `record_hash` (queue `io`)
 
-- Skip if `state ≥ HASHED`.
+- `record_hash` skips if `state ≥ HASHED`. `decode_content` has no database access (§12 R4), so it always decodes.
 - Decode in a child process (`workerpool`, process workers) with a timeout of `DECODE_TIMEOUT_S` = 60 s. A hang or segfault kills only the child:
   - **sharp** (libvips) with `limitInputPixels: 200_000_000` (larger is a decompression bomb, a permanent error), `failOn: 'truncated'`, and `.rotate()` to apply EXIF orientation. JPEG shrink-on-load makes the 32×32 resize fast.
   - **HEIC/HEIF** is decoded with `heic-decode` (libheif compiled to WebAssembly), because prebuilt sharp has no HEVC decoder. The raw RGBA is then handed to sharp. One code path works on the Mac and in Docker; Task 4 benchmarks it.
@@ -189,9 +190,9 @@ A crash mid-build leaves an orphaned `.gen-*` directory, which is deleted at the
 6. earliest `captured_at`
 7. lowest `sha256` (deterministic tie-break)
 
-Among the files that share the best content, the one with the lowest `file_id` gives the name.
+Among the files that share the best content, the one with the lowest `(rel_path, file_id)` gives the name (`file_id` follows arrival order, so it is only the last tie-break).
 
-**Layout.** Date = `captured_at`, else the file's `mtime`.
+**Layout.** Date = `captured_at`, else the file's `mtime`, formatted in UTC.
 ```
 current/
   unique/YYYY/YYYY-MM/<YYYYMMDD_HHMMSS>_<original_name>      best copy of every copy group with no similar set
@@ -218,10 +219,11 @@ current/
 Activity timeouts:
 - `ingest_file`: start-to-close 1 h, heartbeat 30 s
 - `decode_content`: start-to-close 2 min; `record_hash`: 1 min
-- `cluster_content`: start-to-close 1 min
+- `cluster_content`, `mark_failed`: start-to-close 1 min
+- `scan_and_start`: start-to-close 10 min, heartbeat 30 s
 - `build_staging`: start-to-close 2 h, heartbeat 30 s
 
-Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-vault [SAMPLE=1000]` re-hashes vault files and reports mismatches. It never repairs anything.
+Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-vault [SAMPLE=1000]` re-hashes vault files and reports mismatches. It skips `vault/.copies/` (named by file id, not hash) and reports how many it skipped. It never repairs anything.
 
 ## 8. Observability
 
@@ -232,7 +234,7 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
   - backlog per stage (`contents` by state)
   - throughput per stage per minute (from `ingested_at`, `hashed_at`, `clustered_at`)
   - ETA (backlog ÷ 10-minute rate)
-  - copy groups, similar sets, bytes reclaimable (Σ size of non-best copies)
+  - copy groups, similar sets, ≈ bytes reclaimable (per copy group Σ size − max size, plus the size of byte-copy files; an approximation that doesn't repeat the §6.4 best-copy rule in SQL)
   - quarantined by reason, FAILED count and the last 20 `last_error` values
   - age of the last staging build
 - **Alert (optional):** "backlog > 0 and no stage throughput for 10 min" → an ntfy webhook.
@@ -254,10 +256,10 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
 2. **Workflow:** Temporal's time-skipping test environment with activities faked to fail at each boundary. Each workflow completes with each effect applied exactly once. Covers quarantine, poison → FAILED, and backpressure.
 3. **Corpus end-to-end:**
    - The corpus is `test-automation/sample-images/`: read-only, git-ignored, never seen by any hosted service.
-   - `tools/corpus` builds `tests/corpus/manifest.json` from an independent pass: full SHA-256, `sips` dimensions, exiftool capture fields, and relations (exact groups, HEIC/JPG twins, `IMG_E`/`IMG_O`, `"X 1"` copies, bursts, Live Photo pairs).
-   - `seed.py` clones a subset with `cp -c` into `data-test/<run_id>/dropzone`, under Compose project `pmtest_<run_id>`.
+   - `tools/corpus` builds `tests/corpus/manifest.json` (git-ignored: it holds personal capture metadata) from an independent pass: full SHA-256, `sips` dimensions, exiftool capture fields, and relations (exact groups, HEIC/JPG twins, `IMG_E`/`IMG_O`, `"X 1"` copies, bursts, Live Photo pairs).
+   - `tools/corpus/seed.ts` clones a subset with `cp -c` into `data-test/<run_id>/dropzone`, under Compose project `pmtest_<run_id>`.
    - Tiers: `smoke` (~150 files, ≤ 5 min, before every commit), `standard` (~2k files plus synthetic variants, at milestones), `full` (on demand).
-   - Pinned files: `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4` + `"PSWU5412 1.MP4"`, `IMG_0034.HEIC/.JPG`, `IMG_0433` + `IMG_E0433`, `IMG_2834.HEIC` + `"IMG_2834 1.HEIC"` with both MOVs, `VERP1022.TIF`, `AUXA4949.BMP`, ≥ 20 Live Photo pairs, ≥ 5 burst sets.
+   - Pinned files: `IMG_E8719.HEIC`, `IMG_0004.MOV`, `PSWU5412.MP4` + `"PSWU5412 1.MP4"`, `IMG_0034.HEIC/.JPG`, `IMG_0433` + `IMG_E0433`, `IMG_2834.HEIC` + `"IMG_2834 1.HEIC"` with its MOV (`"IMG_2834 1.MOV"`; there is no `IMG_2834.MOV`), `VERP1022.TIF`, `AUXA4949.BMP`, ≥ 20 Live Photo pairs, ≥ 5 burst sets.
    - A **golden staging snapshot** (`tests/e2e/golden/smoke_tree.txt`) is regenerated only by `make update-golden`.
    - `make corpus-verify` runs before and after every run.
 4. **Chaos (the resilience proof):**
@@ -293,3 +295,10 @@ These changes were made while writing the implementation plan. The sections abov
 - **R5 Deterministic staging names.** Group folders are named after their best copy's SHA-256 (`g-<sha8>`, `s-<sha8>`), not database ids, so a calm run and a chaos run produce identical trees.
 - **R6 FAILED contents** are staged under `quarantine/failed/`.
 - **R7 Language: TypeScript.** The pipeline is TypeScript on Node 24 LTS (ESM, strict). The future AI scorer may be any language Temporal supports (likely native Python or Swift for Metal/ANE). It only shares the `ai` task-queue name and JSON payloads with the pipeline.
+- **R8 Preflight rulings.** Applied after a conflict scan of the plan:
+  - §6.4: the staged name comes from the lowest `(rel_path, file_id)`, not the lowest `file_id`, so trees don't depend on arrival order. Dates in staged names are UTC.
+  - §10.3: the pinned set lists only files that exist (`"IMG_2834 1.MOV"`; no `IMG_2834.MOV`). The seeder is `tools/corpus/seed.ts`. The manifest is git-ignored.
+  - §6.2: only `record_hash` skips on `state ≥ HASHED`; `decode_content` always decodes (follows R4).
+  - §6.1: a hashed file whose source and claimed copies are gone is never marked vanished (`.copies` → COPY, vault → owner, else retry). `COPY` means exactly "EEXIST with a different inode", and only the vault owner inserts `contents`. State updates are guarded by predecessor states. `contents.mime` comes only from exiftool.
+  - §5: `staging_builds.cluster_version` stores the version next to the watermark; `updated_at` uses `clock_timestamp()`.
+  - §7: `mark_failed` and `scan_and_start` get timeouts; `verify-vault` skips `.copies`. §8: "reclaimable" is an approximation. §4.1: a one-shot registers the `default` namespace.
