@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+data
+data-test
+.git
+.superpowers
+architecturte
+test-automation
+docs
+tests
+.env

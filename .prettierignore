@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+data/
+data-test/
+architecturte/
+test-automation/
+docs/
+.superpowers/
+package-lock.json

@@ -14,3 +14,6 @@ __pycache__/
 .env
 .DS_Store
 .superpowers/
+node_modules/
+dist/
+coverage/
