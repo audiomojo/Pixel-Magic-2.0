@@ -30,7 +30,7 @@
   - `IO_CONCURRENCY=8`, `CPU_CONCURRENCY=<os.availableParallelism()>`, `DECODE_TIMEOUT_S=60`, `POISON_ATTEMPTS=5`
   - `LOOK_ALIKE_PHASH=8`, `LOOK_ALIKE_DHASH=10`, `COPY_PHASH=4`, `COPY_DHASH=6`
   - `LIVE_MAX_DURATION_S=5`, `STAGE_MAX_STALENESS_S=900`
-- **The `DATA_DIR` layout** is `dropzone/`, `work/claimed/`, `vault/<ab>/<cd>/<sha256>.<ext>`, `vault/.copies/<fileId>.<ext>`, `staging/.gen-<n>/` and `staging/current` (symlink). Every path stored in the database is **relative to `DATA_DIR`**.
+- **The `DATA_DIR` layout** is `dropzone/`, `work/claimed/`, `vault/<ab>/<cd>/<sha256>.<ext>`, `vault/.copies/<fileId>.<ext>`, `staging/.gen-<n>/` and `staging/current` (symlink). Every path stored in the database is **relative to `DATA_DIR`**, except `files.rel_path`, which is the file's path **relative to `dropzone/`** (spec §6.1: `rename(dropzone/rel_path, …)`).
 - **Nothing in the pipeline ever unlinks a file holding dropped bytes (`dropzone/`, `work/claimed/`, `vault/`, `vault/.copies/`) that it hasn't first hardlinked or renamed somewhere else.** The only such unlinks allowed are `work/claimed/<id>` after its vault link is committed, and old or orphaned `staging/.gen-*` directories. Temp files the pipeline creates itself (fs-check probe dir, RAW preview temp under `os.tmpdir()`) may be removed.
 - Vault files are mode `0o444`. Containers run as non-root (`UID`/`GID` build args, default 501/20; GID 20 already exists in Debian as `dialout`, so the Dockerfile reuses an existing group).
 - **Workflow code** (`src/workflows.ts`) imports only `@temporalio/workflow` and **type-only** imports from `src/types.ts` and `src/activities/index.ts`.
