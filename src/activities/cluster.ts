@@ -108,6 +108,7 @@ export function makeClusterContent(deps: Deps) {
         copyGroup,
         similarSet: s === null ? null : root(s),
         captured: f.captured,
+        camera: f.camera,
         burstUuid: f.burstUuid,
         ambiguous: r.copy_ambiguous,
       });

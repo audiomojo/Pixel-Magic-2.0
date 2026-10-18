@@ -155,14 +155,14 @@ Rows are evaluated top to bottom; the first match wins.
 | Both have `subsec` and they differ | similar |
 | Both have `camera` and they differ | similar |
 | Same `captured_at`, and both `subsec` present and equal | **copy** |
-| Same `captured_at` with `subsec` missing on either side, and (different dimensions **or** different mime) | **copy** |
+| Same `captured_at` with `subsec` missing on either side, pHash ≤ `COPY_PHASH` and dHash ≤ `COPY_DHASH`, and (different dimensions **or** different mime) | **copy** |
 | Exactly one side has `captured_at`, pHash ≤ `COPY_PHASH` = 4 and dHash ≤ `COPY_DHASH` = 6 | **copy** |
 | Neither has `captured_at`, pHash ≤ 4, dHash ≤ 6, and (different dimensions **or** different mime) | **copy** |
 | Anything else | similar |
 
 **Grouping (union-find, capture-consistent).**
 - Every still content gets a copy group: a new singleton, or the union of the groups of all its *copy* matches.
-- **A union is refused, and downgraded to *similar*, if the merged copy group would contain two different known `(captured_at, subsec)` values.** This stops an EXIF-less export from bridging two burst frames into one copy group.
+- **A union is refused, and downgraded to *similar*, if the merged copy group would contain two different known `(captured_at, subsec)` values, two members of one burst, or two different non-null `camera` values.** This stops an EXIF-less export from bridging two burst frames (or two cameras' look-alikes) into one copy group.
 - *Similar* matches union the copy groups' similar sets.
 - On a merge, the smaller group gets `merged_into` the larger (ties broken by lower id), and its members are re-pointed.
 - A content whose copy union was refused is flagged `copy_ambiguous` and is never chosen as a best copy.
@@ -290,7 +290,7 @@ These changes were made while writing the implementation plan. The sections abov
 
 - **R1 Ingest idempotency key.** `files.workflow_run_id` (unique) identifies the row. If an ingest is re-run after its commit (a crash before Temporal recorded completion), it returns the stored outcome instead of reporting the file as vanished. `files.ext` is stored at claim time.
 - **R2 Cluster cache.** `contents.cluster_seq` is replaced by a single-row `cluster_state.version`, so a cached index is never used after another worker has changed the groups. Only the `worker` service serves `cluster`; `worker-extra` replicas don't.
-- **R3 Order independence, stated precisely.** Refusing a capture-conflicting union means an EXIF-less export that bridges two burst frames can join either frame's group, depending on arrival order. Such contents are flagged `copy_ambiguous`, are never a best copy, and are excluded when partitions are compared. Similar sets are always order-independent.
+- **R3 Order independence, stated precisely.** Refusing a capture-conflicting union means an EXIF-less export that bridges two burst frames can join either frame's group, depending on arrival order. Such contents are flagged `copy_ambiguous`, are never a best copy, and are excluded when partitions are compared. Similar sets are always order-independent. Two frames of one second without `subsec` (older cameras) look like a re-encoding pair, so §6.3 row 6 also needs the tight copy distances, and a union that would mix two different cameras is refused like a capture conflict; a refusal flags only contents with neither a capture key nor a burst.
 - **R4 Decode and record are split.** `decode_content` (cpu, no database, 5 attempts) is separate from `record_hash` (io, unlimited retries). A long database outage therefore never marks content FAILED. FAILED moved from `files.state` to `contents.state`. Quarantine is returned as an activity outcome rather than raised.
 - **R5 Deterministic staging names.** Group folders are named after their best copy's SHA-256 (`g-<sha8>`, `s-<sha8>`), not database ids, so a calm run and a chaos run produce identical trees.
 - **R6 FAILED contents** are staged under `quarantine/failed/`.

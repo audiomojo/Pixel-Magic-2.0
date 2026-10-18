@@ -541,3 +541,53 @@ test('a stale unhashed attempt cannot re-hash a re-drop over a parked copy', asy
   expect(await readdir(layout.vaultCopies)).toEqual([`${r.fileId}.jpg`]);
   expect([await count('files'), await count('contents')]).toEqual([2, 1]);
 });
+
+/** Regular files anywhere under the vault (including .copies). */
+async function vaultFiles(): Promise<string[]> {
+  return (await readdir(layout.vault, { recursive: true, withFileTypes: true }))
+    .filter((d) => d.isFile())
+    .map((d) => d.name);
+}
+
+test('a file changed between scan and claim is put back and quarantined, never vaulted', async () => {
+  const ref = await drop('a.jpg', JPEG_A);
+  const grown = Buffer.concat([JPEG_A, Buffer.from('still being written')]);
+  await writeFile(join(layout.dropzone, 'a.jpg'), grown); // the copy was still running
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect([r.state, r.sha256, r.isNew]).toEqual(['QUARANTINED', null, false]);
+  expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(grown);
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect(await vaultFiles()).toEqual([]);
+  const row = (
+    await pool.query<{ state: string; last_error: string; sha256: string | null }>(
+      'SELECT state, last_error, sha256 FROM files',
+    )
+  ).rows;
+  expect(row).toEqual([{ state: 'QUARANTINED', last_error: 'changed_before_claim', sha256: null }]);
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(r); // replay
+});
+
+test('a file written to while it is hashed is put back and retried, never vaulted', async () => {
+  const ref = await drop('a.jpg', JPEG_A);
+  const writing = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      if (n === 'hashed') {
+        const [id] = await readdir(layout.claimed);
+        await writeFile(join(layout.claimed, id!), Buffer.from(' more'), { flag: 'a' });
+      }
+    },
+  });
+  await expect(runActivity(writing.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(
+    /changed while hashing/,
+  );
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(
+    Buffer.concat([JPEG_A, Buffer.from(' more')]),
+  );
+  expect(await vaultFiles()).toEqual([]);
+  expect(await count('files', 'sha256 IS NOT NULL')).toBe(0);
+  // The retry sees a file that no longer matches the scan: quarantined, left for the next scan.
+  expect((await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).state).toBe('QUARANTINED');
+  expect(existsSync(join(layout.dropzone, 'a.jpg'))).toBe(true);
+});

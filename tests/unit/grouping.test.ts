@@ -200,6 +200,7 @@ const row = (
   copyGroup,
   similarSet,
   captured,
+  camera: F(sha).camera,
   burstUuid,
   ambiguous: false,
 });
@@ -537,3 +538,69 @@ test('a key-less copy of a flagged bridge is flagged on arrival; one with a keye
     ]).ambiguous,
   ).toBe(false);
 });
+
+/** `n` set bits starting at bit `from` (a Hamming distance of exactly `n` from 0). */
+const bits = (n: number, from = 0): bigint => ((1n << BigInt(n)) - 1n) << BigInt(from);
+
+/** The copy group holding `sha` (sorted, comma-joined members). */
+const copyGroupOf = (g: Grouper, sha: string): string[] =>
+  [...g.copyPartition()].find((grp) => grp.split(',').includes(sha))!.split(',');
+
+test('I6: two same-second frames without subsec and an export of one never form a copy group', () =>
+  fc.assert(
+    fc.property(
+      // A and B differ by 5–8 pHash bits (look-alike, not tight); B′ is a tight resize of B whose
+      // own differences lie elsewhere, so it is never tight to A.
+      fc
+        .integer({ min: 5, max: 8 })
+        .chain((ab) =>
+          fc.tuple(
+            fc.constant(ab),
+            fc.integer({ min: 0, max: Math.min(4, 8 - ab) }),
+            fc.integer({ min: 0, max: 6 }),
+            fc.shuffledSubarray([0, 1, 2], { minLength: 3, maxLength: 3 }),
+          ),
+        ),
+      ([ab, bb, dd, order]) => {
+        const captured = { s: 1_200_000_000, sub: null };
+        const A = F('A', { captured, camera: 'cam' });
+        const B = F('B', { captured, camera: 'cam', phash: bits(ab) });
+        const B2 = F('B2', {
+          captured,
+          camera: 'cam',
+          phash: bits(ab) ^ bits(bb, 32),
+          dhash: bits(dd, 32),
+          width: 2000,
+          height: 1500,
+          mime: 'image/jpeg',
+        });
+        const facts = [A, B, B2];
+        const g = runGrouper(lookAlikeEdges(facts), facts, order);
+        expect(copyGroupOf(g, 'A')).not.toContain('B');
+        expect(g.similarPartition()).toEqual(new Set(['A,B,B2']));
+      },
+    ),
+    { numRuns: 300 },
+  ));
+
+test('I6: two cameras plus a dateless bridge never form one copy group', () =>
+  fc.assert(
+    fc.property(
+      fc.constantFrom(null, { s: 1_200_000_000, sub: null }),
+      fc.constantFrom(null, { s: 1_200_000_000, sub: null }),
+      fc.shuffledSubarray([0, 1, 2], { minLength: 3, maxLength: 3 }),
+      (ca, cb, order) => {
+        const A = F('A', { captured: ca, camera: 'Canon EOS 5D' });
+        const B = F('B', { captured: cb, camera: 'Nikon D70', phash: 1n });
+        const K = F('K', { ...NOEXIF, width: 640, height: 480, mime: 'image/jpeg' });
+        const facts = [A, B, K];
+        const g = runGrouper(lookAlikeEdges(facts), facts, order);
+        expect(copyGroupOf(g, 'A')).not.toContain('B');
+        // A refusal flags only contents with neither a capture key nor a burst (spec §12 R3).
+        const bySha = new Map(facts.map((f) => [f.sha256, f]));
+        for (const sha of g.ambiguousContents())
+          expect([bySha.get(sha)!.captured, bySha.get(sha)!.burstUuid]).toEqual([null, null]);
+      },
+    ),
+    { numRuns: 200 },
+  ));

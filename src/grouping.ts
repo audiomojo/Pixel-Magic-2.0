@@ -9,7 +9,7 @@ export interface Assignment {
   copyGroup: number;
   /**
    * The new content is a key-less bridge (no capture key, no burst) whose copy union was refused:
-   * it would mix two different capture keys or two frames of one burst.
+   * it would mix two different capture keys, two frames of one burst or two cameras.
    */
   ambiguous: boolean;
   /**
@@ -30,6 +30,7 @@ export interface LoadedRow {
   copyGroup: number;
   similarSet: number | null;
   captured: CaptureKey | null;
+  camera: string | null;
   burstUuid: string | null;
   /** Persisted `contents.copy_ambiguous`; never changes unions. */
   ambiguous: boolean;
@@ -43,6 +44,8 @@ interface CopyGroup {
   captures: CaptureKey[];
   /** Burst UUIDs of the members (roots only); a copy group holds at most one frame per burst. */
   bursts: Set<string>;
+  /** Non-null cameras of the members (roots only); a copy group comes from one camera. */
+  cameras: Set<string>;
   /** Similar set id, possibly not a root (roots only). */
   similar: number | null;
 }
@@ -55,10 +58,14 @@ interface SimilarSet {
 
 const sameKey = (a: CaptureKey, b: CaptureKey): boolean => a.s === b.s && a.sub === b.sub;
 
-/** Would merging these groups mix two shots: conflicting capture keys, or two frames of one burst? */
+/**
+ * Would merging these groups mix two shots: conflicting capture keys, two frames of one burst,
+ * or two different cameras (spec §6.3)?
+ */
 const mustNotMerge = (a: CopyGroup, b: CopyGroup): boolean =>
   a.captures.some((x) => b.captures.some((y) => captureConflict(x, y))) ||
-  [...a.bursts].some((u) => b.bursts.has(u));
+  [...a.bursts].some((u) => b.bursts.has(u)) ||
+  [...a.cameras].some((x) => [...b.cameras].some((y) => x !== y));
 
 /** Larger wins; on a tie the lower id wins. */
 const pick = (a: [id: number, size: number], b: [id: number, size: number]): [number, number] =>
@@ -66,8 +73,9 @@ const pick = (a: [id: number, size: number], b: [id: number, size: number]): [nu
 
 /**
  * Capture-consistent union-find over copy groups and their similar sets (spec §6.3).
- * A copy union that would put two conflicting capture keys in one group is refused, so burst
- * frames are never collapsed into one copy group, even through an EXIF-less bridge.
+ * A copy union that would put two conflicting capture keys, two frames of one burst or two
+ * cameras in one group is refused, so burst frames are never collapsed into one copy group,
+ * even through an EXIF-less bridge.
  */
 export class Grouper {
   private readonly copy = new Map<number, CopyGroup>();
@@ -88,12 +96,20 @@ export class Grouper {
     if (row.ambiguous) this.flaggedSet.add(row.sha256);
     let g = this.copy.get(row.copyGroup);
     if (g === undefined) {
-      g = { parent: row.copyGroup, members: [], captures: [], bursts: new Set(), similar: null };
+      g = {
+        parent: row.copyGroup,
+        members: [],
+        captures: [],
+        bursts: new Set(),
+        cameras: new Set(),
+        similar: null,
+      };
       this.copy.set(row.copyGroup, g);
     }
     g.members.push(row.sha256);
     if (row.captured !== null) addCapture(g, row.captured);
     if (row.burstUuid !== null) g.bursts.add(row.burstUuid);
+    if (row.camera !== null) g.cameras.add(row.camera);
     if (row.similarSet !== null) {
       if (!this.similar.has(row.similarSet))
         this.similar.set(row.similarSet, { parent: row.similarSet, size: 0 });
@@ -120,6 +136,7 @@ export class Grouper {
       members: [f.sha256],
       captures: f.captured === null ? [] : [f.captured],
       bursts: new Set(f.burstUuid === null ? [] : [f.burstUuid]),
+      cameras: new Set(f.camera === null ? [] : [f.camera]),
       similar: null,
     });
     const asg: Assignment = {
@@ -273,10 +290,12 @@ export class Grouper {
     w.members.push(...l.members);
     for (const c of l.captures) addCapture(w, c);
     for (const u of l.bursts) w.bursts.add(u);
+    for (const c of l.cameras) w.cameras.add(c);
     l.parent = winner;
     l.members = [];
     l.captures = [];
     l.bursts = new Set();
+    l.cameras = new Set();
     l.similar = null;
     asg.copyMerges.push([loser, winner]);
   }

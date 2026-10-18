@@ -18,6 +18,11 @@ export class MissingBytesError extends Error {
   override name = 'MissingBytesError';
 }
 
+/** The claimed file changed while it was hashed (a writer still has it open). Retryable. */
+export class ChangedWhileHashingError extends Error {
+  override name = 'ChangedWhileHashingError';
+}
+
 type Kind = IngestResult['kind'];
 interface Row {
   id: string;
@@ -216,14 +221,7 @@ export function makeIngestFile(deps: Deps) {
         [],
         'sha256 IS NULL',
       );
-      return {
-        fileId: row.id,
-        sha256: null,
-        ext: null,
-        state: 'QUARANTINED',
-        isNew: false,
-        kind: null,
-      };
+      return QUARANTINED_UNHASHED(row.id);
     }
     if (row.ext) {
       const vault = vaultPath(row.sha256, row.ext);
@@ -235,6 +233,15 @@ export function makeIngestFile(deps: Deps) {
       `file ${row.id} (${ref.relPath}, sha ${row.sha256}): bytes in neither drop zone, claimed nor vault`,
     );
   }
+
+  const QUARANTINED_UNHASHED = (id: string): IngestResult => ({
+    fileId: id,
+    sha256: null,
+    ext: null,
+    state: 'QUARANTINED',
+    isNew: false,
+    kind: null,
+  });
 
   return async function ingestFile(ref: FileRef): Promise<IngestResult> {
     const runId = Context.current().info.workflowExecution?.runId;
@@ -265,9 +272,37 @@ export function makeIngestFile(deps: Deps) {
     }
     await checkpoint('claim');
 
+    // The scan's stability check may be minutes old: claim only the file the scan saw. A file
+    // still being written (a slow or repeated copy) goes back to the drop zone for a later scan,
+    // under a new size/mtime and so a new workflow. The row ends like a vanished one. A hashed
+    // row was already checked by the attempt that hashed it.
+    const before = await stat(claimed, { bigint: true });
+    if (
+      row.sha256 === null &&
+      (before.size !== BigInt(ref.size) || before.mtimeNs !== BigInt(ref.mtimeNs))
+    ) {
+      await putBack(ref, row.id);
+      await guarded(
+        pool,
+        row.id,
+        `state = 'QUARANTINED', last_error = 'changed_before_claim'`,
+        ['DISCOVERED', 'CLAIMED'],
+        [],
+        'sha256 IS NULL',
+      );
+      return QUARANTINED_UNHASHED(row.id);
+    }
+
     // Step 3: hash, heartbeating per 1 MiB chunk. Commit CLAIMED + sha256.
-    const size = BigInt((await stat(claimed)).size);
+    const size = before.size;
     const sha = await sha256File(claimed, () => heartbeat());
+    await checkpoint('hashed');
+    const after = await stat(claimed, { bigint: true });
+    if (after.size !== before.size || after.mtimeNs !== before.mtimeNs) {
+      // The hash covers bytes that are no longer the file's: never vault them under it.
+      await putBack(ref, row.id);
+      throw new ChangedWhileHashingError(`${ref.relPath} changed while hashing; put back`);
+    }
     try {
       // A row already hashed to other bytes belongs to an earlier claim (e.g. parked in .copies by
       // a newer attempt): this attempt must not re-attribute it to whatever it claimed.

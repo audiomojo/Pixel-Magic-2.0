@@ -1,7 +1,17 @@
-import { link, mkdir, readdir, readlink, rename, rmdir, symlink, unlink } from 'node:fs/promises';
+import {
+  link,
+  lstat,
+  mkdir,
+  readdir,
+  readlink,
+  rename,
+  rmdir,
+  symlink,
+  unlink,
+} from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { dirname, join } from 'node:path';
-import { heartbeat } from '@temporalio/activity';
+import { dirname, join, relative } from 'node:path';
+import { heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
 import { fsyncDir, vaultRel } from '../fsops.js';
 import { planStaging, type Entry, type StageContent, type StageFile } from '../stagingPlan.js';
@@ -29,6 +39,20 @@ interface Snapshot {
 }
 
 const isEnoent = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOENT';
+const isNotEmpty = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOTEMPTY';
+
+/** `path`, or `path.1`, `path.2`, … : the first name nothing occupies (a rescue never overwrites). */
+async function freeName(path: string): Promise<string> {
+  for (let i = 0; ; i++) {
+    const p = i === 0 ? path : `${path}.${String(i)}`;
+    try {
+      await lstat(p);
+    } catch (e) {
+      if (isEnoent(e)) return p;
+      throw e;
+    }
+  }
+}
 
 export function makeStaging(deps: Deps) {
   const { pool, layout, settings } = deps;
@@ -196,25 +220,53 @@ export function makeStaging(deps: Deps) {
     }
   }
 
-  /** Removes `.gen-<n>` bottom-up (staging links only), heartbeating every 1,000 removals. */
+  /**
+   * Removes `.gen-<n>` bottom-up, heartbeating every 1,000 entries. Only staging links are
+   * unlinked: regular files with another name (the vault's). Anything else is something a user
+   * saved or made inside staging, whose bytes may exist nowhere else: it is moved, never
+   * deleted, to `staging/.rescued/<n>/<same relative path>`.
+   */
   async function removeGen(n: number): Promise<void> {
+    const root = genPath(n);
     let count = 0;
+    let rescued = 0;
     const tick = () => {
       if (++count % HEARTBEAT_EVERY === 0) heartbeat(`rm .gen-${String(n)}`);
+    };
+    const rescue = async (p: string): Promise<void> => {
+      const dest = join(layout.staging, '.rescued', String(n), relative(root, p));
+      await mkdir(dirname(dest), { recursive: true });
+      await rename(p, await freeName(dest));
+      rescued++;
     };
     const walk = async (dir: string): Promise<void> => {
       for (const e of await readdir(dir, { withFileTypes: true })) {
         const p = join(dir, e.name);
         if (e.isDirectory()) await walk(p);
-        else await unlink(p);
+        else {
+          const st = await lstat(p);
+          if (st.isFile() && st.nlink >= 2) await unlink(p);
+          else await rescue(p);
+        }
         tick();
       }
-      await rmdir(dir);
+      try {
+        await rmdir(dir);
+      } catch (e) {
+        // Something appeared meanwhile: leave the directory for the next build's sweep.
+        if (!isNotEmpty(e)) throw e;
+      }
     };
     try {
-      await walk(genPath(n));
+      await walk(root);
     } catch (e) {
       if (!isEnoent(e)) throw e;
+    } finally {
+      if (rescued > 0)
+        log.warn(`staging: moved ${String(rescued)} files not made by staging to .rescued`, {
+          gen: n,
+          rescued,
+        });
     }
   }
 

@@ -341,6 +341,8 @@ test('heartbeats while removing a large orphan generation', async () => {
   await runActivity(acts.maybeBuildStaging, [true], { onHeartbeat: (d) => beats.push(d) });
   expect(beats).toEqual(['rm .gen-7']);
   expect(existsSync(genDir(7))).toBe(false);
+  // Single-link files are nobody's staging link: they were moved aside, not deleted.
+  expect(await readdir(join(layout.staging, '.rescued', '7', 'unique'))).toHaveLength(1500);
 });
 
 test.skipIf(process.getuid?.() === 0)('staged file is read-only', async () => {
@@ -348,4 +350,33 @@ test.skipIf(process.getuid?.() === 0)('staged file is read-only', async () => {
   await build(true);
   const f = (await walk(join(layout.staging, 'current', 'unique')))[0]!;
   await expect(open(f, 'r+')).rejects.toMatchObject({ code: 'EACCES' });
+});
+
+test('files the user saved inside staging are rescued when their generation goes, never deleted', async () => {
+  await seedPipelineRows();
+  const g1 = (await build(true)).gen!;
+  const cur = join(layout.staging, 'current');
+  await writeFile(join(cur, 'unique', 'my-edit.jpg'), 'edited by hand'); // nlink 1: only copy
+  await mkdir(join(cur, 'mine'));
+  await writeFile(join(cur, 'mine', 'notes.txt'), 'notes');
+  await symlink('../unique', join(cur, 'mine', 'alias'));
+  // A rescue never overwrites: an earlier rescue at the same path keeps its bytes.
+  await mkdir(join(layout.staging, '.rescued', String(g1), 'unique'), { recursive: true });
+  await writeFile(join(layout.staging, '.rescued', String(g1), 'unique', 'my-edit.jpg'), 'older');
+
+  await build(true);
+  await build(true); // gen g1 is now old and removed
+  expect(existsSync(genDir(g1))).toBe(false);
+  const rescued = join(layout.staging, '.rescued', String(g1));
+  expect(await readFile(join(rescued, 'unique', 'my-edit.jpg'), 'utf8')).toBe('older');
+  expect(await readFile(join(rescued, 'unique', 'my-edit.jpg.1'), 'utf8')).toBe('edited by hand');
+  expect(await readFile(join(rescued, 'mine', 'notes.txt'), 'utf8')).toBe('notes');
+  expect(await readlink(join(rescued, 'mine', 'alias'))).toBe('../unique');
+  // Staging hardlinks themselves are removed, not rescued.
+  expect((await walk(rescued)).map((f) => relative(rescued, f)).sort()).toEqual([
+    'mine/alias',
+    'mine/notes.txt',
+    'unique/my-edit.jpg',
+    'unique/my-edit.jpg.1',
+  ]);
 });

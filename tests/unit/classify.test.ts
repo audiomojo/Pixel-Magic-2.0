@@ -29,6 +29,16 @@ test.each<[Facts, Facts, 'copy' | 'similar']>([
   [F('a'), F('b', { camera: null, width: 2000 }), 'copy'], // camera missing on one side
   [F('a'), F('b', { captured: { s: 1_600_000_000, sub: null }, mime: 'image/jpeg' }), 'copy'], // subsec missing, mime differs
   [F('a'), F('b', { captured: { s: 1_600_000_000, sub: null } }), 'similar'], // subsec missing, same dims+mime
+  [
+    F('a', { captured: { s: 1, sub: null } }),
+    F('b', { phash: 0b11111n, width: 2000, captured: { s: 1, sub: null } }),
+    'similar',
+  ], // I6: same second, no subsec, other dims, but pHash 5 > COPY_PHASH (a burst neighbour's export)
+  [
+    F('a', { captured: { s: 1, sub: null } }),
+    F('b', { dhash: 0b1111111n, width: 2000, captured: { s: 1, sub: null } }),
+    'similar',
+  ], // I6: same second, no subsec, other dims, but dHash 7 > COPY_DHASH
   [F('a'), F('b', { phash: 1n, dhash: 0b1111111n, ...NOEXIF }), 'similar'], // one-sided, dHash not tight
   [
     F('a', { captured: null }),

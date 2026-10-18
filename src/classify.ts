@@ -58,12 +58,14 @@ export function classify(a: Facts, b: Facts, t: Thresholds): 'copy' | 'similar' 
   const cb = b.captured;
   if (ca !== null && cb !== null && captureConflict(ca, cb)) return 'similar';
   if (bothDiffer(a.camera, b.camera)) return 'similar';
-  if (ca !== null && cb !== null) {
-    if (ca.sub !== null && cb.sub !== null) return 'copy';
-    return differentEncoding(a, b) ? 'copy' : 'similar';
-  }
   const tight =
     hamming(a.phash, b.phash) <= t.copyPhash && hamming(a.dhash, b.dhash) <= t.copyDhash;
+  if (ca !== null && cb !== null) {
+    if (ca.sub !== null && cb.sub !== null) return 'copy';
+    // Same second without subsecs: two burst frames look exactly like this, so a re-encoding
+    // must also be within the copy distances (spec §6.3 row 6).
+    return tight && differentEncoding(a, b) ? 'copy' : 'similar';
+  }
   if (!tight) return 'similar';
   if (ca !== null || cb !== null) return 'copy';
   return differentEncoding(a, b) ? 'copy' : 'similar';

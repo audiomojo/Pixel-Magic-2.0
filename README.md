@@ -6,6 +6,10 @@ Photo de-duplication pipeline (TypeScript, Temporal, Postgres). Drop photos into
 Everything under `DATA_DIR` must live on one filesystem (hardlinks and renames are
 relied on). Verify with `make fs-check`.
 
+`staging/current/` is rebuilt from the database: don't keep files there. Anything saved inside
+it that staging did not put there is moved to `staging/.rescued/<generation>/` when that
+generation is cleaned up, never deleted.
+
 ## Development
 
     npm install
