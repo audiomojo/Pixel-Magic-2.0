@@ -968,6 +968,11 @@ export async function synthesize(
       const { autoOrient } = await sharp(input).metadata();
       const out = await render(sharp(input).rotate(), autoOrient.width).toBuffer();
       await writeFile(join(dest, relPath), out, { flag: 'wx' });
+      // The seed's times, not "now": an EXIF-less variant that becomes a best copy is staged
+      // under its mtime, and two runs must get identical inputs (calm vs chaos, spec §10.4).
+      const st = await stat(join(corpusDir, seedName), { bigint: true });
+      const secs = (ns: bigint) => Number(ns) / 1e9;
+      await utimes(join(dest, relPath), secs(st.atimeNs), secs(st.mtimeNs));
       made.push({ relPath, seedName, variant });
     };
     for (const { name } of seeds) {

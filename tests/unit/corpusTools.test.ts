@@ -454,6 +454,15 @@ describe('seed', () => {
     expect([meta.width, meta.height, meta.exif !== undefined]).toEqual([32, 24, true]);
     const bridge = synth.find((f) => f.variant === 'bridge')!;
     expect((await sharp(join(dest, bridge.relPath)).metadata()).exif).toBeUndefined();
+    // Every variant carries its seed's mtime, so two runs seeded at different times stage the
+    // same names (an EXIF-less best copy is named by its file's mtime).
+    for (const f of synth) {
+      const [v, sd] = await Promise.all([
+        stat(join(dest, f.relPath)),
+        stat(join(src, f.seedName!)),
+      ]);
+      expect(Math.abs(v.mtimeMs - sd.mtimeMs), f.name).toBeLessThan(0.01);
+    }
   });
 
   test('shuffle changes only the copy order, never the content', async () => {
