@@ -28,3 +28,10 @@ export interface BuildResult {
   entries: number;
   skipped: boolean;
 }
+
+/** `scanAndStart`'s outcome. `pendingBytes` is a decimal string (bigint can't cross Temporal JSON). */
+export interface ScanResult {
+  started: number;
+  pendingFiles: number;
+  pendingBytes: string;
+}

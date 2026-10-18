@@ -18,6 +18,9 @@
   "dependencies": {
     "@temporalio/activity": "^1.24.0",
     "@temporalio/client": "^1.24.0",
+    "@temporalio/common": "^1.24.0",
+    "@temporalio/worker": "^1.24.0",
+    "@temporalio/workflow": "^1.24.0",
     "exiftool-vendored": "^39.0.1",
     "heic-decode": "^2.1.0",
     "node-pg-migrate": "^9.0.0",

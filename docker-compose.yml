@@ -155,7 +155,8 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - '127.0.0.1:3000:3000'
+      # Host port overridable when 3000 is taken on the dev machine (the default is spec §4.1's).
+      - '127.0.0.1:${GRAFANA_PORT:-3000}:3000'
     volumes:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro

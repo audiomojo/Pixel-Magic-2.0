@@ -99,3 +99,11 @@ test('truncate keeps singletons', async () => {
     1,
   );
 });
+
+test('pool sessions bound hung statements and idle transactions', async () => {
+  const s = await one<{ st: string; idle: string }>(
+    `SELECT current_setting('statement_timeout') AS st,
+            current_setting('idle_in_transaction_session_timeout') AS idle`,
+  );
+  expect(s).toEqual({ st: '1min', idle: '2min' });
+});
