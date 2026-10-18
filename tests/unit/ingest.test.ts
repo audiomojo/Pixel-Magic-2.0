@@ -1,8 +1,18 @@
 import { existsSync } from 'node:fs';
-import { chmod, link, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  link,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type pg from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import { MissingBytesError, StaleAttemptError } from '../../src/activities/ingest.js';
 import { DataLayout, vaultRel } from '../../src/fsops.js';
@@ -13,8 +23,24 @@ import { startPg, type PgHandle } from '../helpers/pg.js';
 
 class SimulatedCrash extends Error {}
 
-let pgh: PgHandle;
+/** Every `fsyncDir` the activity makes, with what was already on disk / committed at that moment. */
+const fsyncs = vi.hoisted(() => [] as { dir: string; copies: string[]; states: string[] }[]);
 let pool: pg.Pool;
+vi.mock('../../src/fsops.js', async (orig) => {
+  const real = await orig<typeof import('../../src/fsops.js')>();
+  const { readdir: ls } = await import('node:fs/promises');
+  return {
+    ...real,
+    fsyncDir: async (dir: string) => {
+      const states = (await pool.query<{ state: string }>('SELECT state FROM files ORDER BY id'))
+        .rows;
+      fsyncs.push({ dir, copies: await ls(dir), states: states.map((r) => r.state) });
+      await real.fsyncDir(dir);
+    },
+  };
+});
+
+let pgh: PgHandle;
 let deps: Deps;
 let layout: DataLayout;
 let close: () => Promise<void>;
@@ -270,18 +296,34 @@ test('nested relPath and unknown type keep a usable ext', async () => {
   ).toBe('é.xyz');
 });
 
-test.each([
-  ['blob', 'bin'],
-  ['x.ABC', 'abc'],
-  ['x.t#', 'bin'],
-])('undetectable bytes named %s vault as .%s with no mime', async (name, ext) => {
-  const r = await runActivity(acts.ingestFile, [await drop(name, Buffer.alloc(64))], {
+test.each(['blob', 'x.ABC', 'x.t#'])(
+  'undetectable bytes named %s vault as .bin with no mime (never by extension)',
+  async (name) => {
+    const r = await runActivity(acts.ingestFile, [await drop(name, Buffer.alloc(64))], {
+      runId: 'r1',
+    });
+    expect([r.state, r.ext, r.kind]).toEqual(['INGESTED', 'bin', 'other']);
+    expect((await pool.query<{ mime: string | null }>('SELECT mime FROM contents')).rows).toEqual([
+      { mime: null },
+    ]);
+  },
+);
+
+test('identical undetectable bytes under different names dedup to one vault inode', async () => {
+  const a = await runActivity(acts.ingestFile, [await drop('x.abc', Buffer.alloc(64))], {
     runId: 'r1',
   });
-  expect([r.state, r.ext, r.kind]).toEqual(['INGESTED', ext, 'other']);
-  expect((await pool.query<{ mime: string | null }>('SELECT mime FROM contents')).rows).toEqual([
-    { mime: null },
+  const b = await runActivity(acts.ingestFile, [await drop('y.def', Buffer.alloc(64))], {
+    runId: 'r2',
+  });
+  expect([a.state, a.isNew, b.state, b.isNew, b.sha256]).toEqual([
+    'INGESTED',
+    true,
+    'COPY',
+    false,
+    a.sha256,
   ]);
+  expect(await count('contents')).toBe(1);
 });
 
 test('a claim failing other than ENOENT is retried, never quarantined', async () => {
@@ -331,5 +373,103 @@ test('a crash during metadata resumes to INGESTED', async () => {
     SimulatedCrash,
   );
   expect((await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).state).toBe('INGESTED');
+  expect(await readdir(layout.claimed)).toEqual([]);
+});
+
+test('the .copies rename is fsynced before the COPY commit', async () => {
+  await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
+  fsyncs.length = 0;
+  const b = await runActivity(acts.ingestFile, [await drop('b.jpg', JPEG_A)], { runId: 'r2' });
+  expect(b.state).toBe('COPY');
+  expect(fsyncs).toEqual([
+    { dir: layout.vaultCopies, copies: [`${b.fileId}.jpg`], states: ['INGESTED', 'CLAIMED'] },
+  ]);
+});
+
+test('a stale attempt that claimed a re-drop puts it back in the drop zone', async () => {
+  const ref = await drop('a.jpg', JPEG_A);
+  const redrop = Buffer.concat([JPEG_A, Buffer.from('re-drop')]);
+  let second: IngestResult | undefined;
+  const stale = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      // attempt X stalls after its upsert (sha256 still null in its snapshot)…
+      if (n === 'upsert' && !second) {
+        second = await runActivity(acts.ingestFile, [ref], { runId: 'r1' }); // …Y commits
+        await drop('a.jpg', redrop); // …and the user drops a new file at the same path
+      }
+    },
+  });
+  await expect(runActivity(stale.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(
+    StaleAttemptError,
+  );
+  expect(second?.state).toBe('INGESTED');
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(redrop);
+  expect(await count('files')).toBe(1);
+});
+
+test('a put-back onto an occupied drop-zone path fails loudly and keeps the bytes', async () => {
+  const ref = await drop('a.jpg', JPEG_A);
+  let second: IngestResult | undefined;
+  const stale = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      if (n === 'upsert' && !second) {
+        second = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+        await drop('a.jpg', Buffer.from('re-drop 1'));
+      }
+      if (n === 'claim') await drop('a.jpg', Buffer.from('re-drop 2')); // path taken again
+    },
+  });
+  await expect(runActivity(stale.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(/occupied/);
+  const held = await readdir(layout.claimed);
+  expect(held).toHaveLength(1);
+  expect(await readFile(join(layout.claimed, held[0]!), 'utf8')).toBe('re-drop 1');
+  expect(await readFile(join(layout.dropzone, 'a.jpg'), 'utf8')).toBe('re-drop 2');
+});
+
+test('a stale unhashed attempt never marks a parked copy vanished', async () => {
+  await runActivity(acts.ingestFile, [await drop('first.jpg', JPEG_A)], { runId: 'r0' });
+  const ref = await drop('a.jpg', JPEG_A);
+  let crashed = false;
+  const stale = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      if (n === 'upsert' && !crashed) {
+        crashed = true; // Y gets as far as parking the bytes in .copies, then dies
+        await expect(
+          runActivity(createActivities(crashAt('copies_rename')).ingestFile, [ref], {
+            runId: 'r1',
+          }),
+        ).rejects.toThrow(SimulatedCrash);
+      }
+    },
+  });
+  await expect(runActivity(stale.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(
+    StaleAttemptError,
+  );
+  expect(await count('files', `state = 'QUARANTINED'`)).toBe(0);
+  expect((await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).state).toBe('COPY');
+});
+
+test('put-back never returns bytes the row already committed (no double count)', async () => {
+  const ref = await drop('a.jpg', JPEG_A);
+  let second: IngestResult | undefined;
+  const stale = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      // X claimed the file itself; Y reuses X's claimed file, commits, and dies before its unlink.
+      if (n === 'claim' && !second) {
+        second = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+        await link(join(layout.root, vaultRel(second.sha256!, 'jpg')), join(layout.claimed, '1'));
+      }
+    },
+  });
+  await expect(runActivity(stale.ingestFile, [ref], { runId: 'r1' })).rejects.toThrow(
+    StaleAttemptError,
+  );
+  expect(existsSync(join(layout.dropzone, 'a.jpg'))).toBe(false);
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(second);
   expect(await readdir(layout.claimed)).toEqual([]);
 });

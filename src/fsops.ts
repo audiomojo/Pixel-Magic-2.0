@@ -74,7 +74,8 @@ export async function sha256File(path: string, onChunk?: () => void): Promise<st
 
 export type LinkOutcome = 'LINKED' | 'ALREADY_LINKED' | 'EXISTS_OTHER';
 
-async function fsyncDir(dir: string): Promise<void> {
+/** fsync a directory so a link or rename inside it survives power loss. */
+export async function fsyncDir(dir: string): Promise<void> {
   const fh = await open(dir, 'r');
   try {
     await fh.sync();
