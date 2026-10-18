@@ -11,7 +11,8 @@ const REQUIRED = [
   'ETA',
   'Copy groups',
   'Similar sets',
-  '≈ Reclaimable',
+  'Duplicates removed',
+  'Copy mismatches',
   'Quarantined by reason',
   'Failed',
   'Recent errors',
@@ -144,30 +145,45 @@ test('Similar sets counts only sets of two or more root copy groups', async () =
   expect(Number(r.rows[0]!.value)).toBe(1);
 });
 
-test('≈ Reclaimable uses the approximate formula', async () => {
-  const { pool } = pgh;
-  const g = (
-    await pool.query<{ id: bigint }>(`INSERT INTO groups (kind) VALUES ('copy') RETURNING id`)
-  ).rows[0]!.id;
-  // a merged (non-root) group must not count
-  await pool.query(`INSERT INTO groups (kind, merged_into) VALUES ('copy', $1)`, [g]);
-  for (const [i, size] of [100, 40].entries())
-    await pool.query(
-      `INSERT INTO contents (sha256, ext, kind, size_bytes, state, copy_group_id)
-       VALUES ($1,'jpg','still',$2,'CLUSTERED',$3)`,
-      [String(i).padStart(64, '0'), size, g],
-    );
-  await pool.query(
-    `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, state)
-     VALUES ('c.jpg','c.jpg',100,1,'COPY')`,
+const row = async (title: string) =>
+  (await pgh.pool.query<Record<string, unknown>>(targetByTitle(title).rawSql)).rows[0]!;
+
+async function copyRow(o: { size: number; removed?: number; mismatch?: boolean; state?: string }) {
+  await pgh.pool.query(
+    `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, state, copy_removed_at,
+                        copy_reclaimed_bytes, copy_mismatch)
+     VALUES ('x', 'x', $1, $2, $3, $4, $5, $6)`,
+    [
+      o.size,
+      Math.floor(Math.random() * 1e12),
+      o.state ?? 'COPY',
+      o.removed === undefined ? null : new Date(),
+      o.removed ?? null,
+      o.mismatch ?? false,
+    ],
   );
-  const r = await pool.query<{ value: unknown }>(targetByTitle('≈ Reclaimable').rawSql);
-  expect(Number(r.rows[0]!.value)).toBe(140);
+}
+
+test('Duplicates removed: count and bytes reclaimed, plus the bytes still pending', async () => {
+  await copyRow({ size: 100, removed: 100 });
+  await copyRow({ size: 50, removed: 50 });
+  await copyRow({ size: 30 }); // pending removal
+  await copyRow({ size: 20, mismatch: true }); // kept: never counted as reclaimable
+  await copyRow({ size: 999, state: 'INGESTED' });
+  const r = await row('Duplicates removed');
+  expect([r.removed, r.reclaimed_bytes, r.pending_bytes].map(Number)).toEqual([2, 150, 30]);
 });
 
-test('≈ Reclaimable is 0 on an empty database', async () => {
-  const r = await pgh.pool.query<{ value: unknown }>(targetByTitle('≈ Reclaimable').rawSql);
-  expect(Number(r.rows[0]!.value)).toBe(0);
+test('Duplicates removed is all zeros on an empty database', async () => {
+  const r = await row('Duplicates removed');
+  expect([r.removed, r.reclaimed_bytes, r.pending_bytes].map(Number)).toEqual([0, 0, 0]);
+});
+
+test('Copy mismatches counts flagged rows (and reads 0 normally)', async () => {
+  expect(Number((await row('Copy mismatches')).value)).toBe(0);
+  await copyRow({ size: 20, mismatch: true });
+  await copyRow({ size: 20, removed: 20 });
+  expect(Number((await row('Copy mismatches')).value)).toBe(1);
 });
 
 test('dashboard has required panels and 5s refresh', () => {

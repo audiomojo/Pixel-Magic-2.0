@@ -6,8 +6,8 @@ import type pg from 'pg';
 import { loadSettings } from './config.js';
 import { createPool } from './db.js';
 import { DataLayout } from './fsops.js';
-import { doctor, retryFailed, verifyVault } from './operator.js';
-import type { StagingWorkflow } from './workflows.js';
+import { doctor, listCopies, removedCopies, retryFailed, verifyVault } from './operator.js';
+import type { CopySweepWorkflow, StagingWorkflow } from './workflows.js';
 
 export interface CliDeps {
   temporal?: Client;
@@ -17,7 +17,8 @@ export interface CliDeps {
   poisonAttempts?: number;
 }
 
-const USAGE = 'usage: cli stage [--force] | retry-failed | verify-vault [--sample N] | doctor\n';
+const USAGE =
+  'usage: cli stage [--force] | retry-failed | verify-vault [--sample N] | doctor | copies | sweep-copies\n';
 
 async function connect(): Promise<{ client: Client; close: () => Promise<void> }> {
   const s = loadSettings();
@@ -40,6 +41,25 @@ async function stage(client: Client, force: boolean): Promise<number> {
   return 0;
 }
 
+async function sweep(client: Client): Promise<number> {
+  const result = await client.workflow.execute<typeof CopySweepWorkflow>('CopySweepWorkflow', {
+    taskQueue: 'main',
+    workflowId: `pm-copies-cli-${String(Date.now())}`,
+    args: [],
+  });
+  out(JSON.stringify(result));
+  return 0;
+}
+
+async function copies(pool: pg.Pool): Promise<number> {
+  out('rel_path\tmtime\tdropped_at\tvault_sha256\tstatus');
+  for (const c of await listCopies(pool))
+    out(
+      [c.relPath, c.mtime.toISOString(), c.droppedAt.toISOString(), c.sha256, c.status].join('\t'),
+    );
+  return 0;
+}
+
 async function retry(pool: pg.Pool, client: Client, poisonAttempts: number): Promise<number> {
   const r = await retryFailed(pool, client, { poisonAttempts });
   out(`started ${String(r.started)} failed contents again`);
@@ -47,12 +67,18 @@ async function retry(pool: pg.Pool, client: Client, poisonAttempts: number): Pro
   return r.failed.length === 0 ? 0 : 1;
 }
 
-async function verify(layout: DataLayout, sample: number | undefined): Promise<number> {
+async function verify(
+  layout: DataLayout,
+  sample: number | undefined,
+  pool: () => pg.Pool,
+): Promise<number> {
   const r = await verifyVault(layout, sample);
+  const removed = await removedCopies(pool());
   for (const m of r.mismatches) out(`MISMATCH ${m.path} expected ${m.expected} actual ${m.actual}`);
   out(
     `checked ${String(r.checked)} vault files, ${String(r.mismatches.length)} mismatches; ` +
-      `skipped ${String(r.skippedCopies)} .copies files`,
+      `skipped ${String(r.skippedCopies)} .copies files still present; ` +
+      `${String(removed)} duplicates removed`,
   );
   return r.mismatches.length === 0 ? 0 : 1;
 }
@@ -78,7 +104,8 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
     (force ? command === 'stage' : true) &&
     (sampleArg === undefined ||
       (command === 'verify-vault' && Number.isInteger(sample) && sample! > 0));
-  if (!ok || !['stage', 'retry-failed', 'verify-vault', 'doctor'].includes(command ?? '')) {
+  const commands = ['stage', 'retry-failed', 'verify-vault', 'doctor', 'copies', 'sweep-copies'];
+  if (!ok || !commands.includes(command ?? '')) {
     process.stderr.write(USAGE);
     return 2;
   }
@@ -108,7 +135,11 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
           deps.poisonAttempts ?? loadSettings().poisonAttempts,
         );
       case 'verify-vault':
-        return await verify(needLayout(), sample);
+        return await verify(needLayout(), sample, needPool);
+      case 'copies':
+        return await copies(needPool());
+      case 'sweep-copies':
+        return await sweep(await needClient());
       default:
         out(JSON.stringify(await doctor(needPool(), needLayout())));
         return 0;

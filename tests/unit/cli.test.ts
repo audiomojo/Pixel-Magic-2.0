@@ -272,6 +272,7 @@ test('doctor counts orphaned claimed files and stuck work', async () => {
     orphanedClaimed: 1,
     filesStuckRetrying: 1,
     contentsStale: 1,
+    copyMismatches: 0,
   });
 });
 
@@ -282,5 +283,73 @@ test('doctor reports zeros on a clean system', async () => {
     orphanedClaimed: 0,
     filesStuckRetrying: 0,
     contentsStale: 0,
+    copyMismatches: 0,
   });
+});
+
+/** A COPY row of a.jpg's bytes at `relPath`: removed, flagged a mismatch, or still present. */
+async function seedCopy(relPath: string, status: 'removed' | 'mismatch' | 'present') {
+  const r = await pgh.pool.query<{ id: bigint }>(
+    `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state,
+                        copy_removed_at, copy_reclaimed_bytes, copy_mismatch, last_error,
+                        discovered_at)
+     VALUES ($1, $2, 7, 1600000000000000000, 'jpg', $3, 'COPY', $4, $5, $6, $7,
+             '2026-10-18T10:00:00Z')
+     RETURNING id`,
+    [
+      relPath,
+      relPath.split('/').pop(),
+      sha('a'),
+      status === 'removed' ? new Date('2026-10-18T11:00:00Z') : null,
+      status === 'removed' ? 7 : null,
+      status === 'mismatch',
+      status === 'mismatch' ? 'copy_mismatch: .copies sha x, vault sha y, expected z' : null,
+    ],
+  );
+  return String(r.rows[0]!.id);
+}
+
+test('doctor surfaces copy mismatches', async () => {
+  await seedCopy('x/a.jpg', 'mismatch');
+  await seedCopy('y/a.jpg', 'removed');
+  const out = capture('stdout');
+  expect(await main(['doctor'], deps)).toBe(0);
+  expect(JSON.parse(out())).toMatchObject({ copyMismatches: 1 });
+});
+
+test('verify-vault reports removed and still-present duplicates', async () => {
+  await writeVault('a');
+  await writeFile(join(layout.vaultCopies, `${await seedCopy('p/a.jpg', 'present')}.jpg`), 'a');
+  await seedCopy('r/a.jpg', 'removed');
+  await seedCopy('s/a.jpg', 'removed');
+  const out = capture('stdout');
+  expect(await main(['verify-vault'], deps)).toBe(0);
+  expect(out()).toContain('skipped 1 .copies files still present; 2 duplicates removed');
+});
+
+test('copies lists every duplicate drop with its mtime, drop time, vault sha and status', async () => {
+  await seedCopy('y/a.jpg', 'removed');
+  await seedCopy('x/a.jpg', 'mismatch');
+  await seedCopy('z/a.jpg', 'present');
+  const out = capture('stdout');
+  expect(await main(['copies'], deps)).toBe(0);
+  const mtime = '2020-09-13T12:26:40.000Z';
+  const at = '2026-10-18T10:00:00.000Z';
+  expect(out().split('\n')).toEqual([
+    'rel_path\tmtime\tdropped_at\tvault_sha256\tstatus',
+    `x/a.jpg\t${mtime}\t${at}\t${sha('a')}\tmismatch`,
+    `y/a.jpg\t${mtime}\t${at}\t${sha('a')}\tremoved`,
+    `z/a.jpg\t${mtime}\t${at}\t${sha('a')}\tpresent`,
+    '',
+  ]);
+});
+
+test('sweep-copies runs CopySweepWorkflow on main and prints its result', async () => {
+  const f = fakeClient();
+  const out = capture('stdout');
+  expect(await main(['sweep-copies'], { temporal: f.client })).toBe(0);
+  expect(f.executed[0]!.workflowType).toBe('CopySweepWorkflow');
+  expect(f.executed[0]!.opts).toMatchObject({ taskQueue: 'main', args: [] });
+  expect(f.executed[0]!.opts.workflowId).toMatch(/^pm-copies-cli-\d+$/);
+  expect(out()).toContain('"gen":4'); // the fake's canned result, printed as is
 });

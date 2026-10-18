@@ -81,7 +81,7 @@
       "gridPos": {
         "x": 4,
         "y": 0,
-        "w": 3,
+        "w": 2,
         "h": 4
       },
       "targets": [
@@ -123,9 +123,9 @@
         "uid": "pixelmagic"
       },
       "gridPos": {
-        "x": 7,
+        "x": 6,
         "y": 0,
-        "w": 3,
+        "w": 2,
         "h": 4
       },
       "targets": [
@@ -168,9 +168,9 @@
         "uid": "pixelmagic"
       },
       "gridPos": {
-        "x": 10,
+        "x": 8,
         "y": 0,
-        "w": 3,
+        "w": 2,
         "h": 4
       },
       "targets": [
@@ -211,9 +211,9 @@
         "uid": "pixelmagic"
       },
       "gridPos": {
-        "x": 13,
+        "x": 10,
         "y": 0,
-        "w": 3,
+        "w": 2,
         "h": 4
       },
       "targets": [
@@ -247,16 +247,16 @@
     },
     {
       "id": 6,
-      "title": "≈ Reclaimable",
+      "title": "Duplicates removed",
       "type": "stat",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "pixelmagic"
       },
       "gridPos": {
-        "x": 16,
+        "x": 12,
         "y": 0,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -269,13 +269,95 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT (\n  coalesce((SELECT sum(g.total - g.largest) FROM (\n     SELECT sum(c.size_bytes) AS total, max(c.size_bytes) AS largest\n     FROM contents c JOIN groups gr ON gr.id = c.copy_group_id\n     WHERE gr.kind = 'copy' AND gr.merged_into IS NULL GROUP BY c.copy_group_id) g), 0)\n  + coalesce((SELECT sum(size_bytes) FROM files WHERE state = 'COPY'), 0)\n)::bigint AS value"
+          "rawSql": "SELECT count(*) FILTER (WHERE copy_removed_at IS NOT NULL) AS removed,\n  coalesce(sum(copy_reclaimed_bytes), 0)::bigint AS reclaimed_bytes,\n  coalesce(sum(size_bytes) FILTER (WHERE copy_removed_at IS NULL AND NOT copy_mismatch), 0)::bigint AS pending_bytes\nFROM files WHERE state = 'COPY'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reclaimed_bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pending_bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "description": "Byte-identical duplicate drops whose vault/.copies file was removed after a fresh re-hash of it and its vault file matched: how many, the bytes reclaimed, and the bytes of duplicates still waiting for removal (the sweep runs every 15 min)."
+    },
+    {
+      "id": 13,
+      "title": "Copy mismatches",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 2,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS value FROM files WHERE copy_mismatch"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "noValue": "n/a",
-          "unit": "bytes"
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
@@ -285,10 +367,10 @@
           "fields": "/^value$/",
           "values": false
         },
-        "colorMode": "value",
+        "colorMode": "background",
         "graphMode": "none"
       },
-      "description": "Approximate: per copy group, sum of sizes minus the largest, plus byte-copy files. Does not repeat the best-copy ranking."
+      "description": "Duplicates NOT removed: a re-hash disagreed with files.sha256, or a file was missing. Both files are kept; the observed hashes are in the row's last_error (Recent errors, make doctor). Should read 0."
     },
     {
       "id": 7,

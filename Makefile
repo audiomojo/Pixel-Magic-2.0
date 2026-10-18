@@ -1,4 +1,5 @@
-.PHONY: test fs-check build up down stage retry-failed verify-vault doctor trickle corpus-manifest corpus-verify \
+.PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
+	corpus-manifest corpus-verify \
 	test-smoke test-standard update-golden golden-smoke chaos
 
 CORPUS := test-automation/sample-images
@@ -30,9 +31,17 @@ retry-failed:
 verify-vault:
 	docker compose exec -T worker node dist/cli.js verify-vault $(if $(SAMPLE),--sample $(SAMPLE),)
 
-# Orphaned work/claimed files and stuck retries.
+# Orphaned work/claimed files, stuck retries and copy mismatches (duplicates kept, see §6.5).
 doctor:
 	docker compose exec -T worker node dist/cli.js doctor
+
+# Every duplicate drop (TSV: rel_path, mtime, dropped_at, vault sha256, removed|present|mismatch).
+copies:
+	docker compose exec -T worker node dist/cli.js copies
+
+# Run one bounded duplicate sweep now (pm-copies runs it every 15 min); prints its counts.
+sweep-copies:
+	docker compose exec -T worker node dist/cli.js sweep-copies
 
 # Live end-to-end check (G6): a HEIC/JPG copy pair lands one in unique/, the other in copies/g-…/.
 # The corpus is only ever cloned from (cp -c), never written.
