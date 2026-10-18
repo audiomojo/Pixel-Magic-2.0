@@ -12,13 +12,14 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   stat,
   statfs,
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { Worker } from 'node:worker_threads';
@@ -100,13 +101,22 @@ export interface SeedFile {
   origin: 'corpus' | 'synthetic' | 'junk' | 'corrupt';
   seedName?: string;
   variant?: 'resize50' | 'q60-noexif' | 'png' | 'bridge';
-  expect?: 'copy' | 'similar';
+  /**
+   * Synthetic ground truth vs `seedName` (§6.3). `copy-or-ambiguous` marks an EXIF-less copy of a
+   * burst frame (spec §12 R3): it ends up a copy of one of `bridges` or `copy_ambiguous`, and the
+   * two `bridges` frames are never in the same copy group.
+   */
+  expect?: 'copy' | 'similar' | 'copy-or-ambiguous';
+  /** `[seedName, its burst partner]` when `expect` is `copy-or-ambiguous`. */
+  bridges?: [string, string];
   reason?: string;
 }
 
 export interface SeedManifest {
   dest: string;
   files: SeedFile[];
+  /** Corpus files byte-copied because the destination can't clone (0 on one APFS volume). */
+  fallbackCopies: number;
 }
 
 /** Spec §10.3: in both subsets. Only files that exist (there is no `IMG_2834.MOV`). */
@@ -195,6 +205,7 @@ const EXIF_TAGS = [
   '-EXIF:DateTimeOriginal',
   '-EXIF:OffsetTimeOriginal',
   '-EXIF:SubSecTimeOriginal',
+  '-EXIF:Orientation',
   '-EXIF:Make',
   '-EXIF:Model',
   '-MakerNotes:BurstUUID',
@@ -323,20 +334,35 @@ function factsOf(name: string, t: Tags): Facts {
   };
 }
 
-/** Records (without size/mtime/sha) for `names` in `dir`: exiftool facts plus sips dimensions. */
-async function describe(dir: string, names: string[]): Promise<Array<Facts & Dims>> {
+type Dims = { width: number | null; height: number | null };
+/** What the pipeline compares beyond the record: exiftool MIME type and EXIF orientation. */
+type Encoding = { mime: string; orientation: number | null };
+
+/**
+ * Record facts (without size/mtime/sha) for `names` in `dir`: exiftool facts plus sips
+ * (stored) dimensions, and in `enc` each file's encoding.
+ */
+async function describe(
+  dir: string,
+  names: string[],
+): Promise<{ facts: Array<Facts & Dims>; enc: Encoding[] }> {
   const tags = await readExif(names.map((n) => join(dir, n)));
   const facts = names.map((n, i) => factsOf(n, tags[i]!));
   const stills = names.filter((_, i) => facts[i]!.kind === 'still');
   const dims = new Map(
     (await readDims(stills.map((n) => join(dir, n)))).map((d, i) => [stills[i]!, d]),
   );
-  return facts.map((f, i) => {
-    const d = dims.get(names[i]!) ?? null;
-    return { ...f, width: d?.[0] ?? null, height: d?.[1] ?? null };
-  });
+  return {
+    facts: facts.map((f, i) => {
+      const d = dims.get(names[i]!) ?? null;
+      return { ...f, width: d?.[0] ?? null, height: d?.[1] ?? null };
+    }),
+    enc: tags.map((t) => ({
+      mime: tagStr(t['File:MIMEType']) ?? '',
+      orientation: typeof t['EXIF:Orientation'] === 'number' ? t['EXIF:Orientation'] : null,
+    })),
+  };
 }
-type Dims = { width: number | null; height: number | null };
 
 // ---------------------------------------------------------------------------------------------
 // Manifest.
@@ -390,7 +416,7 @@ export async function buildManifest(
     const c = cache.entries[l.name];
     return c?.size !== l.size || c.mtimeNs !== l.mtimeNs;
   });
-  const [shas, facts] = await Promise.all([
+  const [shas, { facts }] = await Promise.all([
     hashFiles(fresh.map((l) => join(corpusDir, l.name))),
     describe(
       corpusDir,
@@ -614,21 +640,62 @@ async function freeBytes(dir: string): Promise<bigint> {
   return s.bavail * s.bsize;
 }
 
+/** `statfs().type` of APFS on macOS. */
+const APFS_FSTYPE = 26;
+
 /**
- * APFS clone (`cp -c -p`, never overwriting). When cloning fails (another filesystem), falls
- * back to a byte copy (free space checked first) stamped with the source times; that path
- * keeps mtime only to sub-microsecond precision. `cp` is injectable for tests.
+ * How corpus bytes reach a destination. `clone` must be a real copy-on-write clone; `copy` is
+ * the byte copy used only where `canClone` says cloning is unsupported. Injectable for tests.
  */
-export async function cloneFile(src: string, dest: string, cp = 'cp'): Promise<void> {
-  try {
-    await execFile(cp, ['-c', '-p', '-n', src, dest]);
-  } catch {
+export interface Copier {
+  canClone(srcDir: string, destDir: string): Promise<boolean>;
+  clone(src: string, dest: string): Promise<void>;
+  copy(src: string, dest: string): Promise<void>;
+}
+
+/**
+ * macOS `cp -c` silently falls back to a byte copy when `clonefile(2)` is unsupported (another
+ * volume, HFS+), and Node's `COPYFILE_FICLONE_FORCE` is ENOSYS on macOS. So support is decided
+ * up front: cloning works only within one APFS volume. Then `cp -c -p -n` clones, and any
+ * error it reports is fatal.
+ */
+export const defaultCopier: Copier = {
+  async canClone(srcDir, destDir) {
+    const [a, b, fs] = await Promise.all([stat(srcDir), stat(destDir), statfs(destDir)]);
+    return a.dev === b.dev && fs.type === APFS_FSTYPE;
+  },
+  async clone(src, dest) {
+    await execFile('cp', ['-c', '-p', '-n', src, dest]);
+  },
+  /** Byte copy stamped with the source times (mtime to sub-microsecond precision). */
+  async copy(src, dest) {
     const s = await stat(src, { bigint: true });
     if ((await freeBytes(dirname(dest))) < s.size + MIN_FREE_BYTES)
       throw new Error(`not enough free space to copy ${basename(src)}`);
     await copyFile(src, dest, constants.COPYFILE_EXCL);
     const secs = (ns: bigint) => Number(ns) / 1e9;
     await utimes(dest, secs(s.atimeNs), secs(s.mtimeNs));
+  },
+};
+
+/** `p` resolved through symlinks, even when its tail doesn't exist yet. */
+async function realpathLoose(p: string): Promise<string> {
+  const abs = resolve(p);
+  try {
+    return await realpath(abs);
+  } catch {
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(await realpathLoose(parent), basename(abs));
+  }
+}
+
+/** Throws unless `dest` and `dest/..` (where manifests are written) lie outside the corpus. */
+export async function assertOutsideCorpus(corpusDir: string, dest: string): Promise<void> {
+  const corpus = await realpath(corpusDir);
+  for (const p of [dest, dirname(resolve(dest))]) {
+    const rel = relative(corpus, await realpathLoose(p));
+    if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)))
+      throw new Error(`refusing to write inside the corpus: ${p}`);
   }
 }
 
@@ -670,11 +737,17 @@ async function hashed(
 
 /**
  * Clones `names` from the corpus into `dest` (flat or nested), in an order shuffled by
- * `shuffle`, then adds junk / corrupt extras and synthetic variants. Never overwrites.
+ * `shuffle`, then adds junk / corrupt extras and synthetic variants. Never overwrites, never
+ * writes inside the corpus. Byte copies happen only where cloning is unsupported; they are
+ * warned about and counted in `fallbackCopies`.
  */
-export async function seed(opts: SeedOptions): Promise<SeedManifest> {
+export async function seed(
+  opts: SeedOptions,
+  copier: Copier = defaultCopier,
+): Promise<SeedManifest> {
   const { corpusDir, dest } = opts;
   const prefix = opts.prefix ?? '';
+  await assertOutsideCorpus(corpusDir, dest);
   await mkdir(dest, { recursive: true });
   if ((await freeBytes(dest)) < MIN_FREE_BYTES) throw new Error(`less than 1 GiB free at ${dest}`);
   for (const n of opts.names) await stat(join(corpusDir, n)); // fail early, naming the file
@@ -682,12 +755,20 @@ export async function seed(opts: SeedOptions): Promise<SeedManifest> {
   const order =
     opts.shuffle === undefined ? [...opts.names] : shuffled(opts.names, prng(opts.shuffle));
   const rel = (n: string) => (opts.layout === 'nested' ? `${bucketOf(n)}/${n}` : n);
+  const clones = await copier.canClone(corpusDir, dest);
   for (const n of order) {
     const target = join(dest, rel(n));
     await mkdir(dirname(target), { recursive: true });
     if (await exists(target)) throw new Error(`refusing to overwrite ${target}`);
-    await cloneFile(join(corpusDir, n), target);
+    await (clones
+      ? copier.clone(join(corpusDir, n), target)
+      : copier.copy(join(corpusDir, n), target));
   }
+  const fallbackCopies = clones ? 0 : order.length;
+  if (fallbackCopies > 0)
+    console.warn(
+      `WARNING: ${dest} can't clone from ${corpusDir} (not one APFS volume): made ${fallbackCopies} byte copies`,
+    );
   const items: Parameters<typeof hashed>[1] = order.map((n) => ({
     relPath: rel(n),
     origin: 'corpus',
@@ -696,7 +777,7 @@ export async function seed(opts: SeedOptions): Promise<SeedManifest> {
   if (opts.extras?.includes('corrupt')) items.push(...(await writeCorrupt(dest, prefix)));
   const files = await hashed(dest, items);
   if (opts.synthetic) files.push(...(await synthesize(corpusDir, opts.names, dest, prefix)));
-  return { dest, files };
+  return { dest, files, fallbackCopies };
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -771,9 +852,53 @@ async function decodable(src: string, tmp: string): Promise<string> {
   return out;
 }
 
+/** The facts §6.3 compares for a pair; `width`/`height` are as displayed (EXIF-oriented). */
+export interface TruthFacts {
+  capturedAt: string | null;
+  subsec: string | null;
+  camera: string | null;
+  burstUuid: string | null;
+  width: number | null;
+  height: number | null;
+  mime: string;
+}
+
 /**
- * Variants of real seeds, all copies of their seed by ground truth: 50% resize keeping EXIF,
- * q60 with EXIF stripped, PNG, and an EXIF-stripped export of one burst frame (the bridge case).
+ * The §6.3 classification of a pair that is already within the *copy* hash distances (true of
+ * a synthetic variant and its seed by construction). Rows top to bottom, first match wins.
+ */
+export function expectedRelation(a: TruthFacts, b: TruthFacts): 'copy' | 'similar' {
+  const both = <T>(x: T | null, y: T | null) => x !== null && y !== null;
+  const sec = (t: string) => Math.floor(Date.parse(t) / 1000);
+  const otherEncoding = a.width !== b.width || a.height !== b.height || a.mime !== b.mime;
+  if (both(a.burstUuid, b.burstUuid) && a.burstUuid === b.burstUuid) return 'similar';
+  const captured = a.capturedAt !== null && b.capturedAt !== null;
+  if (captured && sec(a.capturedAt!) !== sec(b.capturedAt!)) return 'similar';
+  if (both(a.subsec, b.subsec) && a.subsec !== b.subsec) return 'similar';
+  if (both(a.camera, b.camera) && a.camera !== b.camera) return 'similar';
+  if (captured) return both(a.subsec, b.subsec) || otherEncoding ? 'copy' : 'similar';
+  if (a.capturedAt !== null || b.capturedAt !== null) return 'copy';
+  return otherEncoding ? 'copy' : 'similar';
+}
+
+function truthFacts(f: Facts & Dims, e: Encoding): TruthFacts {
+  const swap = e.orientation !== null && e.orientation >= 5 && e.orientation <= 8;
+  return {
+    capturedAt: f.capturedAt,
+    subsec: f.subsec,
+    camera: f.camera,
+    burstUuid: f.burstUuid,
+    width: swap ? f.height : f.width,
+    height: swap ? f.width : f.height,
+    mime: e.mime,
+  };
+}
+
+/**
+ * Variants of real seeds: 50% resize keeping EXIF, q60 with EXIF stripped, PNG keeping EXIF,
+ * and an EXIF-stripped export of one burst frame (the bridge case). Each variant's `expect` is
+ * derived from §6.3 on the seed's and the variant's own exiftool/sips facts; an EXIF-less copy
+ * of a burst frame whose partner is also seeded is `copy-or-ambiguous` with `bridges`.
  */
 export async function synthesize(
   corpusDir: string,
@@ -781,9 +906,11 @@ export async function synthesize(
   dest: string,
   prefix = '',
 ): Promise<SeedFile[]> {
+  await assertOutsideCorpus(corpusDir, dest);
+  await mkdir(dest, { recursive: true });
   const stills = names.filter((n) => SYNTH_STILL_EXT.has(extOf(n))).sort();
   if (stills.length === 0) return [];
-  const facts = await describe(corpusDir, stills);
+  const { facts, enc } = await describe(corpusDir, stills);
   const recs = stills.map((name, i) => ({
     name,
     size: '0',
@@ -791,10 +918,16 @@ export async function synthesize(
     sha256: name,
     ...facts[i]!,
   }));
+  const truth = new Map(stills.map((n, i) => [n, truthFacts(facts[i]!, enc[i]!)]));
+  const burst = buildRelations(recs.filter((r) => r.kind === 'still')).burst;
+  const partnerOf = (n: string) => burst.find((p) => p.includes(n))?.find((x) => x !== n);
   const seeds = recs.filter((r) => r.kind === 'still').slice(0, SYNTH_SEEDS);
-  const frame = buildRelations(recs.filter((r) => r.kind === 'still')).burst[0]?.[0];
   const tmp = await mkdtemp(join(tmpdir(), 'pm-synth-'));
-  const items: Item[] = [];
+  const made: Array<{
+    relPath: string;
+    seedName: string;
+    variant: NonNullable<SeedFile['variant']>;
+  }> = [];
   try {
     const emit = async (
       seedName: string,
@@ -807,7 +940,7 @@ export async function synthesize(
       const { autoOrient } = await sharp(input).metadata();
       const out = await render(sharp(input).rotate(), autoOrient.width).toBuffer();
       await writeFile(join(dest, relPath), out, { flag: 'wx' });
-      items.push({ relPath, origin: 'synthetic', seedName, variant, expect: 'copy' });
+      made.push({ relPath, seedName, variant });
     };
     for (const { name } of seeds) {
       await emit(name, 'resize50', 'jpg', (img, w) =>
@@ -819,10 +952,23 @@ export async function synthesize(
       await emit(name, 'q60-noexif', 'jpg', (img) => img.jpeg({ quality: 60 }));
       await emit(name, 'png', 'png', (img) => img.keepExif().png());
     }
+    const frame = burst[0]?.[0];
     if (frame !== undefined) await emit(frame, 'bridge', 'jpg', (img) => img.jpeg({ quality: 85 }));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+  const out = await describe(
+    dest,
+    made.map((m) => m.relPath),
+  );
+  const items: Item[] = made.map((m, i) => {
+    const v = truthFacts(out.facts[i]!, out.enc[i]!);
+    const rel = expectedRelation(truth.get(m.seedName)!, v);
+    const partner = partnerOf(m.seedName);
+    return rel === 'copy' && v.capturedAt === null && partner !== undefined
+      ? { ...m, origin: 'synthetic', expect: 'copy-or-ambiguous', bridges: [m.seedName, partner] }
+      : { ...m, origin: 'synthetic', expect: rel };
+  });
   return hashed(dest, items);
 }
 

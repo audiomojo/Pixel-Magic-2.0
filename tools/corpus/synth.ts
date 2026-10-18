@@ -1,6 +1,6 @@
 /**
  * `tsx tools/corpus/synth.ts --dest DIR [--subset smoke|standard] [--seed N] [--prefix P]`
- * Writes synthetic variants of real seeds into DIR and appends their ground truth to
+ * Writes synthetic variants of real seeds into DIR (created; never inside the corpus) and appends their ground truth to
  * DIR/../seed-manifest.json (created if absent).
  */
 import { readFile, writeFile } from 'node:fs/promises';
@@ -31,7 +31,7 @@ const files = await synthesize(values.corpus, names, dest, values.prefix);
 const out = join(dirname(dest), 'seed-manifest.json');
 const sm = await readFile(out, 'utf8')
   .then((s) => JSON.parse(s) as SeedManifest)
-  .catch((): SeedManifest => ({ dest, files: [] }));
+  .catch((): SeedManifest => ({ dest, files: [], fallbackCopies: 0 }));
 sm.files.push(...files);
 await writeFile(out, JSON.stringify(sm, null, 1));
 console.log(`wrote ${files.length} synthetic variants into ${dest}; updated ${out}`);

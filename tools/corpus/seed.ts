@@ -52,4 +52,6 @@ if (values.shuffle !== undefined) opts.shuffle = Number(values.shuffle);
 const sm = await seed(opts);
 const out = join(dirname(dest), 'seed-manifest.json');
 await writeFile(out, JSON.stringify(sm, null, 1));
-console.log(`seeded ${sm.files.length} files into ${dest}; wrote ${out}`);
+console.log(
+  `seeded ${sm.files.length} files into ${dest} (${sm.fallbackCopies} byte copies); wrote ${out}`,
+);

@@ -8,17 +8,22 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import sharp from 'sharp';
-import { beforeAll, describe, expect, test } from 'vitest';
+import { beforeAll, describe, expect, test, vi } from 'vitest';
 import {
   PINNED,
   buildManifest,
   buildRelations,
-  cloneFile,
+  defaultCopier,
+  expectedRelation,
+  synthesize,
+  type Copier,
+  type TruthFacts,
   loadManifest,
   seed,
   selectSubsets,
@@ -182,6 +187,37 @@ describe('relations', () => {
       ['IMG_1.HEIC', 'other.MOV'],
       ['IMG_2.HEIC', 'IMG_2.MOV'],
     ]);
+  });
+});
+
+describe('expectedRelation (§6.3, for a pair within the copy thresholds)', () => {
+  const base: TruthFacts = {
+    capturedAt: '2021-10-03T14:02:11.000Z',
+    subsec: '120',
+    camera: 'Apple iPhone 12',
+    burstUuid: null,
+    width: 4032,
+    height: 3024,
+    mime: 'image/heic',
+  };
+  const jpgHalf = { width: 2016, height: 1512, mime: 'image/jpeg' };
+  const none = { capturedAt: null, subsec: null, camera: null };
+  test.each<[string, Partial<TruthFacts>, Partial<TruthFacts>, 'copy' | 'similar']>([
+    ['same BurstUUID', { burstUuid: 'u' }, { burstUuid: 'u', ...jpgHalf }, 'similar'],
+    ['different second', {}, { capturedAt: '2021-10-03T14:02:12.000Z' }, 'similar'],
+    ['same second, ms ignored', {}, { capturedAt: '2021-10-03T14:02:11.900Z' }, 'copy'],
+    ['different subsec', {}, { subsec: '480' }, 'similar'],
+    ['different camera', {}, { camera: 'Canon', ...jpgHalf }, 'similar'],
+    ['same capture and subsec', {}, {}, 'copy'],
+    ['subsec missing, other encoding', {}, { subsec: null, ...jpgHalf }, 'copy'],
+    ['subsec missing, same encoding', {}, { subsec: null }, 'similar'],
+    ['one side has no capture', {}, { ...none }, 'copy'],
+    ['neither has capture, other mime', none, { ...none, mime: 'image/jpeg' }, 'copy'],
+    ['neither has capture, other size', none, { ...none, width: 2016 }, 'copy'],
+    ['neither has capture, same encoding', none, { ...none }, 'similar'],
+  ])('%s', (_, a, b, want) => {
+    expect(expectedRelation({ ...base, ...a }, { ...base, ...b })).toBe(want);
+    expect(expectedRelation({ ...base, ...b }, { ...base, ...a })).toBe(want);
   });
 });
 
@@ -369,7 +405,22 @@ describe('seed', () => {
     expect(variants('a.jpg')).toEqual(['png', 'q60-noexif', 'resize50']);
     expect(variants('e.heic')).toEqual(['png', 'q60-noexif', 'resize50']);
     expect(variants('b.jpg')).toEqual(['bridge', 'png', 'q60-noexif', 'resize50']);
-    expect(synth.every((f) => f.expect === 'copy' && f.name.startsWith('z-'))).toBe(true);
+    expect(synth.every((f) => f.name.startsWith('z-'))).toBe(true);
+    const truthOf = (seedName: string, variant: string) =>
+      synth
+        .filter((f) => f.seedName === seedName && f.variant === variant)
+        .map((f) => [f.expect, f.bridges ?? null]);
+    // a.jpg has no capture time: a same-size, same-mime re-encode is only "similar" (§6.3 row 8).
+    expect(truthOf('a.jpg', 'resize50')).toEqual([['copy', null]]);
+    expect(truthOf('a.jpg', 'q60-noexif')).toEqual([['similar', null]]);
+    expect(truthOf('a.jpg', 'png')).toEqual([['copy', null]]);
+    expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy', null]]);
+    // b.jpg and c.jpg are a burst: EXIF-kept variants are copies, EXIF-less ones are bridges.
+    expect(truthOf('b.jpg', 'resize50')).toEqual([['copy', null]]);
+    expect(truthOf('b.jpg', 'png')).toEqual([['copy', null]]);
+    expect(truthOf('b.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
+    expect(truthOf('b.jpg', 'bridge')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
+    expect(truthOf('c.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['c.jpg', 'b.jpg']]]);
     const resized = synth.find((f) => f.seedName === 'b.jpg' && f.variant === 'resize50')!;
     const meta = await sharp(join(dest, resized.relPath)).metadata();
     expect([meta.width, meta.height, meta.exif !== undefined]).toEqual([32, 24, true]);
@@ -386,13 +437,79 @@ describe('seed', () => {
     expect(one.files.map(key).sort()).toEqual(two.files.map(key).sort());
   });
 
-  test('clone falls back to a byte copy that keeps the mtime', async () => {
+  test('same-stem HEIC and JPG seeds get distinct variant names', async () => {
     const src = await makeCorpus();
-    const dest = join(tmp, 'fallback.jpg');
-    await cloneFile(join(src, 'a.jpg'), dest, '/usr/bin/false');
-    expect(await readFile(dest)).toEqual(await readFile(join(src, 'a.jpg')));
-    const [s, d] = await Promise.all([stat(join(src, 'a.jpg')), stat(dest)]);
-    expect(Math.abs(d.mtimeMs - s.mtimeMs)).toBeLessThan(0.01);
+    await copyFile(join(src, 'a.jpg'), join(src, 'e.jpg'));
+    const dest = join(tmp, 'dz-stem');
+    const files = await synthesize(src, ['e.heic', 'e.jpg'], dest);
+    expect(files.map((f) => f.name).sort()).toEqual([
+      'synth-png-e_heic.png',
+      'synth-png-e_jpg.png',
+      'synth-q60-noexif-e_heic.jpg',
+      'synth-q60-noexif-e_jpg.jpg',
+      'synth-resize50-e_heic.jpg',
+      'synth-resize50-e_jpg.jpg',
+    ]);
+  });
+
+  test('a tmp dir on APFS clones: no fallback copies', async () => {
+    const src = await makeCorpus();
+    const sm = await seed({ corpusDir: src, names: ['a.jpg', 'b.jpg'], dest: join(tmp, 'cl') });
+    expect(sm.fallbackCopies).toBe(0);
+    expect(await defaultCopier.canClone(src, join(tmp, 'cl'))).toBe(true);
+  });
+
+  test('byte copy only where cloning is unsupported, loudly counted', async () => {
+    const src = await makeCorpus();
+    const calls: string[] = [];
+    const copier: Copier = {
+      canClone: () => Promise.resolve(false),
+      clone: () => Promise.reject(new Error('must not clone')),
+      copy: (a, b) => (calls.push(basename(a)), defaultCopier.copy(a, b)),
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const dest = join(tmp, 'fb');
+      const sm = await seed({ corpusDir: src, names: ['a.jpg', 'b.jpg'], dest }, copier);
+      expect(sm.fallbackCopies).toBe(2);
+      expect(calls.sort()).toEqual(['a.jpg', 'b.jpg']);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/2 .*byte cop/));
+      expect(await readFile(join(dest, 'a.jpg'))).toEqual(await readFile(join(src, 'a.jpg')));
+      const [s, d] = await Promise.all([stat(join(src, 'a.jpg')), stat(join(dest, 'a.jpg'))]);
+      expect(Math.abs(d.mtimeMs - s.mtimeMs)).toBeLessThan(0.01);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('a clone failure where cloning is supported is fatal, never a silent copy', async () => {
+    const src = await makeCorpus();
+    const copier: Copier = {
+      canClone: () => Promise.resolve(true),
+      clone: () => Promise.reject(new Error('EIO: clone broke')),
+      copy: () => Promise.reject(new Error('must not copy')),
+    };
+    await expect(
+      seed({ corpusDir: src, names: ['a.jpg'], dest: join(tmp, 'fatal') }, copier),
+    ).rejects.toThrow(/clone broke/);
+  });
+
+  test('destinations inside the corpus are refused', async () => {
+    const src = await makeCorpus();
+    const before = await snapshot(src);
+    await expect(seed({ corpusDir: src, names: ['a.jpg'], dest: join(src, 'dz') })).rejects.toThrow(
+      /inside the corpus/,
+    );
+    await expect(
+      seed({ corpusDir: src, names: ['a.jpg'], dest: join(src, 'deep', 'er', 'dz') }),
+    ).rejects.toThrow(/inside the corpus/);
+    const link = join(tmp, `link-${corpusSeq}`);
+    await symlink(src, link);
+    await expect(
+      seed({ corpusDir: src, names: ['a.jpg'], dest: join(link, 'x', 'dz') }),
+    ).rejects.toThrow(/inside the corpus/);
+    await expect(synthesize(src, ['a.jpg'], join(src, 'syn'))).rejects.toThrow(/inside the corpus/);
+    expect(await snapshot(src)).toEqual(before);
   });
 
   test('seed rejects a missing source and an existing destination file', async () => {
