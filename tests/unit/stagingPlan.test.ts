@@ -159,6 +159,47 @@ test('a paired MOV follows a quarantined still', () => {
   ]);
 });
 
+for (const [state, reason, folder] of [
+  ['QUARANTINED', 'truncated', 'quarantine/truncated'],
+  ['FAILED', null, 'quarantine/failed'],
+] as const)
+  test(`a paired MOV follows a ${state} still whose sha sorts after the motion's`, () => {
+    const s = C('6'.repeat(64), {
+      liveContentId: 'L1',
+      state,
+      quarantineReason: reason,
+      copyGroup: null,
+    });
+    const m = C('5'.repeat(64), {
+      kind: 'motion',
+      ext: 'mov',
+      liveContentId: 'L1',
+      copyGroup: null,
+      state: 'INGESTED',
+    });
+    expect(dests(planStaging([s, m], [Fl(1n, 'A.HEIC', s), Fl(2n, 'B.MOV', m)], 5))).toEqual([
+      `${folder}/A.HEIC`,
+      `${folder}/A.MOV`,
+    ]);
+  });
+
+test('naming file: lowest (relPath, mtimeNs, fileId) — a re-drop with an older mtime names it', () => {
+  const c = C('a'.repeat(64), { capturedAt: null });
+  const at = (iso: string) => BigInt(Date.parse(iso)) * 1_000_000n;
+  const files = (newId: bigint, oldId: bigint) => [
+    Fl(newId, 'N.HEIC', c, { mtimeNs: at('2020-03-01T00:00:00Z') }),
+    Fl(oldId, 'N.HEIC', c, { mtimeNs: at('2020-01-01T00:00:00Z'), state: 'COPY' }),
+  ];
+  for (const [n, o] of [
+    [1n, 2n],
+    [2n, 1n],
+  ] as const)
+    expect(planStaging([c], files(n, o), 5)).toEqual([
+      { dest: 'copies/g-aaaaaaaa/N.HEIC', src: vaultRel(c.sha256, 'heic') },
+      { dest: 'unique/2020/2020-01/20200101_000000_N.HEIC', src: vaultRel(c.sha256, 'heic') },
+    ]);
+});
+
 test('stem fallback is exact and duration-bounded', () => {
   const s1 = C('1'.repeat(64)),
     s2 = C('2'.repeat(64));
@@ -462,6 +503,8 @@ const world: fc.Arbitrary<World> = fc
             name: fc.constantFrom(...NAMES),
             dir: fc.constantFrom(...DIRS),
             copy: fc.boolean(),
+            day: fc.constantFrom(0, 40),
+            redrop: fc.boolean(),
           }),
           { minLength: 1, maxLength: 3 },
         ),
@@ -492,10 +535,15 @@ const world: fc.Arbitrary<World> = fc
         sizeBytes: r.size,
       });
       contents.push(c);
+      let prev = '';
       r.files.forEach((f, j) => {
-        const relPath = f.dir + f.name;
-        // mtime is a function of the path: two drops at one path differ only by arrival order
-        const mtimeNs = BigInt(relPath.length) * 1_000_000_000_000_000n;
+        // a re-drop of the same bytes at the previous drop's path (new row, maybe a new mtime)
+        const relPath = j > 0 && f.redrop ? prev : f.dir + f.name;
+        prev = relPath;
+        // mtime varies per drop, independently of the path: two drops at one path with equal
+        // bytes may differ in mtime (and, without captured_at, in staged date)
+        const mtimeNs =
+          BigInt(Date.parse('2020-01-01T00:00:00Z') + f.day * 86_400_000) * 1_000_000n;
         files.push(Fl(id++, relPath, c, { state: j > 0 && f.copy ? 'COPY' : 'INGESTED', mtimeNs }));
       });
     });
@@ -551,6 +599,6 @@ test('the tree is independent of arrival order and group ids (property)', () => 
         expect(a.map((e) => e.dest)).toEqual(a.map((e) => e.dest).sort());
       },
     ),
-    { numRuns: 300 },
+    { numRuns: 1000 },
   );
 });

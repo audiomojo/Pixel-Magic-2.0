@@ -1,4 +1,5 @@
-import { link, mkdir, readdir, readlink, rename, rm, symlink, unlink } from 'node:fs/promises';
+import { link, mkdir, readdir, readlink, rename, rmdir, symlink, unlink } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname, join } from 'node:path';
 import { heartbeat } from '@temporalio/activity';
 import type pg from 'pg';
@@ -9,6 +10,7 @@ import type { Deps } from './index.js';
 
 const GEN = /^\.gen-(\d+)$/;
 const HEARTBEAT_EVERY = 1000;
+const LOCK_POLL_MS = 250;
 
 /** A planned source is missing: the vault disagrees with the database. Retryable, never hidden. */
 export class MissingSourceError extends Error {
@@ -19,6 +21,8 @@ interface Snapshot {
   /** `greatest(max(files.updated_at), max(contents.updated_at))` as text (full µs precision). */
   watermark: string;
   version: bigint;
+  /** `pg_current_snapshot()` of the read transaction: which commits these facts include. */
+  snapshot: string;
   changed: boolean;
   lastGen: number | null;
   sinceLastS: number | null;
@@ -36,6 +40,7 @@ export function makeStaging(deps: Deps) {
     const r = await c.query<{
       watermark: string;
       version: bigint;
+      snapshot: string;
       changed: boolean;
       last_gen: bigint | null;
       since_s: number | null;
@@ -44,10 +49,17 @@ export function makeStaging(deps: Deps) {
          SELECT coalesce(greatest((SELECT max(updated_at) FROM files),
                                   (SELECT max(updated_at) FROM contents)),
                          'epoch'::timestamptz) AS watermark,
-                (SELECT version FROM cluster_state WHERE id = 1) AS version),
+                (SELECT version FROM cluster_state WHERE id = 1) AS version,
+                pg_current_snapshot() AS snapshot),
        b AS (SELECT * FROM staging_builds ORDER BY gen DESC LIMIT 1)
-       SELECT w.watermark::text AS watermark, w.version,
-              (b.gen IS NULL OR w.watermark > b.watermark OR w.version <> b.cluster_version) AS changed,
+       SELECT w.watermark::text AS watermark, w.version, w.snapshot::text AS snapshot,
+              (b.gen IS NULL OR b.snapshot IS NULL OR w.version <> b.cluster_version
+                 OR w.watermark > b.watermark
+                 OR EXISTS (SELECT 1 FROM files
+                             WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
+                 OR EXISTS (SELECT 1 FROM contents
+                             WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
+              ) AS changed,
               b.gen AS last_gen,
               extract(epoch FROM clock_timestamp() - b.built_at)::float8 AS since_s
          FROM w LEFT JOIN b ON true`,
@@ -56,6 +68,7 @@ export function makeStaging(deps: Deps) {
     return {
       watermark: row.watermark,
       version: row.version,
+      snapshot: row.snapshot,
       changed: row.changed,
       lastGen: row.last_gen === null ? null : Number(row.last_gen),
       sinceLastS: row.since_s,
@@ -183,6 +196,40 @@ export function makeStaging(deps: Deps) {
     }
   }
 
+  /** Removes `.gen-<n>` bottom-up (staging links only), heartbeating every 1,000 removals. */
+  async function removeGen(n: number): Promise<void> {
+    let count = 0;
+    const tick = () => {
+      if (++count % HEARTBEAT_EVERY === 0) heartbeat(`rm .gen-${String(n)}`);
+    };
+    const walk = async (dir: string): Promise<void> => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) await walk(p);
+        else await unlink(p);
+        tick();
+      }
+      await rmdir(dir);
+    };
+    try {
+      await walk(genPath(n));
+    } catch (e) {
+      if (!isEnoent(e)) throw e;
+    }
+  }
+
+  /** Takes the session advisory lock, heartbeating while another build holds it. */
+  async function lock(c: pg.PoolClient): Promise<void> {
+    for (;;) {
+      const r = await c.query<{ ok: boolean }>(
+        `SELECT pg_try_advisory_lock(hashtext('pm.stage')) AS ok`,
+      );
+      if (r.rows[0]!.ok) return;
+      heartbeat('waiting for pm.stage');
+      await sleep(LOCK_POLL_MS);
+    }
+  }
+
   async function buildLocked(c: pg.PoolClient, force: boolean): Promise<BuildResult> {
     await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     let snap: Snapshot;
@@ -195,10 +242,15 @@ export function makeStaging(deps: Deps) {
           (snap.sinceLastS !== null &&
             snap.sinceLastS < settings.stageMaxStalenessS &&
             (await runningFileWorkflows()) > 0));
-      if (skip) return { gen: null, entries: 0, skipped: true };
+      if (skip) {
+        await c.query('COMMIT');
+        return { gen: null, entries: 0, skipped: true };
+      }
       facts = await loadFacts(c);
-    } finally {
       await c.query('COMMIT');
+    } catch (e) {
+      await c.query('ROLLBACK').catch(() => undefined); // never mask the original error
+      throw e;
     }
 
     // Orphans: generations no build recorded, except the one `current` still points at.
@@ -208,8 +260,7 @@ export function makeStaging(deps: Deps) {
       ),
     );
     const live = await currentGen();
-    for (const g of await gensOnDisk())
-      if (!recorded.has(g) && g !== live) await rm(genPath(g), { recursive: true, force: true });
+    for (const g of await gensOnDisk()) if (!recorded.has(g) && g !== live) await removeGen(g);
     await unlink(tmpLink).catch((e: unknown) => {
       if (!isEnoent(e)) throw e;
     });
@@ -220,35 +271,38 @@ export function makeStaging(deps: Deps) {
       await mkdir(genPath(gen));
       await linkAll(genPath(gen), entries);
     } catch (e) {
-      await rm(genPath(gen), { recursive: true, force: true }); // never recorded: an orphan
+      await removeGen(gen); // never recorded: an orphan
       throw e;
     }
     await symlink(`.gen-${String(gen)}`, tmpLink);
     await rename(tmpLink, currentPath);
     await fsyncDir(layout.staging);
     await c.query(
-      `INSERT INTO staging_builds (gen, watermark, cluster_version, built_at, entries)
-       VALUES ($1, $2::timestamptz, $3, clock_timestamp(), $4)`,
-      [gen, snap.watermark, snap.version, entries.length],
+      `INSERT INTO staging_builds (gen, watermark, cluster_version, snapshot, built_at, entries)
+       VALUES ($1, $2::timestamptz, $3, $4::pg_snapshot, clock_timestamp(), $5)`,
+      [gen, snap.watermark, snap.version, snap.snapshot, entries.length],
     );
     // Keep the new generation and the previous one (still open in someone's browser, maybe).
-    for (const g of await gensOnDisk())
-      if (g !== gen && g !== live) await rm(genPath(g), { recursive: true, force: true });
+    for (const g of await gensOnDisk()) if (g !== gen && g !== live) await removeGen(g);
     return { gen, entries: entries.length, skipped: false };
   }
 
   /** Queue `io`. Rebuilds `staging/current` from the database when anything changed (or `force`). */
   return async function maybeBuildStaging(force: boolean): Promise<BuildResult> {
     const c = await pool.connect();
+    let failure: Error | undefined;
     try {
-      await c.query(`SELECT pg_advisory_lock(hashtext('pm.stage'))`);
+      await lock(c);
       try {
         return await buildLocked(c, force);
       } finally {
         await c.query(`SELECT pg_advisory_unlock(hashtext('pm.stage'))`);
       }
+    } catch (e) {
+      failure = e instanceof Error ? e : new Error(String(e));
+      throw e;
     } finally {
-      c.release();
+      c.release(failure); // a failed client is discarded, not returned to the pool
     }
   };
 }

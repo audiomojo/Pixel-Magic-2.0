@@ -89,8 +89,9 @@ export function compareBestCopy(a: BestCopyKey, b: BestCopyKey): number {
   return cmpStr(a[7], b[7]);
 }
 
+/** Naming-file order `(relPath, mtimeNs, fileId)`: `fileId` (arrival order) only breaks true ties. */
 const cmpFile = (a: StageFile, b: StageFile): number =>
-  cmpStr(a.relPath, b.relPath) || cmpDesc(b.fileId, a.fileId);
+  cmpStr(a.relPath, b.relPath) || cmpDesc(b.mtimeNs, a.mtimeNs) || cmpDesc(b.fileId, a.fileId);
 
 const lastSlash = (p: string): number => p.lastIndexOf('/');
 const dirOf = (relPath: string): string => relPath.slice(0, Math.max(0, lastSlash(relPath)));
@@ -189,12 +190,17 @@ interface Request {
   name: string;
   sha: string;
   relPath: string;
+  mtimeNs: bigint;
   fileId: bigint;
   src: string;
 }
 
+/** Collision order `(sha256, relPath)`, then the naming-file tie-breaks, so a content's naming file is its first claimant. */
 const cmpRequest = (a: Request, b: Request): number =>
-  cmpStr(a.sha, b.sha) || cmpStr(a.relPath, b.relPath) || cmpDesc(b.fileId, a.fileId);
+  cmpStr(a.sha, b.sha) ||
+  cmpStr(a.relPath, b.relPath) ||
+  cmpDesc(b.mtimeNs, a.mtimeNs) ||
+  cmpDesc(b.fileId, a.fileId);
 
 /** Collision-free names: dests compare NFC + case-insensitively (APFS), whatever the host. */
 class Namer {
@@ -245,6 +251,7 @@ export function planStaging(
     name,
     sha: f.sha256,
     relPath: f.relPath,
+    mtimeNs: f.mtimeNs,
     fileId: f.fileId,
     src: f.srcRel,
   });
@@ -287,20 +294,22 @@ export function planStaging(
   const stillsOf = new Map<string, string[]>();
   for (const [still, motion] of pairs)
     stillsOf.set(motion, [...(stillsOf.get(motion) ?? []), still]);
-  const besideMotions: StageContent[] = [];
+  const vcopies = (c: StageContent) => `copies/v-${sha8(c.sha256)}`;
   for (const c of staged) {
     const name = namingFile(c).originalName;
-    const vcopies = `copies/v-${sha8(c.sha256)}`;
     if (c.state === 'QUARANTINED')
-      place(c, `quarantine/${reasonDir(c.quarantineReason)}`, name, vcopies);
-    else if (c.state === 'FAILED') place(c, 'quarantine/failed', name, vcopies);
-    else if (c.kind !== 'still' && c.state === 'INGESTED') {
-      if (c.kind === 'motion' && (stillsOf.get(c.sha256) ?? []).some((s) => placementOf.has(s)))
-        besideMotions.push(c);
-      else {
-        const dir = dirOf(namingFile(c).relPath);
-        place(c, dir === '' ? 'other' : `other/${dir}`, name, vcopies);
-      }
+      place(c, `quarantine/${reasonDir(c.quarantineReason)}`, name, vcopies(c));
+    else if (c.state === 'FAILED') place(c, 'quarantine/failed', name, vcopies(c));
+  }
+  // Every still placement is known now, so a motion's home never depends on sha order.
+  const besideMotions: StageContent[] = [];
+  for (const c of staged) {
+    if (c.kind === 'still' || c.state !== 'INGESTED') continue;
+    if (c.kind === 'motion' && (stillsOf.get(c.sha256) ?? []).some((s) => placementOf.has(s)))
+      besideMotions.push(c);
+    else {
+      const dir = dirOf(namingFile(c).relPath);
+      place(c, dir === '' ? 'other' : `other/${dir}`, namingFile(c).originalName, vcopies(c));
     }
   }
 

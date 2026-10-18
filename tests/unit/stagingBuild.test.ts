@@ -229,6 +229,24 @@ test('skips when unchanged; a cluster_state bump counts as a change', async () =
   expect(await build(false)).toMatchObject({ skipped: true, gen: null });
 });
 
+test('a write committed after a later write still triggers a rebuild', async () => {
+  await seedPipelineRows();
+  await build(true);
+  const [t1, t2] = [await pool.connect(), await pool.connect()];
+  try {
+    await t1.query('BEGIN');
+    await t1.query(`UPDATE files SET state = state WHERE rel_path = 'p/IMG_1.JPG'`); // writes t1
+    await t2.query(`UPDATE files SET state = state WHERE rel_path = 'p/IMG_1.AAE'`); // t2 > t1, commits
+    expect((await build(false)).skipped).toBe(false); // sees t2, not T1's uncommitted row
+    await t1.query('COMMIT'); // max(updated_at) is still t2
+    expect((await build(false)).skipped).toBe(false);
+    expect((await build(false)).skipped).toBe(true);
+  } finally {
+    t1.release();
+    t2.release();
+  }
+});
+
 test('a first build runs even with an empty database', async () => {
   expect(await build(false)).toEqual({ gen: 1, entries: 0, skipped: false });
   expect(await readdir(join(layout.staging, 'current'))).toEqual([]);
@@ -255,6 +273,18 @@ test('waits while FileWorkflows run, unless stale', async () => {
       )
     ).skipped,
   ).toBe(false);
+});
+
+test('a failure inside the read transaction surfaces as is, and the next build works', async () => {
+  await seedPipelineRows();
+  await build(true);
+  await pool.query(`UPDATE files SET state = state`);
+  const down = {
+    workflow: { count: () => Promise.reject(new Error('temporal down')) },
+  } as unknown as Client;
+  const a = createActivities({ ...deps, temporal: down });
+  await expect(runActivity(a.maybeBuildStaging, [false])).rejects.toThrow('temporal down');
+  expect((await build(false)).gen).toBe(2);
 });
 
 test('a missing source fails the build and leaves current untouched', async () => {
@@ -284,6 +314,33 @@ test('heartbeats every 1,000 links', async () => {
   const r = await runActivity(acts.maybeBuildStaging, [true], { onHeartbeat: () => beats++ });
   expect(r.entries).toBe(2001);
   expect(beats).toBe(2);
+});
+
+test('heartbeats while another build holds the lock', async () => {
+  const holder = await pool.connect();
+  try {
+    await holder.query(`SELECT pg_advisory_lock(hashtext('pm.stage'))`);
+    const beats: unknown[] = [];
+    const run = runActivity(acts.maybeBuildStaging, [true], { onHeartbeat: (d) => beats.push(d) });
+    await expect.poll(() => beats.length, { timeout: 5000 }).toBeGreaterThan(1);
+    expect(beats[0]).toBe('waiting for pm.stage');
+    await holder.query(`SELECT pg_advisory_unlock(hashtext('pm.stage'))`);
+    expect((await run).gen).toBe(1);
+  } finally {
+    holder.release();
+  }
+});
+
+test('heartbeats while removing a large orphan generation', async () => {
+  const orphan = join(genDir(7), 'unique');
+  await mkdir(orphan, { recursive: true });
+  await Promise.all(
+    Array.from({ length: 1500 }, (_, i) => writeFile(join(orphan, `${String(i)}.x`), '')),
+  );
+  const beats: unknown[] = [];
+  await runActivity(acts.maybeBuildStaging, [true], { onHeartbeat: (d) => beats.push(d) });
+  expect(beats).toEqual(['rm .gen-7']);
+  expect(existsSync(genDir(7))).toBe(false);
 });
 
 test.skipIf(process.getuid?.() === 0)('staged file is read-only', async () => {
