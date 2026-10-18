@@ -17,6 +17,7 @@ x-worker-env: &worker-env
   DATA_DIR: /data
   DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-pixelmagic}@postgres:5432/pixelmagic
   TEMPORAL_ADDRESS: temporal:7233
+  DECODE_MEM_BUDGET_MB: ${DECODE_MEM_BUDGET_MB:-1280}
 
 services:
   postgres:

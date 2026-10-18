@@ -36,6 +36,14 @@ function isPoolFailure(e: WireError): boolean {
   );
 }
 
+/**
+ * The child was killed by a signal (the kernel's OOM killer, an operator, a crash). That says
+ * nothing about the file: transient, retried without limit by the workflow (never FAILED).
+ */
+function isSignalDeath(e: WireError): boolean {
+  return typeof e.message === 'string' && /signalCode: `?SIG[A-Z0-9]+/.test(e.message);
+}
+
 /** HASHED/CLUSTERED and QUARANTINED are where a recorded hash can already be. */
 const RECORDED: Partial<Record<string, 'HASHED' | 'QUARANTINED'>> = {
   HASHED: 'HASHED',
@@ -58,6 +66,11 @@ export function makeHashing(deps: Deps) {
       const e = (err ?? {}) as WireError;
       if (e.name === 'QuarantineError' && typeof e.reason === 'string')
         return { facts: null, quarantineReason: e.reason };
+      if (e.name !== 'TimeoutError' && isSignalDeath(e))
+        throw ApplicationFailure.retryable(
+          `decode ${sha256}.${ext}: ${String(e.message)}`,
+          'DecodeKilled', // workflows.ts DECODE_KILLED
+        );
       if (isPoolFailure(e))
         throw ApplicationFailure.retryable(
           `decode ${sha256}.${ext}: ${String(e.message)}`,

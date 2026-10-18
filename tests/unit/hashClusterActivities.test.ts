@@ -136,12 +136,12 @@ test('decodeContent: timeout is retryable Poison, and the hung child is killed',
   }
 }, 30_000);
 
-test('decodeContent: a crashed child is retryable Poison and is replaced', async () => {
+test('decodeContent: a child killed by a signal (OOM) is transient, not Poison, and is replaced', async () => {
   const crashy = createDecodePool('tests/helpers/crashWorker.ts', 1, tsx);
   try {
     const a = createActivities({ ...deps, decodePool: crashy });
     await expect(runActivity(a.decodeContent, ['0'.repeat(64), 'crash'])).rejects.toMatchObject({
-      type: 'Poison',
+      type: 'DecodeKilled',
       nonRetryable: false,
     });
     const r = await runActivity(a.decodeContent, await vaultFile((d) => photo(d, 'jpg')));
@@ -372,6 +372,21 @@ test('cluster flags a refused copy union as copy_ambiguous', async () => {
   expect([g1, g2]).toContain(gx);
   const r = await pool.query<{ sha256: string; copy_ambiguous: boolean }>(
     'SELECT sha256, copy_ambiguous FROM contents WHERE copy_ambiguous',
+  );
+  expect(r.rows.map((row) => row.sha256)).toEqual([x]);
+});
+
+test('a bridge that arrived first is flagged when the conflicting frame arrives', async () => {
+  const [x, f1, f2] = await seedHashed(
+    F('x', { phash: 1n, ...NOEXIF }),
+    F('f1', { captured: { s: 1_600_000_000, sub: '1' } }),
+    F('f2', { phash: 0b111n, captured: { s: 1_600_000_000, sub: '2' } }),
+  );
+  const [gx, g1, g2] = [await cluster(x!), await cluster(f1!), await cluster(f2!)];
+  expect(g1).toBe(gx);
+  expect(g2).not.toBe(g1);
+  const r = await pool.query<{ sha256: string }>(
+    'SELECT sha256 FROM contents WHERE copy_ambiguous ORDER BY sha256',
   );
   expect(r.rows.map((row) => row.sha256)).toEqual([x]);
 });

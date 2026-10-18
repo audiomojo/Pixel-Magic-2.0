@@ -137,6 +137,10 @@ export function makeClusterContent(deps: Deps) {
         winner,
       ]);
     }
+    if (asg.flagged.length > 0)
+      await c.query('UPDATE contents SET copy_ambiguous = true WHERE sha256 = ANY($1::text[])', [
+        asg.flagged,
+      ]);
     for (const [group, set] of asg.similarLinks)
       await c.query('UPDATE groups SET similar_set_id = $2 WHERE id = $1', [group, set]);
     const r = await c.query(

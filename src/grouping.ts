@@ -7,8 +7,16 @@ export type Verdict = 'copy' | 'similar';
 export interface Assignment {
   /** Root copy group of the new content after all merges. */
   copyGroup: number;
-  /** A copy union was refused: it would mix two different capture keys or two frames of one burst. */
+  /**
+   * The new content is a key-less bridge (no capture key, no burst) whose copy union was refused:
+   * it would mix two different capture keys or two frames of one burst.
+   */
   ambiguous: boolean;
+  /**
+   * Existing key-less contents newly found to bridge conflicting groups (spec §12 R3): the new
+   * content has a key and copy-matches them, but their group holds a conflicting shot.
+   */
+  flagged: string[];
   /** Groups allocated by this add: always one copy group, at most one similar set. */
   created: Array<[id: number, kind: GroupKind]>;
   copyMerges: Array<[loser: number, winner: number]>;
@@ -23,7 +31,7 @@ export interface LoadedRow {
   similarSet: number | null;
   captured: CaptureKey | null;
   burstUuid: string | null;
-  /** Ignored by grouping: the flag is persisted in `contents.copy_ambiguous` and never changes unions. */
+  /** Persisted `contents.copy_ambiguous`; never changes unions. */
   ambiguous: boolean;
 }
 
@@ -65,12 +73,17 @@ export class Grouper {
   private readonly copy = new Map<number, CopyGroup>();
   private readonly similar = new Map<number, SimilarSet>();
   private readonly groupOf = new Map<string, number>();
+  /** Contents with neither a capture key nor a burst: the only ones that can be flagged. */
+  private readonly keyless = new Set<string>();
+  private readonly flaggedSet = new Set<string>();
 
   constructor(private readonly newId: (kind: GroupKind) => number) {}
 
   /** Restore one already-clustered content from the database. */
   load(row: LoadedRow): void {
     this.claim(row.sha256, row.copyGroup);
+    if (row.captured === null && row.burstUuid === null) this.keyless.add(row.sha256);
+    if (row.ambiguous) this.flaggedSet.add(row.sha256);
     let g = this.copy.get(row.copyGroup);
     if (g === undefined) {
       g = { parent: row.copyGroup, members: [], captures: [], bursts: new Set(), similar: null };
@@ -92,11 +105,13 @@ export class Grouper {
     const resolved = matches.map(([sha, verdict]) => {
       const id = this.groupOf.get(sha);
       if (id === undefined) throw new Error(`Grouper: unknown match ${sha}`);
-      return [this.findCopy(id), verdict] as const;
+      return [this.findCopy(id), verdict, sha] as const;
     });
 
     const gid = this.newId('copy');
     this.claim(f.sha256, gid);
+    const keyless = f.captured === null && f.burstUuid === null;
+    if (keyless) this.keyless.add(f.sha256);
     this.copy.set(gid, {
       parent: gid,
       members: [f.sha256],
@@ -107,6 +122,7 @@ export class Grouper {
     const asg: Assignment = {
       copyGroup: gid,
       ambiguous: false,
+      flagged: [],
       created: [[gid, 'copy']],
       copyMerges: [],
       similarMerges: [],
@@ -119,7 +135,7 @@ export class Grouper {
     for (const target of copyTargets) {
       const root = this.findCopy(gid);
       if (mustNotMerge(this.group(root), this.group(target))) {
-        asg.ambiguous = true;
+        this.flagBridges(f.sha256, keyless, target, resolved, asg);
         continue;
       }
       this.mergeCopy(root, target, asg, pendingSets);
@@ -134,6 +150,36 @@ export class Grouper {
       this.joinSimilar([root, ...similarTargets], pendingSets, asg);
     for (const [g, s] of asg.similarLinks) asg.similarLinks.set(g, this.findSim(s));
     return asg;
+  }
+
+  /**
+   * A refused union (spec §12 R3) flags the key-less content that bridges the two groups, never a
+   * content with a capture key or a burst: the new content itself when it is key-less, otherwise
+   * the key-less members of `target` it copy-matched (a bridge that arrived before the conflict).
+   */
+  private flagBridges(
+    sha: string,
+    keyless: boolean,
+    target: number,
+    resolved: ReadonlyArray<readonly [root: number, verdict: Verdict, sha: string]>,
+    asg: Assignment,
+  ): void {
+    if (keyless) {
+      asg.ambiguous = true;
+      this.flaggedSet.add(sha);
+      return;
+    }
+    for (const [root, verdict, m] of resolved) {
+      if (root !== target || verdict !== 'copy' || !this.keyless.has(m)) continue;
+      if (this.flaggedSet.has(m)) continue;
+      this.flaggedSet.add(m);
+      asg.flagged.push(m);
+    }
+  }
+
+  /** Every content flagged `copy_ambiguous` (loaded or flagged since). */
+  ambiguousContents(): Set<string> {
+    return new Set(this.flaggedSet);
   }
 
   /** Copy groups as sorted, comma-joined SHA-256 lists. */

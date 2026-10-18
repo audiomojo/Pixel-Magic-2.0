@@ -220,6 +220,18 @@ test('decode poison marks FAILED after 5', async () => {
   expect(error).toContain('decode timed out');
 });
 
+test('a decode child killed by a signal (OOM) is retried past the poison cap, never FAILED', async () => {
+  let left = 12;
+  const killed = () => {
+    if (left-- > 0) throw ApplicationFailure.retryable('child got SIGKILL', 'DecodeKilled');
+    return DECODED;
+  };
+  const f = fakes({ ingest: INGESTED_STILL, decode: killed });
+  expect(await runFile(f)).toBe('CLUSTERED');
+  expect(f.calls.filter((c) => c === 'decodeContent')).toHaveLength(13);
+  expect(f.calls).not.toContain('markFailed');
+});
+
 test('poisonAttempts option caps decode attempts', async () => {
   const f = fakes({ ingest: INGESTED_STILL, decode: alwaysPoison });
   expect(await runFile(f, { poisonAttempts: 2 })).toBe('FAILED');

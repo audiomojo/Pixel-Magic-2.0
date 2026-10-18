@@ -90,13 +90,10 @@ test('bridge export never merges conflicting shots', () => {
   for (const order of permutations(['A', 'B', 'X'] as const)) {
     const g = new Grouper(counter());
     const seen: string[] = [];
-    const flagged: boolean[] = [];
     for (const s of order) {
-      flagged.push(
-        g.add(
-          facts[s],
-          seen.map((o) => [o, verdict(s, o)] as const),
-        ).ambiguous,
+      g.add(
+        facts[s],
+        seen.map((o) => [o, verdict(s, o)] as const),
       );
       seen.push(s);
     }
@@ -104,7 +101,8 @@ test('bridge export never merges conflicting shots', () => {
       false,
     );
     expect(g.similarPartition()).toEqual(new Set(['A,B,X']));
-    expect(flagged.filter(Boolean)).toHaveLength(1);
+    // Spec §12 R3: the bridging export is the flagged content, whichever arrived first.
+    expect(g.ambiguousContents()).toEqual(new Set(['X']));
   }
 });
 
@@ -143,6 +141,7 @@ test('unrelated contents are singleton copy groups and singleton similar compone
   expect(a).toEqual<Assignment>({
     copyGroup: 1,
     ambiguous: false,
+    flagged: [],
     created: [[1, 'copy']],
     copyMerges: [],
     similarMerges: [],
@@ -159,6 +158,7 @@ test('assignment: copy merges into the older group; a similar match creates and 
   expect(g.add(F('c', { width: 2000 }), [['a', 'copy']])).toEqual<Assignment>({
     copyGroup: 1,
     ambiguous: false,
+    flagged: [],
     created: [[2, 'copy']],
     copyMerges: [[2, 1]],
     similarMerges: [],
@@ -173,6 +173,7 @@ test('assignment: copy merges into the older group; a similar match creates and 
   ).toEqual<Assignment>({
     copyGroup: 3,
     ambiguous: false,
+    flagged: [],
     created: [
       [3, 'copy'],
       [4, 'similar'],
@@ -290,7 +291,7 @@ test('copy merge of two groups with different sets unions the sets', () => {
   expect(g.similarPartition()).toEqual(new Set(['a,a2,b,n,z']));
 });
 
-test('refused union is flagged ambiguous and still joins the similar set', () => {
+test('a keyed content whose union is refused is never flagged and still joins the similar set', () => {
   const g = new Grouper(counter(100));
   g.load(row('a', 10, null, { s: 1, sub: '1' }));
   g.load(row('b', 11, null, { s: 1, sub: '2' }));
@@ -298,7 +299,7 @@ test('refused union is flagged ambiguous and still joins the similar set', () =>
     ['a', 'copy'],
     ['b', 'copy'],
   ]);
-  expect(asg.ambiguous).toBe(true);
+  expect([asg.ambiguous, asg.flagged]).toEqual([false, []]);
   expect(asg.copyGroup).toBe(10);
   expect(asg.created).toEqual([
     [100, 'copy'],
@@ -318,7 +319,7 @@ test('a content conflicting with its only copy match keeps its own group', () =>
   const g = new Grouper(counter(100));
   g.load(row('a', 10, null, { s: 1, sub: '1' }));
   const asg = g.add(F('n', { captured: { s: 2, sub: '1' } }), [['a', 'copy']]);
-  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: true, copyMerges: [] });
+  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: false, flagged: [], copyMerges: [] });
   expect(g.copyPartition()).toEqual(new Set(['a', 'n']));
   expect(g.similarPartition()).toEqual(new Set(['a,n']));
 });
@@ -359,7 +360,9 @@ test('a loaded group refuses a second frame of its burst', () => {
   g.load(row('a', 10, null, { s: 1, sub: '1' }, 'B'));
   g.load(row('x', 10, null, null));
   const asg = g.add(F('n', { captured: { s: 1, sub: null }, burstUuid: 'B' }), [['x', 'copy']]);
-  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: true, copyMerges: [] });
+  // The key-less x bridges the burst frames: x is flagged, never the frame n.
+  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: false, flagged: ['x'], copyMerges: [] });
+  expect(g.ambiguousContents()).toEqual(new Set(['x']));
   expect(g.copyPartition()).toEqual(new Set(['a,x', 'n']));
   expect(g.similarPartition()).toEqual(new Set(['a,n,x']));
 });
@@ -428,5 +431,79 @@ test('copy groups never mix shots, and similar sets are the look-alike component
       }
       expect(g.similarPartition()).toEqual(components(facts));
     }),
+    { numRuns: 500 },
+  ));
+
+test('a key-less member of a burst is never flagged', () => {
+  const g = new Grouper(counter(100));
+  g.load(row('a', 10, null, { s: 1, sub: '1' }, 'B'));
+  const asg = g.add(F('n', { ...NOEXIF, burstUuid: 'B' }), [['a', 'copy']]);
+  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: false, flagged: [] });
+  expect(g.ambiguousContents()).toEqual(new Set());
+});
+
+test('loaded copy_ambiguous rows stay flagged and are not reported again', () => {
+  const g = new Grouper(counter(100));
+  g.load(row('a', 10, null, { s: 1, sub: '1' }));
+  g.load({ ...row('x', 10, null, null), ambiguous: true });
+  const asg = g.add(F('b', { captured: { s: 2, sub: '1' } }), [['x', 'copy']]);
+  expect([asg.ambiguous, asg.flagged, asg.copyGroup]).toEqual([false, [], 100]);
+  expect(g.ambiguousContents()).toEqual(new Set(['x']));
+});
+
+/**
+ * Two burst frames A and B, a keyed copy of each (A2, B2: same capture key, other encoding), a
+ * key-less copy of A only (Y), and two key-less exports that copy-match both frames (X1, X2).
+ */
+const BRIDGED = {
+  A: F('A', { captured: { s: 1, sub: '1' }, burstUuid: 'U' }),
+  B: F('B', { captured: { s: 1, sub: '2' }, burstUuid: 'U' }),
+  A2: F('A2', { captured: { s: 1, sub: '1' }, width: 2000, mime: 'image/jpeg' }),
+  B2: F('B2', { captured: { s: 1, sub: '2' }, width: 2000, mime: 'image/jpeg' }),
+  Y: F('Y', { ...NOEXIF, width: 1000 }),
+  X1: F('X1', { ...NOEXIF, width: 3000 }),
+  X2: F('X2', { ...NOEXIF, width: 3000 }),
+};
+type Bridged = keyof typeof BRIDGED;
+const KEYED: Bridged[] = ['A', 'B', 'A2', 'B2'];
+const bridgedVerdict = (p: Bridged, q: Bridged): 'copy' | 'similar' => {
+  const pair = new Set([p, q]);
+  const frame = (n: Bridged) =>
+    n === 'A' || n === 'A2' ? 'A' : n === 'B' || n === 'B2' ? 'B' : null;
+  if (KEYED.includes(p) && KEYED.includes(q)) return frame(p) === frame(q) ? 'copy' : 'similar';
+  if (pair.has('Y')) return [...pair].some((n) => frame(n) === 'A') ? 'copy' : 'similar';
+  return KEYED.includes(p) || KEYED.includes(q) ? 'copy' : 'similar'; // X1/X2 vs a frame
+};
+
+test('bridges are flagged and the unflagged copy partition is order-independent', () =>
+  fc.assert(
+    fc.property(
+      fc.shuffledSubarray(Object.keys(BRIDGED) as Bridged[], { minLength: 7, maxLength: 7 }),
+      (order) => {
+        const g = new Grouper(counter());
+        const seen: Bridged[] = [];
+        for (const n of order) {
+          g.add(
+            BRIDGED[n],
+            seen.map((o) => [o, bridgedVerdict(n, o)] as const),
+          );
+          seen.push(n);
+        }
+        const flagged = g.ambiguousContents();
+        expect(flagged).toEqual(new Set(['X1', 'X2']));
+        const unflagged = new Set(
+          [...g.copyPartition()]
+            .map((grp) =>
+              grp
+                .split(',')
+                .filter((sha) => !flagged.has(sha))
+                .join(','),
+            )
+            .filter((grp) => grp !== ''),
+        );
+        expect(unflagged).toEqual(new Set(['A,A2,Y', 'B,B2']));
+        expect(g.similarPartition()).toEqual(new Set(['A,A2,B,B2,X1,X2,Y']));
+      },
+    ),
     { numRuns: 500 },
   ));

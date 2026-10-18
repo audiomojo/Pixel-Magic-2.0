@@ -87,7 +87,10 @@ async function main(): Promise<void> {
       if (serves(q)) workers.push(await Worker.create({ ...base, taskQueue: q, ...perQueue[q] }));
 
     if (serves('cluster')) await ensureSchedules(temporal, settings);
-    logger.info({ queues, dataDir: settings.dataDir }, 'worker started');
+    logger.info(
+      { queues, dataDir: settings.dataDir, cpuConcurrency: settings.cpuConcurrency },
+      'worker started',
+    );
 
     // SIGTERM/SIGINT shut every worker down (Runtime's default signals), so each run() returns.
     // If one worker fails, stop the rest too.

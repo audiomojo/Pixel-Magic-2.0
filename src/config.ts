@@ -1,4 +1,4 @@
-import { availableParallelism } from 'node:os';
+import { availableParallelism, totalmem } from 'node:os';
 import { z } from 'zod';
 
 const int = (def: number) => z.coerce.number().int().default(def);
@@ -14,6 +14,7 @@ const schema = z.object({
   MAX_IN_FLIGHT: int(5000),
   IO_CONCURRENCY: int(8),
   CPU_CONCURRENCY: z.coerce.number().int().positive().optional(),
+  DECODE_MEM_BUDGET_MB: z.coerce.number().int().positive().default(1280),
   DECODE_TIMEOUT_S: int(60),
   POISON_ATTEMPTS: int(5),
   LOOK_ALIKE_PHASH: int(8),
@@ -35,6 +36,8 @@ export interface Settings {
   maxInFlight: number;
   ioConcurrency: number;
   cpuConcurrency: number;
+  /** Memory one decode may need (a ~60 MP HEIC peaks near 1 GB); sizes the default `cpuConcurrency`. */
+  decodeMemBudgetMb: number;
   decodeTimeoutS: number;
   poisonAttempts: number;
   lookAlikePhash: number;
@@ -43,6 +46,19 @@ export interface Settings {
   copyDhash: number;
   liveMaxDurationS: number;
   stageMaxStalenessS: number;
+}
+
+/** Memory available to this process: the cgroup limit when one is set and below RAM, else RAM. */
+export function memoryBytes(
+  constrained: number = process.constrainedMemory(),
+  total: number = totalmem(),
+): number {
+  return constrained > 0 ? Math.min(constrained, total) : total;
+}
+
+/** Default decode parallelism: one per CPU, but no more than memory / budget, and at least 1. */
+export function decodeConcurrency(cpus: number, memBytes: number, budgetMb: number): number {
+  return Math.max(1, Math.min(cpus, Math.floor(memBytes / (budgetMb * 1024 * 1024))));
 }
 
 export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
@@ -64,7 +80,10 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     stableSeconds: e.STABLE_SECONDS,
     maxInFlight: e.MAX_IN_FLIGHT,
     ioConcurrency: e.IO_CONCURRENCY,
-    cpuConcurrency: e.CPU_CONCURRENCY ?? availableParallelism(),
+    cpuConcurrency:
+      e.CPU_CONCURRENCY ??
+      decodeConcurrency(availableParallelism(), memoryBytes(), e.DECODE_MEM_BUDGET_MB),
+    decodeMemBudgetMb: e.DECODE_MEM_BUDGET_MB,
     decodeTimeoutS: e.DECODE_TIMEOUT_S,
     poisonAttempts: e.POISON_ATTEMPTS,
     lookAlikePhash: e.LOOK_ALIKE_PHASH,

@@ -6,6 +6,7 @@ import {
   isCancellation,
   log,
   proxyActivities,
+  sleep,
   type ActivityOptions,
   type RetryPolicy,
 } from '@temporalio/workflow';
@@ -59,6 +60,10 @@ const { markFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.markFailed);
 const { maybeBuildStaging } = proxyActivities<Activities>(ACTIVITY_OPTIONS.maybeBuildStaging);
 const { scanAndStart } = proxyActivities<Activities>(ACTIVITY_OPTIONS.scanAndStart);
 
+/** Error type of a decode whose child was killed by a signal: transient, never FAILED. */
+export const DECODE_KILLED = 'DecodeKilled';
+const MAX_KILLED_BACKOFF_S = 300;
+
 export type ContentOutcome = 'CLUSTERED' | 'QUARANTINED' | 'FAILED';
 
 /**
@@ -75,14 +80,23 @@ export async function runContentSteps(
     ACTIVITY_OPTIONS.decodeContent(poisonAttempts),
   );
   let decoded;
-  try {
-    decoded = await decodeContent(sha256, ext);
-  } catch (e) {
-    if (!(e instanceof ActivityFailure) || isCancellation(e)) throw e;
-    const error = e.cause?.message ?? e.message;
-    log.warn('decode attempts exhausted; marking FAILED', { sha256, error });
-    await markFailed(sha256, error);
-    return 'FAILED';
+  for (let round = 0; ; round++) {
+    try {
+      decoded = await decodeContent(sha256, ext);
+      break;
+    } catch (e) {
+      if (!(e instanceof ActivityFailure) || isCancellation(e)) throw e;
+      const error = e.cause?.message ?? e.message;
+      if (e.cause instanceof ApplicationFailure && e.cause.type === DECODE_KILLED) {
+        // A child killed by a signal (OOM) says nothing about the file: back off, decode again.
+        log.warn('decode child killed; retrying', { sha256, error, round });
+        await sleep(Math.min(2 ** round, MAX_KILLED_BACKOFF_S) * 1000);
+        continue;
+      }
+      log.warn('decode attempts exhausted; marking FAILED', { sha256, error });
+      await markFailed(sha256, error);
+      return 'FAILED';
+    }
   }
   if ((await recordHash(sha256, decoded)) === 'QUARANTINED') return 'QUARANTINED';
   await clusterContent(sha256);
