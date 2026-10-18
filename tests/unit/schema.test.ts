@@ -126,3 +126,12 @@ test('an idle pooled client losing its backend is logged, not fatal', async () =
     warn.mockRestore();
   }
 });
+
+test('similar-set re-pointing on a merge is indexed (migration 0003)', async () => {
+  const r = await rows<{ indexdef: string }>(
+    `SELECT indexdef FROM pg_indexes WHERE tablename = 'groups' AND indexname = 'groups_similar_set_id_idx'`,
+  );
+  expect(r.map((x) => x.indexdef)).toEqual([
+    'CREATE INDEX groups_similar_set_id_idx ON public.groups USING btree (similar_set_id)',
+  ]);
+});

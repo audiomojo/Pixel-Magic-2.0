@@ -40,7 +40,13 @@ export const ACTIVITY_OPTIONS = {
     retry: { ...TRANSIENT_RETRY, maximumAttempts: 1 },
   },
   recordHash: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
-  clusterContent: { taskQueue: 'cluster', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
+  /** 15 min: a cache reload after a worker restart scans every clustered content (heartbeats). */
+  clusterContent: {
+    taskQueue: 'cluster',
+    startToCloseTimeout: '15m',
+    heartbeatTimeout: '30s',
+    retry: TRANSIENT_RETRY,
+  },
   markFailed: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
   maybeBuildStaging: {
     taskQueue: 'io',

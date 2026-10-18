@@ -620,3 +620,21 @@ test('the tree is independent of arrival order and group ids (property)', () => 
     { numRuns: 1000 },
   );
 });
+
+test('perf: a 40,000-content similar set plans in linear time', () => {
+  // Thousands of look-alike dark or document shots form one set; accumulating its members by
+  // copying the list on every push made this O(S²) (≈ 1.6 s here at 40k, seconds more beyond).
+  const n = 40_000;
+  const cs = Array.from({ length: n }, (_, i) =>
+    C(i.toString(16).padStart(64, '0'), {
+      ext: 'jpg',
+      copyGroup: i + 1,
+      similarSet: 1,
+      capturedAt: new Date(1e12 + i * 1000),
+    }),
+  );
+  const fs = cs.map((c, i) => Fl(BigInt(i + 1), `p/${String(i)}.jpg`, c));
+  const t0 = performance.now();
+  expect(planStaging(cs, fs, 5)).toHaveLength(n);
+  expect(performance.now() - t0).toBeLessThan(750);
+});

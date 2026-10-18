@@ -514,16 +514,22 @@ test('bridges and copies of bridges are flagged; the unflagged copy partition is
     { numRuns: 2000 },
   ));
 
-test('a reloaded grouper propagates a new flag through loaded copy edges', () => {
-  const g = new Grouper(counter(100));
+test('a reloaded grouper propagates a new flag through copy edges it computes only on demand', () => {
+  const stored: Partial<Record<string, string[]>> = { a: ['x'], x: ['a', 'r'], r: ['x'] };
+  const asked: string[] = [];
+  const g = new Grouper(counter(100), (sha) => {
+    asked.push(sha);
+    return stored[sha] ?? [];
+  });
   g.load(row('a', 10, null, { s: 1, sub: '1' }));
   g.load(row('x', 10, null, null));
   g.load(row('r', 10, null, null));
-  g.loadCopyEdge('x', 'a');
-  g.loadCopyEdge('r', 'x');
+  g.load(row('u', 11, null, null)); // key-less, never visited
+  expect(asked).toEqual([]); // loading computes no edges
   const asg = g.add(F('b', { captured: { s: 1, sub: '2' } }), [['x', 'copy']]);
   expect(asg.flagged.sort()).toEqual(['r', 'x']);
   expect(g.ambiguousContents()).toEqual(new Set(['r', 'x']));
+  expect(asked.sort()).toEqual(['r', 'x']); // only the contents the flag walk visited
 });
 
 test('a key-less copy of a flagged bridge is flagged on arrival; one with a keyed match is not', () => {

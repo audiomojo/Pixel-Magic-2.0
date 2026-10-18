@@ -228,6 +228,13 @@ class Namer {
  * The full staged tree (spec §6.4, §12 R5/R8) from database facts, sorted by `dest`. Only facts
  * decide it — never group ids, file ids beyond the last tie-break, or input order.
  */
+/** Appends `v` to `map[k]` in place (linear, unlike rebuilding the list on every push). */
+function push<K, V>(map: Map<K, V[]>, k: K, v: V): void {
+  let list = map.get(k);
+  if (list === undefined) map.set(k, (list = []));
+  list.push(v);
+}
+
 export function planStaging(
   contents: readonly StageContent[],
   files: readonly StageFile[],
@@ -269,8 +276,8 @@ export function planStaging(
   const sets = new Map<number, StageContent[]>();
   for (const c of staged) {
     if (c.kind !== 'still' || c.state !== 'CLUSTERED' || c.copyGroup === null) continue;
-    groups.set(c.copyGroup, [...(groups.get(c.copyGroup) ?? []), c]);
-    if (c.similarSet !== null) sets.set(c.similarSet, [...(sets.get(c.similarSet) ?? []), c]);
+    push(groups, c.copyGroup, c);
+    if (c.similarSet !== null) push(sets, c.similarSet, c);
   }
   // A set is two or more look-alike copy groups (spec §6.3). One that holds a single copy group
   // (its groups merged after they were linked) stages as unique: had the copies merged first,
@@ -299,8 +306,7 @@ export function planStaging(
 
   // Quarantine, FAILED, and INGESTED motion / other.
   const stillsOf = new Map<string, string[]>();
-  for (const [still, motion] of pairs)
-    stillsOf.set(motion, [...(stillsOf.get(motion) ?? []), still]);
+  for (const [still, motion] of pairs) push(stillsOf, motion, still);
   const vcopies = (c: StageContent) => `copies/v-${sha8(c.sha256)}`;
   for (const c of staged) {
     const name = namingFile(c).originalName;

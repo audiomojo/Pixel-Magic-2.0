@@ -1,4 +1,4 @@
-import { ApplicationFailure } from '@temporalio/activity';
+import { ApplicationFailure, heartbeat } from '@temporalio/activity';
 import type pg from 'pg';
 import { classify, type CaptureKey, type Facts, type Thresholds } from '../classify.js';
 import { withTx } from '../db.js';
@@ -12,7 +12,8 @@ export function captureKey(capturedAt: Date | null, subsec: string | null): Capt
   return capturedAt === null ? null : { s: Math.floor(capturedAt.getTime() / 1000), sub: subsec };
 }
 
-interface ContentRow {
+/** A `contents` row as the cluster step reads it. */
+export interface ContentRow {
   sha256: string;
   state: string;
   phash: bigint | null;
@@ -49,10 +50,85 @@ function toFacts(r: ContentRow): Facts {
 
 const num = (v: bigint | null): number | null => (v === null ? null : Number(v));
 
-interface Cache {
-  version: bigint;
+export interface GroupRow {
+  id: bigint;
+  merged_into: bigint | null;
+  similar_set_id: bigint | null;
+}
+
+export interface CacheState {
   grouper: Grouper;
   index: HashIndex;
+  /** Facts by SHA-256 of every indexed content (the source of lazy copy edges). */
+  facts: Map<string, Facts>;
+  /** Copy-verdict neighbours of a cached content, from one index scan. */
+  edgesOf: (sha256: string) => string[];
+}
+
+interface Cache extends CacheState {
+  version: bigint;
+}
+
+/** `onRows` is called every this many contents, so a long reload keeps heartbeating. */
+export const RELOAD_BEAT_EVERY = 1000;
+
+/**
+ * Rebuilds index and grouper from the stored clustering, resolving every id to its root. Linear
+ * in the number of contents: copy edges (needed only when a flag propagates) are computed on
+ * demand, one index scan per content a flag walk visits, never for every key-less content.
+ */
+export function rebuildCache(
+  groups: readonly GroupRow[],
+  rows: readonly ContentRow[],
+  t: Thresholds,
+  newId: () => number,
+  onRows?: (n: number) => void,
+): CacheState {
+  const parent = new Map(groups.map((g) => [Number(g.id), num(g.merged_into)]));
+  const similarOf = new Map(groups.map((g) => [Number(g.id), num(g.similar_set_id)]));
+  const root = (id: number): number => {
+    for (let x = id, hops = 0; ; hops++) {
+      const p = parent.get(x);
+      if (p === undefined || p === null) return x;
+      if (hops > parent.size) throw new Error(`groups: merged_into cycle at ${id}`);
+      x = p;
+    }
+  };
+  const index = new HashIndex();
+  const facts = new Map<string, Facts>();
+  const edgesOf = (sha: string): string[] => {
+    const f = facts.get(sha);
+    if (f === undefined) return [];
+    return index
+      .matches(f, t)
+      .filter((m) => m.sha256 !== sha && classify(f, m, t) === 'copy')
+      .map((m) => m.sha256);
+  };
+  const grouper = new Grouper(newId, edgesOf);
+  const list: Facts[] = [];
+  const copyGroups: number[] = [];
+  rows.forEach((r, i) => {
+    const f = toFacts(r);
+    if (r.copy_group_id === null)
+      throw new Error(`content ${r.sha256} is CLUSTERED without a group`);
+    const copyGroup = root(Number(r.copy_group_id));
+    const s = similarOf.get(copyGroup) ?? null;
+    grouper.load({
+      sha256: r.sha256,
+      copyGroup,
+      similarSet: s === null ? null : root(s),
+      captured: f.captured,
+      camera: f.camera,
+      burstUuid: f.burstUuid,
+      ambiguous: r.copy_ambiguous,
+    });
+    facts.set(f.sha256, f);
+    list.push(f);
+    copyGroups.push(copyGroup);
+    if ((i + 1) % RELOAD_BEAT_EVERY === 0) onRows?.(i + 1);
+  });
+  index.append(list, copyGroups);
+  return { grouper, index, facts, edgesOf };
 }
 
 export function makeClusterContent(deps: Deps) {
@@ -74,57 +150,18 @@ export function makeClusterContent(deps: Deps) {
   /** Calls on one worker run one at a time: the cache is shared and updated after COMMIT. */
   let tail: Promise<unknown> = Promise.resolve();
 
-  /** Rebuilds index and grouper from the stored clustering, resolving every id to its root. */
+  /** Reads the stored clustering and rebuilds the cache from it, heartbeating as it goes. */
   async function load(c: pg.PoolClient, version: bigint): Promise<Cache> {
-    const groups = await c.query<{
-      id: bigint;
-      merged_into: bigint | null;
-      similar_set_id: bigint | null;
-    }>('SELECT id, merged_into, similar_set_id FROM groups');
-    const parent = new Map(groups.rows.map((g) => [Number(g.id), num(g.merged_into)]));
-    const similarOf = new Map(groups.rows.map((g) => [Number(g.id), num(g.similar_set_id)]));
-    const root = (id: number): number => {
-      for (let x = id, hops = 0; ; hops++) {
-        const p = parent.get(x);
-        if (p === undefined || p === null) return x;
-        if (hops > parent.size) throw new Error(`groups: merged_into cycle at ${id}`);
-        x = p;
-      }
-    };
+    const groups = await c.query<GroupRow>('SELECT id, merged_into, similar_set_id FROM groups');
+    heartbeat('cluster cache: groups read');
     const rows = await c.query<ContentRow>(
       `SELECT ${COLS} FROM contents WHERE state = 'CLUSTERED' ORDER BY sha256`,
     );
-    const grouper = new Grouper(newId);
-    const facts: Facts[] = [];
-    const copyGroups: number[] = [];
-    for (const r of rows.rows) {
-      const f = toFacts(r);
-      if (r.copy_group_id === null)
-        throw new Error(`content ${r.sha256} is CLUSTERED without a group`);
-      const copyGroup = root(Number(r.copy_group_id));
-      const s = similarOf.get(copyGroup) ?? null;
-      grouper.load({
-        sha256: r.sha256,
-        copyGroup,
-        similarSet: s === null ? null : root(s),
-        captured: f.captured,
-        camera: f.camera,
-        burstUuid: f.burstUuid,
-        ambiguous: r.copy_ambiguous,
-      });
-      facts.push(f);
-      copyGroups.push(copyGroup);
-    }
-    const index = new HashIndex();
-    index.append(facts, copyGroups);
-    // Copy verdicts of key-less contents, so a later flag can propagate to copies of a bridge.
-    for (const f of facts) {
-      if (f.captured !== null || f.burstUuid !== null) continue;
-      for (const m of index.matches(f, t))
-        if (m.sha256 !== f.sha256 && classify(f, m, t) === 'copy')
-          grouper.loadCopyEdge(f.sha256, m.sha256);
-    }
-    return { version, grouper, index };
+    heartbeat('cluster cache: contents read');
+    const state = rebuildCache(groups.rows, rows.rows, t, newId, (n) =>
+      heartbeat(`cluster cache: ${String(n)} rows`),
+    );
+    return { version, ...state };
   }
 
   /** Writes one `Assignment`, keeping every stored copy-group and similar-set id a root. */
@@ -163,6 +200,9 @@ export function makeClusterContent(deps: Deps) {
   async function clusterOnce(sha256: string): Promise<number> {
     try {
       const out = await withTx(pool, async (c) => {
+        // A cache reload is pure JS while this transaction sits idle: never let the server's
+        // idle-in-transaction timeout kill it (the activity heartbeats and has its own timeout).
+        await c.query('SET LOCAL idle_in_transaction_session_timeout = 0');
         await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
         const row = (
           await c.query<ContentRow>(`SELECT ${COLS} FROM contents WHERE sha256 = $1`, [sha256])
@@ -202,6 +242,7 @@ export function makeClusterContent(deps: Deps) {
       if (out.added) {
         const { f, cache: c, version } = out.added;
         c.index.append([f], [out.group]);
+        c.facts.set(f.sha256, f);
         c.version = version;
       }
       return out.group;

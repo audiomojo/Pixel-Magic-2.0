@@ -84,10 +84,21 @@ export class Grouper {
   /** Contents with neither a capture key nor a burst: the only ones that can be flagged. */
   private readonly keyless = new Set<string>();
   private readonly flaggedSet = new Set<string>();
-  /** Copy-verdict neighbours of each key-less content (both directions), for flag propagation. */
+  /**
+   * Copy-verdict neighbours of key-less contents, for flag propagation: built on first use from
+   * `edgesOf` (loaded contents) or from the matches of `add`, then kept up to date by `add`.
+   */
   private readonly copyEdges = new Map<string, Set<string>>();
 
-  constructor(private readonly newId: (kind: GroupKind) => number) {}
+  /**
+   * `edgesOf(sha)`: the contents a loaded content copy-matches (the cluster cache asks its hash
+   * index). Called lazily, only for key-less contents a flag walk visits, so a reload stays
+   * O(contents) instead of one full index scan per key-less content.
+   */
+  constructor(
+    private readonly newId: (kind: GroupKind) => number,
+    private readonly edgesOf: (sha256: string) => Iterable<string> = () => [],
+  ) {}
 
   /** Restore one already-clustered content from the database. */
   load(row: LoadedRow): void {
@@ -129,8 +140,14 @@ export class Grouper {
     const gid = this.newId('copy');
     this.claim(f.sha256, gid);
     const keyless = f.captured === null && f.burstUuid === null;
-    if (keyless) this.keyless.add(f.sha256);
-    for (const [, verdict, m] of resolved) if (verdict === 'copy') this.loadCopyEdge(f.sha256, m);
+    const copyMatches = resolved.filter(([, v]) => v === 'copy').map(([, , m]) => m);
+    // An existing content's set is materialised before `f` joins it: its lazy source (the hash
+    // index) only gets `f` after this add commits.
+    for (const m of copyMatches) if (this.keyless.has(m)) this.edges(m).add(f.sha256);
+    if (keyless) {
+      this.keyless.add(f.sha256);
+      this.copyEdges.set(f.sha256, new Set(copyMatches));
+    }
     this.copy.set(gid, {
       parent: gid,
       members: [f.sha256],
@@ -205,7 +222,7 @@ export class Grouper {
     this.flaggedSet.add(sha);
     if (self) asg.ambiguous = true;
     else asg.flagged.push(sha);
-    for (const n of this.copyEdges.get(sha) ?? [])
+    for (const n of this.edges(sha))
       if (this.keyless.has(n) && !this.flaggedSet.has(n)) this.flagIfOnlyBridged(n, asg, false);
   }
 
@@ -219,7 +236,7 @@ export class Grouper {
     const comp = new Set([start]);
     let bridged = false;
     for (const x of comp)
-      for (const n of this.copyEdges.get(x) ?? []) {
+      for (const n of this.edges(x)) {
         if (this.flaggedSet.has(n)) bridged = true;
         else if (this.keyless.has(n)) comp.add(n);
         else return; // a copy of a keyed photo
@@ -232,17 +249,11 @@ export class Grouper {
     }
   }
 
-  /** Records a copy verdict between two contents (for loaded state: from the hash index). */
-  loadCopyEdge(a: string, b: string): void {
-    for (const [x, y] of [
-      [a, b],
-      [b, a],
-    ] as const) {
-      if (!this.keyless.has(x)) continue;
-      let set = this.copyEdges.get(x);
-      if (set === undefined) this.copyEdges.set(x, (set = new Set()));
-      set.add(y);
-    }
+  /** Copy-verdict neighbours of `sha`, computed from `edgesOf` on first use. */
+  private edges(sha: string): Set<string> {
+    let set = this.copyEdges.get(sha);
+    if (set === undefined) this.copyEdges.set(sha, (set = new Set(this.edgesOf(sha))));
+    return set;
   }
 
   /** Every content flagged `copy_ambiguous` (loaded or flagged since). */

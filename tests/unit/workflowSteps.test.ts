@@ -105,7 +105,8 @@ test('a new still runs every step, each with its queue, timeouts and retry polic
   });
   expect(optsOf('clusterContent')).toEqual({
     taskQueue: 'cluster',
-    startToCloseTimeout: '1m',
+    startToCloseTimeout: '15m', // a cache reload at 300k+ contents
+    heartbeatTimeout: '30s',
     retry: forever,
   });
 });
