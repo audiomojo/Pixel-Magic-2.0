@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { isIgnored } from '../../src/fsops.js';
 import type { Manifest } from '../../tools/corpus/lib.js';
 import { diffExpectations, livePairs, moduloAmbiguity, queries } from '../lib/expectations.js';
-import { checkInvariant } from '../lib/invariant.js';
+import { checkInvariant, vaultUsage } from '../lib/invariant.js';
 import { stagedEntries } from '../lib/snapshot.js';
 import { runTier, type TierRun } from '../lib/stack.js';
 
@@ -104,13 +104,17 @@ test('nested Unicode layout works', async () => {
   }
 });
 
-test('re-seed under new paths is all COPY', async () => {
+test('re-seed under new paths is all COPY and stores nothing new', async () => {
   // Last: it mutates the run.
+  const before = await vaultUsage(run.dataDir);
   const again = (await run.reseed('again/')).files.filter(
     (f) => f.relPath.startsWith('again/') && f.origin === 'corpus',
   );
   await run.runToIdle();
   expect(again.length).toBeGreaterThan(0);
   for (const f of again) expect(await q.stateOf(f.relPath), f.relPath).toBe('COPY');
+  // Every re-dropped file was a confirmed duplicate and removed: the vault is byte for byte
+  // what it was (spec §6.5).
+  expect(await vaultUsage(run.dataDir)).toEqual(before);
   expect(await checkInvariant(...run.ctx)).toEqual([]);
 });

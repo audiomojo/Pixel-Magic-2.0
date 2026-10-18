@@ -1,9 +1,10 @@
 // The golden invariant (spec §10.4), plus the burst rule: one violation per line, empty = holds.
-import { readdir } from 'node:fs/promises';
+import { lstat, readdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { isIgnored } from '../../src/fsops.js';
 import { hashFiles, type SeedManifest } from '../../tools/corpus/lib.js';
 import { copyGroups, loadWorld, type ContentRow } from './db.js';
+import { stagedEntries } from './snapshot.js';
 
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
 const FINAL_STILL_STATES = new Set(['CLUSTERED', 'QUARANTINED', 'FAILED']);
@@ -17,6 +18,20 @@ async function filesUnder(root: string): Promise<string[]> {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw e;
   }
+}
+
+/** Regular files under `vault/` (`.copies` included) and their bytes, each inode counted once. */
+export async function vaultUsage(dataDir: string): Promise<{ files: number; bytes: bigint }> {
+  const seen = new Set<string>();
+  let bytes = 0n;
+  for (const p of await filesUnder(join(dataDir, 'vault'))) {
+    const st = await lstat(p, { bigint: true });
+    const key = `${String(st.dev)}:${String(st.ino)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    bytes += st.size;
+  }
+  return { files: seen.size, bytes };
 }
 
 const stemOf = (path: string): string => {
@@ -38,8 +53,12 @@ const conflict = (
 /**
  * - every seeded file has exactly one final row (ignored names: none, and no row is left
  *   DISCOVERED/CLAIMED); every still content is final; any FAILED content has a `last_error`
- * - `sha256(vault file) == name` for every vault file; every `.copies` file holds its row's bytes
- * - the vault plus `.copies` hold every seeded byte; `work/claimed/` is empty
+ * - `sha256(vault file) == name` for every vault file; every distinct seeded sha256 is in the
+ *   vault exactly once; `work/claimed/` is empty
+ * - after idle `.copies` holds no confirmed duplicate: every COPY row is marked removed (its
+ *   size reclaimed), none is flagged `copy_mismatch`, and `.copies` is empty (spec §6.5)
+ * - staging holds each non-motion content once: a byte-identical COPY is never staged (a paired
+ *   MOV is staged beside every placement of its still, by design)
  * - no copy group holds two different known `(captured_at, subsec)` values, or two contents with
  *   the same `burst_uuid` (burst frames are never copies of each other)
  */
@@ -73,25 +92,44 @@ export async function checkInvariant(
       out.push(`content ${c.sha256}: CLUSTERED without a copy group`);
   }
 
-  // Vault integrity and completeness.
+  // Vault integrity and completeness: each distinct seeded sha exactly once.
   const vault = join(dataDir, 'vault');
   const copiesDir = join(vault, '.copies') + sep;
   const all = await filesUnder(vault);
   const hashes = await hashFiles(all);
-  const held = new Set<string>();
+  const held = new Map<string, number>();
   const shaOfId = new Map(w.files.map((f) => [String(f.id), f.sha256]));
   all.forEach((p, i) => {
     const actual = hashes[i]!;
-    held.add(actual);
-    const expected = p.startsWith(copiesDir) ? shaOfId.get(stemOf(p)) : stemOf(p);
+    const inCopies = p.startsWith(copiesDir);
+    if (!inCopies) held.set(actual, (held.get(actual) ?? 0) + 1);
+    const expected = inCopies ? shaOfId.get(stemOf(p)) : stemOf(p);
     if (actual !== expected)
       out.push(`${p.slice(dataDir.length + 1)}: sha256 ${actual} ≠ expected ${String(expected)}`);
+    if (inCopies) out.push(`${p.slice(dataDir.length + 1)}: a duplicate still in .copies`);
   });
-  for (const f of sm.files)
-    if (!isIgnored(f.name) && !held.has(f.sha256))
-      out.push(`${f.relPath}: bytes ${f.sha256} not in the vault or .copies`);
+  for (const sha of new Set(sm.files.filter((f) => !isIgnored(f.name)).map((f) => f.sha256))) {
+    const n = held.get(sha) ?? 0;
+    if (n !== 1) out.push(`bytes ${sha}: in the vault ${String(n)} times, expected exactly once`);
+  }
+  for (const f of w.files) {
+    if (f.state !== 'COPY') continue;
+    const at = `files ${String(f.id)} ${f.relPath}`;
+    if (f.copyMismatch) out.push(`${at}: copy_mismatch (${String(f.lastError)})`);
+    else if (f.copyRemovedAt === null) out.push(`${at}: COPY not removed after idle`);
+    else if (f.copyReclaimedBytes !== f.sizeBytes)
+      out.push(`${at}: reclaimed ${String(f.copyReclaimedBytes)} bytes of ${String(f.sizeBytes)}`);
+  }
   const claimed = await filesUnder(join(dataDir, 'work', 'claimed'));
   if (claimed.length > 0) out.push(`work/claimed holds ${String(claimed.length)} files`);
+
+  // Staging choice (a): a non-motion content is staged once, so no byte-identical COPY is.
+  const placed = new Map<string, string[]>();
+  for (const e of await stagedEntries(dataDir))
+    placed.set(e.sha256, [...(placed.get(e.sha256) ?? []), e.dest]);
+  for (const [sha, dests] of placed)
+    if (dests.length > 1 && w.contents.get(sha)?.kind !== 'motion')
+      out.push(`content ${sha} staged ${String(dests.length)} times: ${dests.join(', ')}`);
 
   // Copy groups never mix shots.
   for (const [id, members] of copyGroups(w)) {

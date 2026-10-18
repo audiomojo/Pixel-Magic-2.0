@@ -26,11 +26,11 @@ Success means:
 | F6 | Live Photo motion clips (MOV) are staged beside their still, in the same folder, with the same base name. |
 | N1 | **Resumable:** a crash, `docker compose down`, power loss or Mac sleep at any point → processing resumes where it stopped, with no manual steps and no double effects. |
 | N2 | **Distributed:** workers are stateless and poll task queues. A worker can run in Docker, natively on macOS (needed for Metal/ANE AI), or on another machine. |
-| N3 | **Never destroys image bytes.** The vault is append-only. Deleting anything is always a human decision outside the pipeline. |
+| N3 | **Never destroys image bytes.** The vault is append-only. Deleting anything is always a human decision outside the pipeline, with one exception the user decided (2026-10-18, R9): a dropped file whose bytes the vault already holds is removed once a fresh re-hash of it **and** of the vault file both equal its SHA-256 (§6.5). The vault holds each distinct file once. |
 | N4 | **Observable:** live drop-zone count, backlog and in-flight work per stage, throughput, ETA, copy/similar counts, errors. |
 | N5 | Docker Compose, open-source components only, ports bound to `127.0.0.1`. |
 
-**Out of scope for v1:** the AI scoring itself (§9 only defines the hook), deleting anything, a review UI, video near-dedupe (videos get exact dedupe by SHA-256 only), detecting crops beyond about 5%, and multi-host shared storage.
+**Out of scope for v1:** the AI scoring itself (§9 only defines the hook), deleting anything other than confirmed byte-identical duplicates (§6.5), a review UI, video near-dedupe (videos get exact dedupe by SHA-256 only), detecting crops beyond about 5%, and multi-host shared storage.
 
 ## 3. Principles
 
@@ -57,7 +57,7 @@ Success means:
 
 | Queue | Activities | Concurrency per worker |
 |-------|-----------|------------------------|
-| `io` | `scan_and_start`, `ingest_file`, `record_hash`, `mark_failed`, `maybe_build_staging` | `IO_CONCURRENCY` = 8 |
+| `io` | `scan_and_start`, `ingest_file`, `reclaim_copy`, `sweep_copies`, `record_hash`, `mark_failed`, `maybe_build_staging` | `IO_CONCURRENCY` = 8 |
 | `cpu` | `decode_content` | `CPU_CONCURRENCY` = number of CPU cores |
 | `cluster` | `cluster_content` | **1**, plus a Postgres advisory lock held for the whole activity, so only one runs system-wide even with several workers |
 | `ai` (future) | `score_content` | Native macOS worker |
@@ -69,16 +69,20 @@ Success means:
   - ID-reuse policy *allow duplicate*, conflict policy *fail*: a start while the file's workflow is still running is ignored, while a re-drop after it has finished starts a new run.
   - **Backpressure:** the scan starts no new workflows while running `FileWorkflow`s ≥ `MAX_IN_FLIGHT` = 5000 (checked with a visibility count query).
   - It always writes `scan_stats` (pending files and bytes in the drop zone).
-- **`FileWorkflow(rel_path, size, mtime_ns)`** runs `ingest_file`. If the result is new still-image content, it then runs `decode_content` (cpu) → `record_hash` (io) → `cluster_content` (cluster). If the content is quarantined, the workflow ends there. If decode attempts run out (§7), it runs `mark_failed` and ends. **`ContentWorkflow(sha256)`** runs the same content steps and is used by `retry-failed`.
+- **`FileWorkflow(rel_path, size, mtime_ns)`** runs `ingest_file`. If the result is `COPY`, it runs `reclaim_copy` (io, §6.5) and ends, whatever that returns. If the result is new still-image content, it then runs `decode_content` (cpu) → `record_hash` (io) → `cluster_content` (cluster). If the content is quarantined, the workflow ends there. If decode attempts run out (§7), it runs `mark_failed` and ends. **`ContentWorkflow(sha256)`** runs the same content steps and is used by `retry-failed`.
 - **`StagingWorkflow`** runs on a Schedule every 5 min, or on demand via `make stage`. It runs `build_staging` when the data has changed since the last build **and** either no `FileWorkflow` is running or ≥ `STAGE_MAX_STALENESS_S` = 900 s have passed since the last build. `make stage FORCE=1` always rebuilds.
+- **`CopySweepWorkflow`** runs on a Schedule (`pm-copies`) every 15 min, overlap *skip*, or on demand via `make sweep-copies`. It calls `sweep_copies` in batches of 200 COPY rows, at most 50 per run, resuming at a persisted cursor (§6.5).
 
 ## 5. Data model (`pixelmagic`)
 
 ```
 files(id bigserial PK, rel_path text, original_name text, size_bytes bigint, mtime_ns bigint,
       ext text NULL, sha256 char(64) NULL, state text, workflow_run_id text UNIQUE NULL,
-      attempts int default 0, last_error text NULL, discovered_at, updated_at)
+      attempts int default 0, last_error text NULL, discovered_at, updated_at,
+      copy_removed_at timestamptz NULL, copy_reclaimed_bytes bigint NULL,
+      copy_mismatch bool default false)                                        -- 0004, §6.5
   state ∈ DISCOVERED | CLAIMED | INGESTED | COPY | QUARANTINED
+  CHECK copy_removed_at only on COPY rows, never together with copy_mismatch
   UNIQUE (rel_path, size_bytes, mtime_ns) WHERE state IN ('DISCOVERED','CLAIMED')   -- partial: a re-drop gets a new row
 
 contents(sha256 char(64) PK, ext text, kind text, mime text, size_bytes bigint,
@@ -97,6 +101,7 @@ groups(id bigserial PK, kind text, merged_into bigint NULL, similar_set_id bigin
 cluster_state(id int PK = 1, version bigint)            -- bumped by every cluster transaction
 scan_stats(id int PK = 1, pending_files bigint, pending_bytes bigint, scanned_at)
 staging_builds(gen bigint PK, watermark timestamptz, cluster_version bigint, built_at, entries bigint)
+copy_sweep_state(id int PK = 1, after_id bigint)        -- where the duplicate sweep resumes (0004)
 ```
 
 - `phash` and `dhash` are stored as signed int64; `toSigned` / `toUnsigned` (`BigInt.asIntN` / `asUintN`) convert. In TypeScript, hashes are always `bigint`.
@@ -113,7 +118,7 @@ Each step can be retried, and the state left by a crash at any point is handled:
 1. Upsert the `files` row by `(rel_path, size, mtime_ns)` among non-final rows, giving `file_id`.
 2. **Claim:** `rename(dropzone/rel_path, work/claimed/<file_id>)`.
    - If the source is missing but the claimed file exists, continue.
-   - If both are missing and `files.sha256` is set, the file is never marked vanished: if `vault/.copies/<file_id>.<ext>` exists, commit `COPY`; else if the vault file exists, commit as its owner (step 6); otherwise fail the attempt as retryable (an anomaly is retried, never hidden).
+   - If both are missing and `files.sha256` is set, the file is never marked vanished: if `vault/.copies/<file_id>.<ext>` exists, commit `COPY`; else if the vault file exists, commit as its owner (step 6); otherwise fail the attempt as retryable (an anomaly is retried, never hidden). This path sees only non-final rows; `.copies` files are removed (§6.5) only after `COPY` is committed, so a parked copy is never gone here.
    - If both are missing and there is no hash, mark `QUARANTINED(vanished)`.
 3. Stream SHA-256 in 1 MiB chunks, heartbeating. **Commit** `state=CLAIMED, sha256`.
 4. Detect the type by content using exiftool `FileType` and `MIMEType`, never by extension. This `MIMEType` is the only source of `contents.mime`. This handles `wide`-atom MOVs and the JPEG named `IMG_E8719.HEIC`. Read metadata through `exiftool-vendored` (one long-lived `-stay_open` exiftool per worker, raw tags with `-G -n`):
@@ -127,6 +132,11 @@ Each step can be retried, and the state left by a crash at any point is handled:
 7. `chmod 0444` the vault file. Staging hardlinks share the inode, so an editor saving in place cannot change the original.
 
 Returns `IngestResult(file_id, sha256, is_new, kind)`.
+
+**Crash states after `COPY` is committed** (with §6.5). A replay of a final row returns the stored outcome; for `COPY` it re-runs the tail of step 6 only if `.copies/<file_id>.<ext>` still exists. Each of these is normal:
+- `COPY`, `.copies` file present, not marked removed: removal is still to come (FileWorkflow or the sweep).
+- `COPY`, `.copies` file gone, `copy_removed_at` set: removed.
+- `COPY`, `.copies` file gone, **not** marked removed: a crash between removal's unlink and its mark. `reclaim_copy` re-hashes the vault file; if it equals `files.sha256` the row is marked removed. If the vault file is missing or differs, that is an anomaly: the row is flagged `copy_mismatch` (reported by `make doctor` and Grafana), never hidden and never retried.
 
 ### 6.2 `decode_content` (queue `cpu`) and `record_hash` (queue `io`)
 
@@ -172,6 +182,8 @@ Rows are evaluated top to bottom; the first match wins.
 
 ### 6.4 `build_staging` (queue `io`, heartbeats)
 
+Every staged link is a hardlink of a **vault** file (`vault/<ab>/<cd>/<sha256>.<ext>`). Byte-identical COPY files are never staged, removed or not (user choice (a), 2026-10-18); they only name contents (the lowest `(rel_path, file_id)` among all of a content's files) and pair Live Photos, and they are counted on the dashboard.
+
 Takes a Postgres advisory lock. Computes the whole tree from the database into `staging/.gen-<n+1>/` using hardlinks from the vault. Then it:
 1. creates the symlink `staging/.current.tmp → .gen-<n+1>`
 2. renames it over `staging/current` (atomic)
@@ -197,8 +209,7 @@ Among the files that share the best content, the one with the lowest `(rel_path,
 current/
   unique/YYYY/YYYY-MM/<YYYYMMDD_HHMMSS>_<original_name>      best copy of every copy group with no similar set
   similar/YYYY/YYYY-MM/s-<sha8>/<YYYYMMDD_HHMMSS>_<name>     best copy of every copy group in the set (all frames kept); sha8 of the set's best copy
-  copies/g-<sha8>/<name>                                     every other file of the group (other contents + byte copies); sha8 of the group's best copy
-  copies/v-<sha8>/<name>                                     byte copies of non-still files
+  copies/g-<sha8>/<name>                                     every other content of the group (different files of the same shot); sha8 of the group's best copy
   quarantine/<reason>/<name>                                 includes quarantine/failed/ for FAILED contents
   other/<rel_dir>/<name>                                     videos, AAE sidecars, unknown types (canonical file)
 ```
@@ -207,6 +218,18 @@ current/
   - Match a `motion` content to a `still` by `live_content_id`.
   - Fallback: some provenance file of each shares the source directory and the stem (case-insensitive, full stem, so `IMG_2834 1` ≠ `IMG_2834`), and `duration_s ≤ LIVE_MAX_DURATION_S` = 5.
   - A paired MOV goes beside **every** staged placement of its still's content. Unpaired MOVs go to `other/`.
+
+### 6.5 Removing confirmed duplicates: `reclaim_copy` and `sweep_copies` (queue `io`, heartbeats)
+
+User decision 2026-10-18: the vault holds each distinct file once, and re-dropping the same folders stores nothing new. Ingest is unchanged up to `COPY` (§6.1). Then, for a `COPY` row whose `vault/.copies/<file_id>.<ext>` exists:
+
+1. Skip (return the outcome, change nothing) if the row is not `COPY`, is already marked removed, or is flagged `copy_mismatch` (never retried).
+2. If the `.copies` file has another name (`nlink > 1`, e.g. a staging generation built before this change linked it), **defer**: unlinking would free nothing. A later sweep retries once that generation is gone.
+3. Re-hash the `.copies` file **and** the vault file `vault/<ab>/<cd>/<sha256>.<ext>` (1 MiB chunks, heartbeating), and check both are unchanged since (size, mtime; not the inode number, which virtiofs may renumber) right before the unlink; a change fails the attempt as retryable.
+4. Only if both hashes equal `files.sha256`: `unlink` the `.copies` file, fsync `vault/.copies`, then mark the row: `copy_removed_at`, `copy_reclaimed_bytes`.
+5. On any mismatch, a missing vault file, or something other than a regular file: delete nothing, keep both files, set `copy_mismatch` with the observed hashes in `last_error`. Shown by `make doctor` and the Grafana "Copy mismatches" tile.
+
+The order is crash-safe: `COPY` is committed before any unlink, and the mark follows it (§6.1, crash states). The step runs in **FileWorkflow** right after a `COPY` outcome, and in **`sweep_copies`** (`CopySweepWorkflow`), which takes the next 200 `COPY` rows not removed and not flagged after `copy_sweep_state.after_id`, in id order, and wraps to 0 at the end. The sweep covers crash leftovers, deferred copies and the one-off pass over data ingested before this change.
 
 ## 7. Errors and retries
 
@@ -222,8 +245,9 @@ Activity timeouts:
 - `cluster_content`, `mark_failed`: start-to-close 1 min
 - `scan_and_start`: start-to-close 10 min, heartbeat 30 s
 - `build_staging`: start-to-close 2 h, heartbeat 30 s
+- `reclaim_copy`, `sweep_copies`: start-to-close 1 h, heartbeat 30 s (hashing a large video twice)
 
-Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-vault [SAMPLE=1000]` re-hashes vault files and reports mismatches. It skips `vault/.copies/` (named by file id, not hash) and reports how many it skipped. It never repairs anything.
+Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-vault [SAMPLE=1000]` re-hashes vault files and reports mismatches. It skips `vault/.copies/` (named by file id, not hash) and reports how many files are still there and how many duplicates were removed (§6.5). It never repairs anything.
 
 ## 8. Observability
 
@@ -234,7 +258,9 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
   - backlog per stage (`contents` by state)
   - throughput per stage per minute (from `ingested_at`, `hashed_at`, `clustered_at`)
   - ETA (backlog ÷ 10-minute rate)
-  - copy groups, similar sets, ≈ bytes reclaimable (per copy group Σ size − max size, plus the size of byte-copy files; an approximation that doesn't repeat the §6.4 best-copy rule in SQL)
+  - copy groups, similar sets
+  - duplicates removed (§6.5): the count, bytes reclaimed, and bytes of COPY files still pending removal
+  - copy mismatches (duplicates kept because a re-hash disagreed or a file was missing): should read 0
   - quarantined by reason, FAILED count and the last 20 `last_error` values
   - age of the last staging build
 - **Alert (optional):** "backlog > 0 and no stage throughput for 10 min" → an ntfy webhook.
@@ -268,7 +294,8 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
    - The **golden invariant** must hold:
      - every seeded file has exactly one final row, in a final state; any FAILED content has a `last_error`
      - `sha256(vault file) == name` for every vault file
-     - the vault plus `.copies` hold every seeded byte
+     - every distinct seeded SHA-256 is in the vault exactly once, and after idle `.copies` holds no confirmed duplicate (every COPY row is marked removed, none flagged)
+     - staging holds each non-motion content once (no byte-identical COPY is staged)
      - `work/claimed/` is empty
      - no copy group contains two different known capture times
    - "Equal" means: the similar-set partition and the copy-group partition are identical, and so is the staging tree snapshot, except for contents flagged `copy_ambiguous` in **either** run (and their staged entries), which both comparisons leave out.
@@ -282,7 +309,7 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
 | Formats | §6.2. Videos and other files are exact-deduped only, then go to `other/` (MOVs paired with a still go beside the still) |
 | Where it runs | Develop on the Mac in Docker Desktop. AI workers run natively on macOS. Stays portable to Linux |
 | One volume | Yes. The worker refuses to start if `DATA_DIR` subfolders span devices |
-| Empty the drop zone | Yes, files are moved into the vault. Nothing is ever deleted |
+| Empty the drop zone | Yes, files are moved into the vault. Nothing is ever deleted, except confirmed byte-identical duplicates (§6.5, R9) |
 
 ## 12. Revisions during planning
 
@@ -302,3 +329,4 @@ These changes were made while writing the implementation plan. The sections abov
   - §6.1: a hashed file whose source and claimed copies are gone is never marked vanished (`.copies` → COPY, vault → owner, else retry). `COPY` means exactly "EEXIST with a different inode", and only the vault owner inserts `contents`. State updates are guarded by predecessor states. `contents.mime` comes only from exiftool.
   - §5: `staging_builds.cluster_version` stores the version next to the watermark; `updated_at` uses `clock_timestamp()`.
   - §7: `mark_failed` and `scan_and_start` get timeouts; `verify-vault` skips `.copies`. §8: "reclaimable" is an approximation. §4.1: a one-shot registers the `default` namespace.
+- **R9 Remove confirmed duplicates (user decision, 2026-10-18).** A `COPY` file's `.copies` twin is unlinked once a fresh re-hash of it and of its vault file both equal `files.sha256` (§6.5; migration 0004). N3's unlink rule now reads: a file holding dropped bytes may be unlinked only (a) after another durable link exists, or (b) after it is confirmed byte-identical to its vault file by a fresh re-hash of both. Staging shows only different files of the same shot under `copies/` (choice (a)); `copies/v-` is gone. Rulings where the brief was silent, each the option that deletes nothing: a `.copies` file with another link is deferred, not unlinked; a missing vault file, a non-regular file or a hash disagreement flags the row and deletes nothing; a file that changes during the re-hash is retried, not removed. The dashboard's "≈ Reclaimable" tile became "Duplicates removed" (count, bytes reclaimed, bytes pending) plus "Copy mismatches".

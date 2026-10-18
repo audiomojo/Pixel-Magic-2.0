@@ -6,6 +6,17 @@ Photo de-duplication pipeline (TypeScript, Temporal, Postgres). Drop photos into
 Everything under `DATA_DIR` must live on one filesystem (hardlinks and renames are
 relied on). Verify with `make fs-check`.
 
+The vault holds each distinct file once. A dropped file whose bytes are already in the vault
+(a byte-identical duplicate, state `COPY`) is parked in `vault/.copies/` and then removed, but
+only after a fresh re-hash of it **and** of the vault file both match. That is the one thing the
+pipeline ever deletes (otherwise a file holding dropped bytes is unlinked only once another
+durable link exists). On any disagreement both files are kept and the row is flagged: see
+`make doctor` and the Grafana "Copy mismatches" tile, which should read 0. `make copies` lists
+every duplicate drop (path, mtime, when it was dropped, the vault sha), so you can see what was
+dropped twice; `make sweep-copies` runs the 15-minute duplicate sweep now. `staging/current/copies/`
+shows only different files of the same shot (e.g. a resized JPG of a HEIC), never byte-identical
+duplicates.
+
 `staging/current/` is rebuilt from the database: don't keep files there. Anything saved inside
 it that staging did not put there is moved to `staging/.rescued/<generation>/` when that
 generation is cleaned up, never deleted.
@@ -57,6 +68,13 @@ Rules for changes to `src/workflows.ts`:
   behind `patched('<change-id>')`, so running histories replay the old path. After a later
   drain, replace it with `deprecatePatch('<change-id>')`, then remove it.
 - Activity implementations and activity options can change without a drain.
+
+**Upgrading to duplicate removal (migration 0004).** Staging generations built before it hardlink
+every `.copies` file, and removal defers a `.copies` file that has another link (it would free
+nothing). After `make up`, run `make stage FORCE=1` **twice** (the build keeps the previous
+generation), then `make sweep-copies` until Grafana's "Duplicates removed" tile shows 0 pending
+bytes (each run handles at most 10,000 duplicates; `pm-copies` also runs it every 15 min).
+Check `make doctor` for `copyMismatches: 0`.
 
 A worker restart (upgrade, crash or Mac reboot) costs each in-flight decode one poison attempt.
 A content whose attempts run out ends FAILED; `make retry-failed` starts it again, and is safe

@@ -26,6 +26,12 @@ export interface FileRow {
   originalName: string;
   state: string;
   sha256: string | null;
+  sizeBytes: bigint;
+  /** Set once its byte-identical `.copies` file was removed (spec §6.5). */
+  copyRemovedAt: Date | null;
+  copyReclaimedBytes: bigint | null;
+  copyMismatch: boolean;
+  lastError: string | null;
 }
 
 export interface ContentRow {
@@ -77,7 +83,15 @@ export async function loadWorld(url: string): Promise<World> {
     original_name: string;
     state: string;
     sha256: string | null;
-  }>('SELECT id, rel_path, original_name, state, sha256 FROM files ORDER BY id');
+    size_bytes: bigint;
+    copy_removed_at: Date | null;
+    copy_reclaimed_bytes: bigint | null;
+    copy_mismatch: boolean;
+    last_error: string | null;
+  }>(
+    `SELECT id, rel_path, original_name, state, sha256, size_bytes, copy_removed_at,
+            copy_reclaimed_bytes, copy_mismatch, last_error FROM files ORDER BY id`,
+  );
   const contents = await pool.query<{
     sha256: string;
     kind: string;
@@ -103,6 +117,11 @@ export async function loadWorld(url: string): Promise<World> {
       originalName: r.original_name,
       state: r.state,
       sha256: r.sha256,
+      sizeBytes: r.size_bytes,
+      copyRemovedAt: r.copy_removed_at,
+      copyReclaimedBytes: r.copy_reclaimed_bytes,
+      copyMismatch: r.copy_mismatch,
+      lastError: r.last_error,
     })),
     contents: new Map(
       contents.rows.map((r) => {
