@@ -8,6 +8,8 @@ import {
 import type { Settings } from './config.js';
 
 export const STAGE_INTERVAL_S = 300;
+/** The duplicate sweep (spec §6.5): low frequency, each run bounded (`CopySweepWorkflow`). */
+export const COPY_SWEEP_INTERVAL_S = 900;
 
 /** The schedules this deployment wants (spec §4.3), from the current settings. */
 export function scheduleOptions(s: Settings): ScheduleOptions[] {
@@ -36,6 +38,19 @@ export function scheduleOptions(s: Settings): ScheduleOptions[] {
         workflowId: 'pm-stage',
         taskQueue: 'main',
         args: [false],
+      },
+      policies,
+    },
+    {
+      // Crash leftovers, deferred copies and the one-off pass over data from before removal.
+      scheduleId: 'pm-copies',
+      spec: every(COPY_SWEEP_INTERVAL_S),
+      action: {
+        type: 'startWorkflow',
+        workflowType: 'CopySweepWorkflow',
+        workflowId: 'pm-copies',
+        taskQueue: 'main',
+        args: [],
       },
       policies,
     },

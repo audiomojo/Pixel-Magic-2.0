@@ -42,3 +42,19 @@ export interface ScanResult {
  * type (not a value) so workflow code can share it through a type-only import.
  */
 export type DecodeKilledType = 'DecodeKilled';
+
+/**
+ * `reclaimCopy`'s outcome for one file (spec §6.5). `DEFERRED`: the `.copies` file has another
+ * name too (an older staging generation), so it is left for a later sweep. `MISMATCH`: flagged,
+ * nothing deleted, never retried.
+ */
+export type ReclaimOutcome = 'REMOVED' | 'ALREADY_REMOVED' | 'MISMATCH' | 'DEFERRED' | 'NOT_COPY';
+
+/** `sweepCopies`' outcome for one bounded batch; `wrapped`: the pass reached the last COPY row. */
+export interface SweepResult {
+  examined: number;
+  removed: number;
+  mismatched: number;
+  deferred: number;
+  wrapped: boolean;
+}

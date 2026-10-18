@@ -31,6 +31,7 @@ export async function startPg(): Promise<PgHandle> {
       await pool.query(
         'UPDATE scan_stats SET pending_files = 0, pending_bytes = 0, scanned_at = NULL WHERE id = 1',
       );
+      await pool.query('UPDATE copy_sweep_state SET after_id = 0 WHERE id = 1');
     },
     async stop() {
       await pool.end();

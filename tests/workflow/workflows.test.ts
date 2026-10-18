@@ -12,10 +12,13 @@ import type {
   DecodeResult,
   FileRef,
   IngestResult,
+  ReclaimOutcome,
   ScanResult,
+  SweepResult,
 } from '../../src/types.js';
 import type {
   ContentWorkflow,
+  CopySweepWorkflow,
   FileWorkflow,
   ScanWorkflow,
   StagingWorkflow,
@@ -29,6 +32,8 @@ interface Overrides {
   cluster?: Fakeable<number>;
   stage?: (force: boolean) => BuildResult;
   scan?: Fakeable<ScanResult>;
+  reclaim?: Fakeable<ReclaimOutcome>;
+  sweep?: Fakeable<SweepResult>;
 }
 type Impl = Pick<
   Activities,
@@ -40,6 +45,8 @@ type Impl = Pick<
   | 'clusterContent'
   | 'maybeBuildStaging'
   | 'scanAndStart'
+  | 'reclaimCopy'
+  | 'sweepCopies'
 >;
 interface Fakes {
   impl: Impl;
@@ -106,6 +113,10 @@ function fakes(o: Overrides): Fakes {
       scanAndStart: rec('scanAndStart', () =>
         value(o.scan, { started: 0, pendingFiles: 0, pendingBytes: '0' }),
       ),
+      reclaimCopy: rec('reclaimCopy', () => value<ReclaimOutcome>(o.reclaim, 'REMOVED')),
+      sweepCopies: rec('sweepCopies', () =>
+        value(o.sweep, { examined: 0, removed: 0, mismatched: 0, deferred: 0, wrapped: true }),
+      ),
     },
   };
 }
@@ -124,6 +135,8 @@ const NAMES = [
   'clusterContent',
   'maybeBuildStaging',
   'scanAndStart',
+  'reclaimCopy',
+  'sweepCopies',
 ] as const;
 /** Every activity forwards to the current test's fakes, so one set of workers serves the file. */
 const activities = Object.fromEntries(
@@ -190,10 +203,32 @@ test('new still passes each step its inputs', async () => {
   expect(f.args['clusterContent']).toEqual([[SHA]]);
 });
 
-test('COPY stops after ingest', async () => {
+test('COPY removes the confirmed duplicate, then stops', async () => {
   const f = fakes({ ingest: COPY });
   expect(await runFile(f)).toBe('COPY');
-  expect(f.calls).toEqual(['ingestFile']);
+  expect(f.calls).toEqual(['ingestFile', 'reclaimCopy']);
+  expect(f.args['reclaimCopy']).toEqual([[COPY.fileId]]);
+});
+
+test('the reclaim step retries through an outage', async () =>
+  expect(await runFile(fakes({ ingest: COPY, reclaim: failNTimes(10, 'REMOVED') }))).toBe('COPY'));
+
+test('CopySweepWorkflow is bounded: it stops after its batch cap or once the pass wraps', async () => {
+  const run = () =>
+    env.client.workflow.execute<typeof CopySweepWorkflow>('CopySweepWorkflow', {
+      ...id(),
+      args: [],
+    });
+  const batch = { examined: 3, removed: 3, mismatched: 0, deferred: 0, wrapped: false };
+  current = fakes({ sweep: batch });
+  expect(await run()).toMatchObject({ wrapped: false });
+  const capped = current.calls.length;
+  expect(capped).toBeGreaterThan(1);
+  let n = 0;
+  current = fakes({ sweep: () => ({ ...batch, wrapped: ++n === 2 }) });
+  expect(await run()).toEqual({ ...batch, examined: 6, removed: 6, wrapped: true });
+  expect(current.calls).toEqual(['sweepCopies', 'sweepCopies']);
+  expect(capped).toBeLessThanOrEqual(100);
 });
 
 test('motion stops after ingest', async () =>

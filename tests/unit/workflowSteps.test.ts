@@ -14,7 +14,9 @@ type Fake = (...a: unknown[]) => unknown;
 const h = vi.hoisted(() => {
   const impl: Record<string, Fake> = {};
   const calls: { name: string; args: unknown[]; opts: unknown }[] = [];
-  return { impl, calls };
+  /** `patched(id)` answers; a missing id means a new run (the patch applies). */
+  const patches: Record<string, boolean> = {};
+  return { impl, calls, patches };
 });
 
 vi.mock('@temporalio/workflow', async (importOriginal) => {
@@ -23,7 +25,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => {
     ...actual,
     log: { warn: () => undefined },
     sleep: () => Promise.resolve(),
-    patched: () => true, // a new run: every patch applies
+    patched: (id: string) => h.patches[id] ?? true, // a new run: every patch applies
     proxyActivities: (opts: unknown) =>
       new Proxy(
         {},
@@ -70,6 +72,7 @@ const activityFailure = (cause: Error) =>
 
 beforeEach(() => {
   h.calls.length = 0;
+  for (const k of Object.keys(h.patches)) delete h.patches[k];
   h.impl = {
     ingestFile: () => STILL,
     decodeContent: () => DECODED,
@@ -79,6 +82,8 @@ beforeEach(() => {
     reopenFailed: () => undefined,
     maybeBuildStaging: (force) => ({ gen: force ? 1 : null, entries: 0, skipped: !force }),
     scanAndStart: () => ({ started: 1, pendingFiles: 1, pendingBytes: '1' }),
+    reclaimCopy: () => 'REMOVED',
+    sweepCopies: () => ({ examined: 1, removed: 1, mismatched: 0, deferred: 0, wrapped: true }),
   };
 });
 
@@ -122,9 +127,11 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
     'ingestFile',
     'markFailed',
     'maybeBuildStaging',
+    'reclaimCopy',
     'recordHash',
     'reopenFailed',
     'scanAndStart',
+    'sweepCopies',
   ]);
   for (const [k, v] of all) {
     expect(v.startToCloseTimeout, k).toBeDefined();
@@ -142,6 +149,13 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
     startToCloseTimeout: '10m',
     heartbeatTimeout: '30s',
   });
+  // Hashing a large video twice takes a while: heartbeats, and a generous start-to-close.
+  for (const k of ['reclaimCopy', 'sweepCopies'] as const)
+    expect(o[k], k).toMatchObject({
+      taskQueue: 'io',
+      startToCloseTimeout: '1h',
+      heartbeatTimeout: '30s',
+    });
 });
 
 test('poisonAttempts caps poison decode attempts', async () => {
@@ -193,8 +207,62 @@ test('quarantine ends before clustering', async () => {
   expect(names()).not.toContain('clusterContent');
 });
 
+test('a COPY outcome removes the confirmed duplicate, then ends', async () => {
+  h.impl['ingestFile'] = () => ({
+    ...STILL,
+    fileId: '42',
+    state: 'COPY',
+    isNew: false,
+    kind: null,
+  });
+  expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
+  expect(names()).toEqual(['ingestFile', 'reclaimCopy']);
+  expect(h.calls[1]).toMatchObject({ args: ['42'], opts: { taskQueue: 'io' } });
+});
+
+test('a mismatch is the outcome, not an error: the COPY workflow still ends normally', async () => {
+  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', isNew: false, kind: null });
+  h.impl['reclaimCopy'] = () => 'MISMATCH';
+  expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
+});
+
+test('a history from before removal existed replays without the reclaim step', async () => {
+  h.patches['reclaim-copy'] = false;
+  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', isNew: false, kind: null });
+  expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
+  expect(names()).toEqual(['ingestFile']);
+});
+
+const swept = (wrapped: boolean) => ({
+  examined: 2,
+  removed: 1,
+  mismatched: 0,
+  deferred: 1,
+  wrapped,
+});
+
+test('CopySweepWorkflow sweeps batches until the pass wraps, and sums them', async () => {
+  let n = 0;
+  h.impl['sweepCopies'] = () => swept(++n === 3);
+  expect(await wf.CopySweepWorkflow()).toEqual({
+    examined: 6,
+    removed: 3,
+    mismatched: 0,
+    deferred: 3,
+    wrapped: true,
+  });
+  expect(h.calls.map((c) => [c.name, c.args])).toEqual(
+    Array(3).fill(['sweepCopies', [wf.SWEEP_BATCH]]),
+  );
+});
+
+test('CopySweepWorkflow is bounded per run', async () => {
+  h.impl['sweepCopies'] = () => swept(false);
+  expect(await wf.CopySweepWorkflow()).toMatchObject({ wrapped: false });
+  expect(names()).toHaveLength(wf.MAX_SWEEP_BATCHES);
+});
+
 test.each([
-  ['COPY', { ...STILL, state: 'COPY', isNew: false, kind: null }],
   ['QUARANTINED', { ...STILL, state: 'QUARANTINED', sha256: null, ext: null, kind: null }],
   ['INGESTED', { ...STILL, kind: 'motion' }],
   ['INGESTED', { ...STILL, kind: 'other' }],

@@ -591,3 +591,45 @@ test('a file written to while it is hashed is put back and retried, never vaulte
   expect((await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).state).toBe('QUARANTINED');
   expect(existsSync(join(layout.dropzone, 'a.jpg'))).toBe(true);
 });
+
+// Spec §6.1 with removal (§6.5): a COPY's .copies file disappears by design once confirmed.
+test('replaying a COPY whose duplicate was removed returns the stored outcome', async () => {
+  await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
+  const ref = await drop('b.jpg', JPEG_A);
+  const b = await runActivity(acts.ingestFile, [ref], { runId: 'r2' });
+  expect(await runActivity(acts.reclaimCopy, [b.fileId])).toBe('REMOVED');
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r2' })).toEqual(b);
+  expect(await readdir(layout.vaultCopies)).toEqual([]);
+  expect(await count('files', `state = 'COPY' AND copy_removed_at IS NOT NULL`)).toBe(1);
+});
+
+test('a re-drop of bytes whose earlier copy was removed is a COPY again, then removed', async () => {
+  await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
+  const ref = await drop('b.jpg', JPEG_A);
+  const b = await runActivity(acts.ingestFile, [ref], { runId: 'r2' });
+  expect(await runActivity(acts.reclaimCopy, [b.fileId])).toBe('REMOVED');
+  const again = await drop('b.jpg', JPEG_A, BigInt(ref.mtimeNs));
+  const b2 = await runActivity(acts.ingestFile, [again], { runId: 'r3' });
+  expect([b2.state, b2.sha256]).toEqual(['COPY', b.sha256]);
+  expect(b2.fileId).not.toBe(b.fileId);
+  expect(await runActivity(acts.reclaimCopy, [b2.fileId])).toBe('REMOVED');
+  expect(await vaultFiles()).toHaveLength(1);
+  expect([await count('files'), await count('contents')]).toEqual([3, 1]);
+});
+
+test('a parked copy whose COPY commit crashed is committed, never removed before it', async () => {
+  await runActivity(acts.ingestFile, [await drop('first.jpg', JPEG_A)], { runId: 'r0' });
+  const ref = await drop('a.jpg', JPEG_A);
+  await expect(
+    runActivity(createActivities(crashAt('copies_rename')).ingestFile, [ref], { runId: 'r1' }),
+  ).rejects.toThrow(SimulatedCrash);
+  const { id } = (await pool.query<{ id: bigint }>(`SELECT id FROM files WHERE state = 'CLAIMED'`))
+    .rows[0]!;
+  // The row is not COPY yet: removal must leave its parked bytes alone.
+  expect(await runActivity(acts.reclaimCopy, [String(id)])).toBe('NOT_COPY');
+  expect(await runActivity(acts.sweepCopies, [10])).toMatchObject({ examined: 0 });
+  expect(await readdir(layout.vaultCopies)).toEqual([`${String(id)}.jpg`]);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r.state).toBe('COPY');
+  expect(await runActivity(acts.reclaimCopy, [r.fileId])).toBe('REMOVED');
+});

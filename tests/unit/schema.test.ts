@@ -135,3 +135,35 @@ test('similar-set re-pointing on a merge is indexed (migration 0003)', async () 
     'CREATE INDEX groups_similar_set_id_idx ON public.groups USING btree (similar_set_id)',
   ]);
 });
+
+test('files records a removed duplicate: when, bytes, or a mismatch flag (migration 0004)', async () => {
+  const r = await one<{
+    copy_removed_at: Date | null;
+    copy_reclaimed_bytes: bigint | null;
+    copy_mismatch: boolean;
+  }>(`${ins} RETURNING copy_removed_at, copy_reclaimed_bytes, copy_mismatch`, ['COPY']);
+  expect(r).toEqual({ copy_removed_at: null, copy_reclaimed_bytes: null, copy_mismatch: false });
+});
+
+test('only a COPY row can be marked removed, and never while flagged a mismatch', async () => {
+  const id = (await one<{ id: bigint }>(`${ins} RETURNING id`, ['INGESTED'])).id;
+  await expect(
+    pool.query('UPDATE files SET copy_removed_at = now() WHERE id = $1', [id]),
+  ).rejects.toMatchObject({ code: '23514' });
+  const c = (await one<{ id: bigint }>(`${ins} RETURNING id`, ['COPY'])).id;
+  await expect(
+    pool.query('UPDATE files SET copy_removed_at = now(), copy_mismatch = true WHERE id = $1', [c]),
+  ).rejects.toMatchObject({ code: '23514' });
+});
+
+test('the duplicate sweep cursor is a singleton that truncate resets', async () => {
+  await pool.query('UPDATE copy_sweep_state SET after_id = 42 WHERE id = 1');
+  await truncate();
+  expect(
+    (await one<{ after_id: bigint }>('SELECT after_id FROM copy_sweep_state WHERE id = 1'))
+      .after_id,
+  ).toBe(0n);
+  await expect(pool.query('INSERT INTO copy_sweep_state (id) VALUES (2)')).rejects.toMatchObject({
+    code: '23514',
+  });
+});

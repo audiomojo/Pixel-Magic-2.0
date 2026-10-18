@@ -4,6 +4,7 @@ import type { Settings } from '../config.js';
 import type { DataLayout } from '../fsops.js';
 import type { MetadataReader } from '../metadata.js';
 import { makeClusterContent } from './cluster.js';
+import { makeCopies } from './copies.js';
 import { makeHashing, type WorkerPool } from './hashing.js';
 import { makeIngestFile } from './ingest.js';
 import { makeScan } from './scan.js';
@@ -27,6 +28,7 @@ export function createActivities(deps: Deps) {
     ingestFile: makeIngestFile(deps),
     ...makeHashing(deps),
     clusterContent: makeClusterContent(deps),
+    ...makeCopies(deps),
     maybeBuildStaging: makeStaging(deps),
     scanAndStart: makeScan(deps),
   };

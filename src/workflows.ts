@@ -12,7 +12,7 @@ import {
   type RetryPolicy,
 } from '@temporalio/workflow';
 import type { Activities } from './activities/index.js';
-import type { BuildResult, DecodeKilledType, FileRef, ScanResult } from './types.js';
+import type { BuildResult, DecodeKilledType, FileRef, ScanResult, SweepResult } from './types.js';
 
 /** Spec §7 transient retry: 1 s, ×2, capped at 5 min, unlimited attempts (no `maximumAttempts`). */
 export const TRANSIENT_RETRY: RetryPolicy = {
@@ -62,6 +62,19 @@ export const ACTIVITY_OPTIONS = {
     heartbeatTimeout: '30s',
     retry: TRANSIENT_RETRY,
   },
+  /** Re-hashes a duplicate and its vault file (a large video takes a while): heartbeats. */
+  reclaimCopy: {
+    taskQueue: 'io',
+    startToCloseTimeout: '1h',
+    heartbeatTimeout: '30s',
+    retry: TRANSIENT_RETRY,
+  },
+  sweepCopies: {
+    taskQueue: 'io',
+    startToCloseTimeout: '1h',
+    heartbeatTimeout: '30s',
+    retry: TRANSIENT_RETRY,
+  },
 } satisfies Record<keyof Activities, ActivityOptions>;
 
 const { ingestFile } = proxyActivities<Activities>(ACTIVITY_OPTIONS.ingestFile);
@@ -71,6 +84,8 @@ const { markFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.markFailed);
 const { reopenFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.reopenFailed);
 const { maybeBuildStaging } = proxyActivities<Activities>(ACTIVITY_OPTIONS.maybeBuildStaging);
 const { scanAndStart } = proxyActivities<Activities>(ACTIVITY_OPTIONS.scanAndStart);
+const { reclaimCopy } = proxyActivities<Activities>(ACTIVITY_OPTIONS.reclaimCopy);
+const { sweepCopies } = proxyActivities<Activities>(ACTIVITY_OPTIONS.sweepCopies);
 
 const DECODE_KILLED: DecodeKilledType = 'DecodeKilled';
 /** Decode attempts in all (kills included) before a content is FAILED `decode_killed`. */
@@ -119,12 +134,18 @@ export async function runContentSteps(
   return 'CLUSTERED';
 }
 
-/** One dropped file: ingest, then the content steps if it brought new still-image content. */
+/**
+ * One dropped file: ingest, then the content steps if it brought new still-image content. A
+ * byte-identical COPY has its `.copies` file removed once confirmed (spec §6.5); a mismatch is
+ * an outcome (flagged), so the workflow ends normally either way. `patched`: histories started
+ * before removal existed replay without the step (the sweep covers those files).
+ */
 export async function FileWorkflow(
   ref: FileRef,
   opts: { poisonAttempts?: number } = {},
 ): Promise<string> {
   const r = await ingestFile(ref);
+  if (r.state === 'COPY' && patched('reclaim-copy')) await reclaimCopy(r.fileId);
   if (r.state !== 'INGESTED' || r.kind !== 'still') return r.state;
   if (r.sha256 === null || r.ext === null)
     throw ApplicationFailure.nonRetryable(
@@ -156,4 +177,32 @@ export async function ScanWorkflow(): Promise<ScanResult> {
 /** Scheduled (`pm-stage`) or on demand (`cli stage [--force]`). */
 export async function StagingWorkflow(force = false): Promise<BuildResult> {
   return maybeBuildStaging(force);
+}
+
+/** Rows per `sweepCopies` call, and calls per run: a run examines at most 10,000 COPY rows. */
+export const SWEEP_BATCH = 200;
+export const MAX_SWEEP_BATCHES = 50;
+
+/**
+ * Scheduled (`pm-copies`) or on demand (`cli sweep-copies`): removes confirmed duplicates that
+ * FileWorkflow did not (crash leftovers, deferred copies, files ingested before removal existed).
+ * Bounded: `MAX_SWEEP_BATCHES` batches of `SWEEP_BATCH`; the next run resumes at the cursor.
+ */
+export async function CopySweepWorkflow(): Promise<SweepResult> {
+  const total: SweepResult = {
+    examined: 0,
+    removed: 0,
+    mismatched: 0,
+    deferred: 0,
+    wrapped: false,
+  };
+  for (let i = 0; i < MAX_SWEEP_BATCHES && !total.wrapped; i++) {
+    const r = await sweepCopies(SWEEP_BATCH);
+    total.examined += r.examined;
+    total.removed += r.removed;
+    total.mismatched += r.mismatched;
+    total.deferred += r.deferred;
+    total.wrapped = r.wrapped;
+  }
+  return total;
 }

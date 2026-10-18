@@ -33,10 +33,26 @@ function fakeScheduleClient({ existing }: { existing: string[] }) {
   return { client: client as unknown as Client, created, updated };
 }
 
-test('ensureSchedules creates both schedules', async () => {
+test('ensureSchedules creates every schedule', async () => {
   const sc = fakeScheduleClient({ existing: [] });
   await ensureSchedules(sc.client, settings);
-  expect([...sc.created.keys()].sort()).toEqual(['pm-scan', 'pm-stage']);
+  expect([...sc.created.keys()].sort()).toEqual(['pm-copies', 'pm-scan', 'pm-stage']);
+});
+
+test('pm-copies runs the bounded CopySweepWorkflow every 15 min, never overlapping', async () => {
+  const sc = fakeScheduleClient({ existing: [] });
+  await ensureSchedules(sc.client, settings);
+  expect(sc.created.get('pm-copies')).toMatchObject({
+    spec: { intervals: [{ every: '900s' }] },
+    action: {
+      type: 'startWorkflow',
+      workflowType: 'CopySweepWorkflow',
+      workflowId: 'pm-copies',
+      taskQueue: 'main',
+      args: [],
+    },
+    policies: { overlap: ScheduleOverlapPolicy.SKIP },
+  });
 });
 
 test('pm-scan runs ScanWorkflow every scanIntervalS, pm-stage StagingWorkflow every 300 s', async () => {
