@@ -248,6 +248,31 @@ describe('subsets', () => {
     expect(selectSubsets(m, 1).standard.sort()).toEqual([...PINNED].sort());
   });
 
+  test('smoke takes BurstUUID-backed bursts first (the hard "bursts never collapse" case)', () => {
+    const base = fakeManifest(500).records.filter((r) => r.burstUuid === null);
+    const timed = Array.from({ length: 20 }, (_, i) =>
+      ['1', '2', '3'].map((sub) =>
+        rec(`T${String(i)}_${sub}.JPG`, {
+          camera: 'cam',
+          subsec: sub,
+          capturedAt: new Date(Date.parse(T0) + i * 60_000).toISOString(),
+        }),
+      ),
+    ).flat();
+    const uuid = [0, 1].flatMap((i) =>
+      [0, 1, 2].map((j) => rec(`U${String(i)}_${String(j)}.HEIC`, { burstUuid: `u${String(i)}` })),
+    );
+    const records = [...base, ...timed, ...uuid];
+    const m: Manifest = { version: 1, records, relations: buildRelations(records) };
+    for (const seed of [1, 2, 3, 7, 42]) {
+      const smoke = new Set(selectSubsets(m, seed).smoke);
+      expect(
+        uuid.every((r) => smoke.has(r.name)),
+        `seed ${String(seed)}`,
+      ).toBe(true);
+    }
+  });
+
   test('selectSubsets throws when a pinned file is missing', () =>
     expect(() => selectSubsets(fakeManifest(500, { omit: ['IMG_2834 1.MOV'] }), 7)).toThrow(
       /IMG_2834 1\.MOV/,
@@ -467,16 +492,44 @@ describe('seed', () => {
       clone: () => Promise.reject(new Error('must not clone')),
       copy: (a, b) => (calls.push(basename(a)), defaultCopier.copy(a, b)),
     };
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, 'warn').mockImplementation((m: string) => void calls.push(m));
     try {
       const dest = join(tmp, 'fb');
       const sm = await seed({ corpusDir: src, names: ['a.jpg', 'b.jpg'], dest }, copier);
       expect(sm.fallbackCopies).toBe(2);
-      expect(calls.sort()).toEqual(['a.jpg', 'b.jpg']);
-      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/2 .*byte cop/));
+      // Warned up front, before the first byte is copied (a big tier copies for a long time).
+      expect(calls[0]).toMatch(/2 .*byte cop/);
+      expect(calls.slice(1).sort()).toEqual(['a.jpg', 'b.jpg']);
+      expect(warn).toHaveBeenCalledTimes(1);
       expect(await readFile(join(dest, 'a.jpg'))).toEqual(await readFile(join(src, 'a.jpg')));
       const [s, d] = await Promise.all([stat(join(src, 'a.jpg')), stat(join(dest, 'a.jpg'))]);
       expect(Math.abs(d.mtimeMs - s.mtimeMs)).toBeLessThan(0.01);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('byte copies beyond the smoke size need ALLOW_BYTE_COPY=1, refused before any copy', async () => {
+    const src = await makeCorpus();
+    const names = Array.from({ length: 151 }, (_, i) => `many-${String(i)}.jpg`);
+    for (const n of names) await writeFile(join(src, n), n);
+    const copies: string[] = [];
+    const copier: Copier = {
+      canClone: () => Promise.resolve(false),
+      clone: () => Promise.reject(new Error('must not clone')),
+      copy: (a, b) => (copies.push(a), defaultCopier.copy(a, b)),
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(
+        seed({ corpusDir: src, names, dest: join(tmp, 'big'), allowByteCopy: false }, copier),
+      ).rejects.toThrow(/ALLOW_BYTE_COPY=1/);
+      expect(copies).toEqual([]);
+      const sm = await seed(
+        { corpusDir: src, names, dest: join(tmp, 'big-ok'), allowByteCopy: true },
+        copier,
+      );
+      expect(sm.fallbackCopies).toBe(151);
     } finally {
       warn.mockRestore();
     }

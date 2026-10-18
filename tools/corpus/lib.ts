@@ -90,6 +90,11 @@ export interface SeedOptions {
   extras?: Array<'junk' | 'corrupt'>;
   synthetic?: boolean;
   prefix?: string;
+  /**
+   * Allow byte copies (cloning unsupported) of more than the smoke tier's file count. Default:
+   * `ALLOW_BYTE_COPY=1` in the environment. Without it a big tier fails before copying anything.
+   */
+  allowByteCopy?: boolean;
 }
 
 export interface SeedFile {
@@ -604,9 +609,13 @@ export function selectSubsets(m: Manifest, seed: number): { smoke: string[]; sta
     throw new Error(`pinned files missing from manifest: ${missing.join(', ')}`);
   const rnd = prng(seed);
   const lives = shuffled(m.relations.livePhoto, rnd);
-  const bursts = shuffled(components(m.relations.burst), rnd).map((g) =>
-    g.slice(0, MAX_BURST_FRAMES),
-  );
+  // BurstUUID-backed bursts first (stable sort keeps the shuffle within each kind), so even the
+  // smoke tier exercises the hard "burst frames never collapse" case on real burst metadata.
+  const uuidOf = new Map(m.records.map((r) => [r.name, r.burstUuid]));
+  const hasUuid = (g: string[]) => g.some((n) => (uuidOf.get(n) ?? null) !== null);
+  const bursts = shuffled(components(m.relations.burst), rnd)
+    .sort((a, b) => Number(hasUuid(b)) - Number(hasUuid(a)))
+    .map((g) => g.slice(0, MAX_BURST_FRAMES));
   const rest = shuffled([...names].sort(), rnd);
 
   const pick = (base: string[], tier: (typeof SUBSETS)[keyof typeof SUBSETS]): string[] => {
@@ -756,6 +765,16 @@ export async function seed(
     opts.shuffle === undefined ? [...opts.names] : shuffled(opts.names, prng(opts.shuffle));
   const rel = (n: string) => (opts.layout === 'nested' ? `${bucketOf(n)}/${n}` : n);
   const clones = await copier.canClone(corpusDir, dest);
+  if (!clones) {
+    const allow = opts.allowByteCopy ?? process.env['ALLOW_BYTE_COPY'] === '1';
+    if (order.length > SUBSETS.smoke.size && !allow)
+      throw new Error(
+        `${dest} can't clone from ${corpusDir} (not one APFS volume): refusing ${order.length} byte copies; set ALLOW_BYTE_COPY=1 to copy anyway`,
+      );
+    console.warn(
+      `WARNING: ${dest} can't clone from ${corpusDir} (not one APFS volume): making ${order.length} byte copies`,
+    );
+  }
   for (const n of order) {
     const target = join(dest, rel(n));
     await mkdir(dirname(target), { recursive: true });
@@ -765,10 +784,6 @@ export async function seed(
       : copier.copy(join(corpusDir, n), target));
   }
   const fallbackCopies = clones ? 0 : order.length;
-  if (fallbackCopies > 0)
-    console.warn(
-      `WARNING: ${dest} can't clone from ${corpusDir} (not one APFS volume): made ${fallbackCopies} byte copies`,
-    );
   const items: Parameters<typeof hashed>[1] = order.map((n) => ({
     relPath: rel(n),
     origin: 'corpus',

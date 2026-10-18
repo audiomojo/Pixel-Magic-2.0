@@ -10,6 +10,7 @@ import { runTier, type TierRun } from '../lib/stack.js';
  * overlaps decode and clustering, and the outcome is shown not to depend on concurrency.
  */
 const STORM_CPU_CONCURRENCY = '1';
+const CALM_CPU_CONCURRENCY = '4';
 
 /** `cpuConcurrency` from the worker's startup log lines. */
 async function loggedConcurrency(run: TierRun, svc: string): Promise<number[]> {
@@ -27,7 +28,12 @@ test(
     let ok = false;
     try {
       const t0 = Date.now();
-      const calm = await runTier('standard', { shuffle: 1, runId: `calm-${t0.toString(36)}` });
+      // Calm is pinned to a concurrency other than storm's, whatever the host's default.
+      const calm = await runTier('standard', {
+        shuffle: 1,
+        runId: `calm-${t0.toString(36)}`,
+        workerEnv: { CPU_CONCURRENCY: CALM_CPU_CONCURRENCY },
+      });
       runs.push(calm);
       await calm.runToIdle();
       // Only its database and staged tree are compared from here on: free the VM's memory.
@@ -57,28 +63,32 @@ test(
       const t2 = Date.now();
       say(
         `chaos action log:\n${chaos.log.join('\n')}\n` +
-          `calm ${((t1 - t0) / 1000).toFixed(1)} s, storm ${((t2 - t1) / 1000).toFixed(1)} s`,
+          `calm ${((t1 - t0) / 1000).toFixed(1)} s, storm ${((t2 - t1) / 1000).toFixed(1)} s, ` +
+          `margin ${(await chaos.marginS()).toFixed(1)} s (last still finished after the last required action)`,
       );
 
+      // Soft: these explain a run, but must never hide the outcome comparison below.
       // Every action landed while seeded stills were still decoding or clustering.
-      expect(chaos.applied.filter((a) => a.stillProgress === null || a.stillProgress >= 1)).toEqual(
-        [],
-      );
+      expect
+        .soft(chaos.applied.filter((a) => a.stillProgress === null || a.stillProgress >= 1))
+        .toEqual([]);
       const stormConcurrency = new Set([
         ...(await loggedConcurrency(storm, 'worker')),
         ...(await loggedConcurrency(storm, 'worker-extra')),
       ]);
-      expect([...stormConcurrency]).toEqual([Number(STORM_CPU_CONCURRENCY)]);
+      expect.soft([...stormConcurrency]).toEqual([Number(STORM_CPU_CONCURRENCY)]);
       const calmConcurrency = await loggedConcurrency(calm, 'worker');
       say(
         `cpuConcurrency: calm ${String(calmConcurrency)}, storm ${String([...stormConcurrency])}`,
       );
-      expect(calmConcurrency.length).toBeGreaterThan(0);
-      expect(calmConcurrency).not.toContain(Number(STORM_CPU_CONCURRENCY));
+      expect.soft([...new Set(calmConcurrency)]).toEqual([Number(CALM_CPU_CONCURRENCY)]);
 
       expect(await checkInvariant(...storm.ctx)).toEqual([]);
       const m = await moduloAmbiguity(storm, calm);
-      say(`left out ${String(m.ambiguous)} copy_ambiguous contents (either run)`);
+      say(
+        `left out ${String(m.ambiguous)} copy_ambiguous contents (either run); ` +
+          `flagged only in storm: ${JSON.stringify(m.onlyA)}, only in calm: ${JSON.stringify(m.onlyB)}`,
+      );
       expect(m.partitions[0]).toEqual(m.partitions[1]);
       expect(m.tree[0]).toEqual(m.tree[1]);
       expect(await diffExpectations(...storm.exp)).toEqual([]);

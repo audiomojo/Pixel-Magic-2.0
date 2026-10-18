@@ -297,6 +297,12 @@ export interface ChaosRun {
   /** Human-readable lines, also printed as they happen. */
   log: string[];
   applied: AppliedAction[];
+  /**
+   * Seconds from the last required action (the moment every action had been applied once) to
+   * the last seeded still reaching a terminal state: how much pipeline work the chaos overlapped.
+   * Call it after `runToIdle`.
+   */
+  marginS(): Promise<number>;
 }
 
 const TERMINAL_STILL_STATES = ['CLUSTERED', 'FAILED', 'QUARANTINED'];
@@ -467,13 +473,30 @@ async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions):
   note('scaled worker-extra to 1');
   const applied = new Set<number>();
   let round: number[] = [];
+  /** Still progress measured in the previous iteration (after its wait). */
+  let last: number | null = null;
+  let allAppliedAt: number | null = null;
+  const marginS = async (): Promise<number> => {
+    const r = await poolFor(stack.dbUrl).query<{ t: number }>(
+      `SELECT extract(epoch FROM max(updated_at))::float8 * 1000 AS t FROM contents
+        WHERE sha256 = ANY($1) AND (state = ANY($2) OR kind <> 'still')`,
+      [stills, TERMINAL_STILL_STATES],
+    );
+    return (r.rows[0]!.t - (allAppliedAt ?? t0)) / 1000;
+  };
   for (;;) {
-    await sleep((min + rnd() * (max - min)) * 1000);
+    // Drawn every iteration, clamped or not, so a seed's action order never changes.
+    const r = rnd();
+    // Late in the run with required actions left: wait only the minimum, so the remaining
+    // actions still land while stills are decoding and clustering.
+    const clamp = last !== null && last >= 0.8 && applied.size < opts.actions.length;
+    await sleep((clamp ? min : min + r * (max - min)) * 1000);
     // Measured after the wait, so no action is applied once the goal is already reached.
     const before = await stillProgress(stack, stills);
+    last = before;
     if (applied.size === opts.actions.length && before !== null && before >= opts.untilProgress) {
       note(`done at still progress ${before.toFixed(3)}`);
-      return { log, applied: done };
+      return { log, applied: done, marginS };
     }
     if (round.length === 0) round = shuffled([...opts.actions.keys()], rnd);
     const i = round.pop()!;
@@ -481,6 +504,7 @@ async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions):
     const started = Date.now();
     await apply(stack, action);
     applied.add(i);
+    if (applied.size === opts.actions.length) allAppliedAt ??= Date.now();
     done.push({ action, stillProgress: before });
     note(
       `${action.join(' ')} (still progress ${before === null ? 'n/a' : before.toFixed(3)}, ` +

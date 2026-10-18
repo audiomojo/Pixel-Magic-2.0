@@ -294,19 +294,26 @@ export async function moduloAmbiguity(
   partitions: [Partitions, Partitions];
   tree: [string[], string[]];
   ambiguous: number;
+  /** Contents flagged only in `a` / only in `b` (sorted): order-dependent flags, to print. */
+  onlyA: string[];
+  onlyB: string[];
 }> {
   const flagged = async (r: ComparableRun) =>
     (
       await poolFor(r.dbUrl).query<{ sha256: string }>(
-        'SELECT sha256 FROM contents WHERE copy_ambiguous',
+        'SELECT sha256 FROM contents WHERE copy_ambiguous ORDER BY sha256',
       )
     ).rows.map((x) => x.sha256);
-  const either = new Set([...(await flagged(a)), ...(await flagged(b))]);
+  const [fa, fb] = [await flagged(a), await flagged(b)];
+  const [sa, sb] = [new Set(fa), new Set(fb)];
+  const either = new Set([...fa, ...fb]);
   const tree = async (r: ComparableRun) =>
     (await treeSnapshot(...r.snap)).filter((l) => !either.has(l.slice(l.lastIndexOf('\t') + 1)));
   return {
     partitions: [await partitions(a.dbUrl, either), await partitions(b.dbUrl, either)],
     tree: [await tree(a), await tree(b)],
     ambiguous: either.size,
+    onlyA: fa.filter((s) => !sb.has(s)),
+    onlyB: fb.filter((s) => !sa.has(s)),
   };
 }
