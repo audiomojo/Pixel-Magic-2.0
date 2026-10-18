@@ -21,3 +21,10 @@ export interface DecodeResult {
   facts: { width: number; height: number; phash: string; dhash: string; mime: string } | null;
   quarantineReason: string | null;
 }
+
+/** `maybeBuildStaging`'s outcome: the new generation, or `skipped` (then `gen` is null). */
+export interface BuildResult {
+  gen: number | null;
+  entries: number;
+  skipped: boolean;
+}

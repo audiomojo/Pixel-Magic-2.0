@@ -6,6 +6,7 @@ import type { MetadataReader } from '../metadata.js';
 import { makeClusterContent } from './cluster.js';
 import { makeHashing, type WorkerPool } from './hashing.js';
 import { makeIngestFile } from './ingest.js';
+import { makeStaging } from './staging.js';
 
 export interface Deps {
   pool: pg.Pool;
@@ -24,6 +25,7 @@ export function createActivities(deps: Deps) {
     ingestFile: makeIngestFile(deps),
     ...makeHashing(deps),
     clusterContent: makeClusterContent(deps),
+    maybeBuildStaging: makeStaging(deps),
   };
 }
 
