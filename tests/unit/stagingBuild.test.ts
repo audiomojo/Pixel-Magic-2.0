@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -13,7 +13,7 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import type { Client } from '@temporalio/client';
 import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
@@ -22,10 +22,11 @@ import { vaultRel, type DataLayout } from '../../src/fsops.js';
 import { runActivity, testDeps } from '../helpers/activityEnv.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
-/** Test seams: when set, `rmdir` / `lstat` call these first (they may throw). */
+/** Test seams: when set, `rmdir` / `lstat` / `unlink` call these first (they may throw). */
 const fsHooks = vi.hoisted(() => ({
   rmdir: null as ((path: string) => void) | null,
   lstat: null as ((path: string) => void) | null,
+  unlink: null as ((path: string) => void) | null,
 }));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
@@ -38,6 +39,10 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     lstat: async (...a: Parameters<typeof actual.lstat>) => {
       fsHooks.lstat?.(String(a[0]));
       return actual.lstat(...a);
+    },
+    unlink: async (...a: Parameters<typeof actual.unlink>) => {
+      fsHooks.unlink?.(String(a[0]));
+      return actual.unlink(...a);
     },
   };
 });
@@ -70,6 +75,7 @@ beforeEach(async () => {
 afterEach(() => {
   fsHooks.rmdir = null;
   fsHooks.lstat = null;
+  fsHooks.unlink = null;
 });
 
 const build = (force: boolean) => runActivity(acts.maybeBuildStaging, [force]);
@@ -405,6 +411,62 @@ test('files the user saved inside staging are rescued when their generation goes
     'unique/my-edit.jpg',
     'unique/my-edit.jpg.1',
   ]);
+});
+
+test('a file saved over a staging link while its generation is being removed is never unlinked', async () => {
+  await seedPipelineRows();
+  const g1 = (await build(true)).gen!;
+  await build(true);
+  // The staging link an app (that resolved `current` earlier) saves over atomically.
+  const target = (await walk(join(genDir(g1), 'unique')))[0]!;
+  const tmp = join(layout.staging, 'app-save.tmp');
+  let raced = false;
+  fsHooks.unlink = (p) => {
+    // The race: the cleanup has examined the link and is about to unlink it, and the app's
+    // rename-over lands first.
+    if (!raced && p.startsWith(genDir(g1)) && basename(p) === basename(target)) {
+      raced = true;
+      writeFileSync(tmp, 'saved by app');
+      renameSync(tmp, target);
+    }
+  };
+  await build(true); // removes g1; the saved file keeps the unique/ directory alive
+  expect(raced).toBe(true);
+  fsHooks.unlink = null;
+  await build(true); // the next sweep finishes g1
+  expect(existsSync(genDir(g1))).toBe(false);
+  const rescued = join(layout.staging, '.rescued', String(g1));
+  expect(await readFile(join(rescued, relative(genDir(g1), target)), 'utf8')).toBe('saved by app');
+  // Only the user's file was rescued: the staging links themselves were removed.
+  expect((await walk(rescued)).map((f) => relative(rescued, f))).toEqual([
+    relative(genDir(g1), target),
+  ]);
+});
+
+test('an entry a crash left under the private name is rescued under its public path', async () => {
+  const left = join(genDir(7), 'unique', `.pm-reap-${randomUUID()}`);
+  await mkdir(left, { recursive: true });
+  await writeFile(join(left, 'mine.txt'), 'mine');
+  await build(true);
+  expect(existsSync(genDir(7))).toBe(false);
+  expect(await readFile(join(layout.staging, '.rescued', '7', 'unique', 'mine.txt'), 'utf8')).toBe(
+    'mine',
+  );
+});
+
+test('an entry that vanishes before the cleanup claims it is skipped', async () => {
+  const dir = join(genDir(7), 'unique');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'a.txt'), 'a');
+  await writeFile(join(dir, 'b.txt'), 'b');
+  // Each name's claim is a rename of the public path: the first claim removes the other name.
+  fsHooks.lstat = (p) => {
+    if (p.includes('.pm-reap-'))
+      rmSync(join(dir, basename(p) === 'a.txt' ? 'b.txt' : 'a.txt'), { force: true });
+  };
+  await build(true);
+  expect(existsSync(genDir(7))).toBe(false);
+  expect(await readdir(join(layout.staging, '.rescued', '7', 'unique'))).toHaveLength(1);
 });
 
 test('a generation directory that gains an entry during cleanup is left for the next build', async () => {

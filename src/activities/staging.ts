@@ -9,8 +9,9 @@ import {
   symlink,
   unlink,
 } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
 import { fsyncDir, vaultRel } from '../fsops.js';
@@ -19,6 +20,8 @@ import type { BuildResult } from '../types.js';
 import type { Deps } from './index.js';
 
 const GEN = /^\.gen-(\d+)$/;
+/** `removeGen`'s private directory inside a generation directory being removed. */
+const REAP = /^\.pm-reap-[0-9a-f-]{36}$/;
 const HEARTBEAT_EVERY = 1000;
 const LOCK_POLL_MS = 250;
 
@@ -225,6 +228,11 @@ export function makeStaging(deps: Deps) {
    * unlinked: regular files with another name (the vault's). Anything else is something a user
    * saved or made inside staging, whose bytes may exist nowhere else: it is moved, never
    * deleted, to `staging/.rescued/<n>/<same relative path>`.
+   *
+   * Each entry is first renamed into a private `.pm-reap-<uuid>/` directory beside it, and only
+   * that private name is examined and unlinked. An app that saves over the public name meanwhile
+   * (rename-over, through an old `current`) makes a new entry there instead, which the next
+   * sweep rescues: there is no window between the `lstat` and the `unlink`.
    */
   async function removeGen(n: number): Promise<void> {
     const root = genPath(n);
@@ -233,29 +241,59 @@ export function makeStaging(deps: Deps) {
     const tick = () => {
       if (++count % HEARTBEAT_EVERY === 0) heartbeat(`rm .gen-${String(n)}`);
     };
-    const rescue = async (p: string): Promise<void> => {
-      const dest = join(layout.staging, '.rescued', String(n), relative(root, p));
+    /** Moves `held` (the private name of the entry once at `p`) to `.rescued`. */
+    const rescue = async (held: string, p: string): Promise<void> => {
+      // A crash can leave a private directory behind: rescue under the public path all the same.
+      const rel = relative(root, p)
+        .split(sep)
+        .filter((c) => !REAP.test(c))
+        .join(sep);
+      const dest = join(layout.staging, '.rescued', String(n), rel);
       await mkdir(dirname(dest), { recursive: true });
-      await rename(p, await freeName(dest));
+      await rename(held, await freeName(dest));
       rescued++;
     };
+    /** Renames `p` to the private `held`; false when `p` is gone meanwhile (nothing to remove). */
+    const claim = async (p: string, held: string): Promise<boolean> => {
+      try {
+        await rename(p, held);
+        return true;
+      } catch (err) {
+        if (isEnoent(err)) return false;
+        throw err;
+      }
+    };
     const walk = async (dir: string): Promise<void> => {
+      let reap: string | null = null;
       for (const e of await readdir(dir, { withFileTypes: true })) {
         const p = join(dir, e.name);
         if (e.isDirectory()) await walk(p);
         else {
-          const st = await lstat(p);
-          if (st.isFile() && st.nlink >= 2) await unlink(p);
-          else await rescue(p);
+          if (reap === null) {
+            reap = join(dir, `.pm-reap-${randomUUID()}`);
+            await mkdir(reap);
+          }
+          const held = join(reap, e.name);
+          if (await claim(p, held))
+            try {
+              const st = await lstat(held);
+              if (st.isFile() && st.nlink >= 2) await unlink(held);
+              else await rescue(held, p);
+            } catch (err) {
+              // Never leave the entry under a private name: put it back (beside anything new).
+              await rename(held, await freeName(p));
+              throw err;
+            }
         }
         tick();
       }
-      try {
-        await rmdir(dir);
-      } catch (e) {
-        // Something appeared meanwhile: leave the directory for the next build's sweep.
-        if (!isNotEmpty(e)) throw e;
-      }
+      for (const d of reap === null ? [dir] : [reap, dir])
+        try {
+          await rmdir(d);
+        } catch (e) {
+          // Something appeared meanwhile: leave the directory for the next build's sweep.
+          if (!isNotEmpty(e)) throw e;
+        }
     };
     try {
       await walk(root);
