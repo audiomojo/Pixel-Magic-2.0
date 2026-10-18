@@ -54,11 +54,17 @@ export class Stack {
   /** Replica counts that `up` keeps (`docker compose up` would reset them to the file's). */
   private readonly scales = new Map<string, number>();
 
+  /** Per-stack compose override holding `workerEnv` (next to the data dir, not inside it). */
+  private readonly envFile: string | null;
+
+  /** `workerEnv`: extra environment for `worker` and `worker-extra` (e.g. `CPU_CONCURRENCY`). */
   constructor(
     readonly runId: string,
     readonly dataDir: string,
+    readonly workerEnv: Readonly<Record<string, string>> = {},
   ) {
     this.project = `pmtest_${runId}`;
+    this.envFile = Object.keys(workerEnv).length === 0 ? null : `${dataDir}.compose.yml`;
   }
 
   /** `postgres://…/pixelmagic` on the mapped host port (after `up`). */
@@ -75,7 +81,15 @@ export class Stack {
   async compose(...args: string[]): Promise<string> {
     const { stdout } = await execFile(
       'docker',
-      ['compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.test.yml', ...args],
+      [
+        'compose',
+        '-f',
+        'docker-compose.yml',
+        '-f',
+        'docker-compose.test.yml',
+        ...(this.envFile === null ? [] : ['-f', this.envFile]),
+        ...args,
+      ],
       {
         cwd: REPO,
         env: { ...process.env, COMPOSE_PROJECT_NAME: this.project, DATA_DIR: this.dataDir },
@@ -87,6 +101,13 @@ export class Stack {
 
   async up(): Promise<void> {
     await mkdir(join(this.dataDir, 'dropzone'), { recursive: true });
+    if (this.envFile !== null) {
+      const env = JSON.stringify(this.workerEnv); // JSON is YAML
+      await writeFile(
+        this.envFile,
+        `services:\n  worker:\n    environment: ${env}\n  worker-extra:\n    environment: ${env}\n`,
+      );
+    }
     const scale = [...this.scales].flatMap(([svc, n]) => ['--scale', `${svc}=${String(n)}`]);
     await this.compose('up', '-d', '--build', '--wait', ...scale);
     await this.connect();
@@ -140,6 +161,7 @@ export class Stack {
     if (keep) return;
     await this.compose('down', '-v', '--remove-orphans');
     await rm(this.dataDir, { recursive: true, force: true });
+    if (this.envFile !== null) await rm(this.envFile, { force: true });
   }
 
   async kill(svc: string): Promise<void> {
@@ -265,6 +287,18 @@ export interface ChaosOptions {
   actions: ChaosAction[];
 }
 
+/** One applied action and the still progress just before it (null: the database was down). */
+export interface AppliedAction {
+  action: ChaosAction;
+  stillProgress: number | null;
+}
+
+export interface ChaosRun {
+  /** Human-readable lines, also printed as they happen. */
+  log: string[];
+  applied: AppliedAction[];
+}
+
 const TERMINAL_STILL_STATES = ['CLUSTERED', 'FAILED', 'QUARANTINED'];
 /** How long a killed service stays down before it is started again (as a supervisor would). */
 const KILL_DOWNTIME_MS = 5000;
@@ -290,15 +324,18 @@ export interface TierRun {
   /**
    * Scales `worker-extra` to 1, then applies seeded-random `actions` at random `everyS` intervals
    * until `untilProgress` (of the seeded stills, see `ChaosOptions`) is reached and every action has been applied at least once (actions are
-   * drawn as shuffled rounds of the whole list). Returns the applied action log.
+   * drawn as shuffled rounds of the whole list). Returns the log and each applied action with
+   * the still progress it landed at.
    */
-  runWithChaos(opts: ChaosOptions): Promise<string[]>;
+  runWithChaos(opts: ChaosOptions): Promise<ChaosRun>;
 }
 
 export interface TierOptions {
   shuffle?: number;
   layout?: 'flat' | 'nested';
   runId?: string;
+  /** Extra environment for this run's workers only (e.g. `{ CPU_CONCURRENCY: '2' }`). */
+  workerEnv?: Record<string, string>;
 }
 
 /**
@@ -321,7 +358,7 @@ export async function runTier(tier: Tier, opts: TierOptions = {}): Promise<TierR
     writeFile(join(dataDir, 'seed-manifest.json'), JSON.stringify(seedManifest, null, 1));
   await saveSeedManifest();
 
-  const stack = new Stack(runId, dataDir);
+  const stack = new Stack(runId, dataDir, opts.workerEnv);
   try {
     await stack.up();
   } catch (e) {
@@ -413,13 +450,14 @@ async function apply(stack: Stack, a: ChaosAction): Promise<void> {
   }
 }
 
-async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions): Promise<string[]> {
+async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions): Promise<ChaosRun> {
   if (opts.actions.length === 0) throw new Error('runWithChaos: no actions');
   if (stills.length === 0) throw new Error('runWithChaos: no seeded stills');
   const rnd = prng(opts.seed);
   const [min, max] = opts.everyS;
   const t0 = Date.now();
   const log: string[] = [];
+  const done: AppliedAction[] = [];
   const note = (msg: string) => {
     const line = `+${((Date.now() - t0) / 1000).toFixed(1)}s ${msg}`;
     log.push(line);
@@ -430,19 +468,20 @@ async function runWithChaos(stack: Stack, stills: string[], opts: ChaosOptions):
   const applied = new Set<number>();
   let round: number[] = [];
   for (;;) {
-    const p = await stillProgress(stack, stills);
-    if (applied.size === opts.actions.length && p !== null && p >= opts.untilProgress) {
-      note(`done at still progress ${p.toFixed(3)}`);
-      return log;
-    }
     await sleep((min + rnd() * (max - min)) * 1000);
+    // Measured after the wait, so no action is applied once the goal is already reached.
+    const before = await stillProgress(stack, stills);
+    if (applied.size === opts.actions.length && before !== null && before >= opts.untilProgress) {
+      note(`done at still progress ${before.toFixed(3)}`);
+      return { log, applied: done };
+    }
     if (round.length === 0) round = shuffled([...opts.actions.keys()], rnd);
     const i = round.pop()!;
     const action = opts.actions[i]!;
-    const before = await stillProgress(stack, stills);
     const started = Date.now();
     await apply(stack, action);
     applied.add(i);
+    done.push({ action, stillProgress: before });
     note(
       `${action.join(' ')} (still progress ${before === null ? 'n/a' : before.toFixed(3)}, ` +
         `took ${((Date.now() - started) / 1000).toFixed(1)}s)`,
