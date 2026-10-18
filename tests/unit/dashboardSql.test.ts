@@ -10,7 +10,8 @@ const REQUIRED = [
   'Throughput / min',
   'ETA',
   'Copy groups',
-  'Similar sets',
+  'Similar groups',
+  'Vault',
   'Duplicates removed',
   'Copy mismatches',
   'Quarantined by reason',
@@ -96,8 +97,8 @@ test('queries return the seeded numbers', async () => {
   const value = async (title: string) =>
     Number((await pgh.pool.query<{ value: unknown }>(targetByTitle(title).rawSql)).rows[0]!.value);
   expect(await value('Failed')).toBe(1);
-  expect(await value('Copy groups')).toBe(1);
-  expect(await value('Similar sets')).toBe(0); // a similar row with no copy groups is no set (below)
+  expect(await value('Copy groups')).toBe(0); // no content shares a copy group here
+  expect(await value('Similar groups')).toBe(0); // a similar row with no copy groups is no set (below)
   // backlog = INGESTED + HASHED stills (2); 2 clustered rows in the last 10 min -> ... finite ETA
   expect(Number.isFinite(await value('ETA'))).toBe(true);
   const dz = (await pgh.pool.query<Record<string, unknown>>(targetByTitle('Drop zone').rawSql))
@@ -128,7 +129,7 @@ test('visibility panel queries run against a stub executions_visibility', async 
 
 // Task 13 chaos: copy groups linked as a similar set can later merge into one copy group. That
 // set holds a single group and stages as unique (stagingPlan), so it is not counted either.
-test('Similar sets counts only sets of two or more root copy groups', async () => {
+test('Similar groups counts only sets of two or more root copy groups', async () => {
   const { pool } = pgh;
   const id = async (sql: string, args: unknown[] = []) =>
     (await pool.query<{ id: bigint }>(`${sql} RETURNING id`, args)).rows[0]!.id;
@@ -141,7 +142,7 @@ test('Similar sets counts only sets of two or more root copy groups', async () =
     root,
     lone,
   ]);
-  const r = await pool.query<{ value: unknown }>(targetByTitle('Similar sets').rawSql);
+  const r = await pool.query<{ value: unknown }>(targetByTitle('Similar groups').rawSql);
   expect(Number(r.rows[0]!.value)).toBe(1);
 });
 
@@ -184,6 +185,30 @@ test('Copy mismatches counts flagged rows (and reads 0 normally)', async () => {
   await copyRow({ size: 20, mismatch: true });
   await copyRow({ size: 20, removed: 20 });
   expect(Number((await row('Copy mismatches')).value)).toBe(1);
+});
+
+test('Copy groups counts only groups of two or more contents', async () => {
+  const { pool } = pgh;
+  const g = async () =>
+    (await pool.query<{ id: bigint }>(`INSERT INTO groups (kind) VALUES ('copy') RETURNING id`))
+      .rows[0]!.id;
+  const pair = await g();
+  const lone = await g();
+  const h = (n: number) => String(n).padStart(64, '0');
+  for (const [i, group] of [pair, pair, lone].entries())
+    await pool.query(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state, copy_group_id)
+       VALUES ($1, 'jpg', 'still', 10, 'CLUSTERED', $2)`,
+      [h(i), group],
+    );
+  expect(Number((await row('Copy groups')).value)).toBe(1);
+});
+
+test('Vault counts every stored content and its bytes', async () => {
+  expect([(await row('Vault')).files, (await row('Vault')).bytes].map(Number)).toEqual([0, 0]);
+  await seedPipelineRows(); // 5 contents of 100 bytes
+  const r = await row('Vault');
+  expect([r.files, r.bytes].map(Number)).toEqual([5, 500]);
 });
 
 test('dashboard has required panels and 5s refresh', () => {

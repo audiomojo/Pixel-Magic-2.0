@@ -191,6 +191,12 @@ services:
     ports:
       # Host port overridable when 3000 is taken on the dev machine (the default is spec §4.1's).
       - '127.0.0.1:${GRAFANA_PORT:-3000}:3000'
+    environment:
+      # Read-only dashboards without a login (Grafana listens on 127.0.0.1 only); the admin
+      # login still exists for edits. The home page is the pipeline dashboard.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pipeline-live.json
     volumes:
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro

@@ -252,13 +252,14 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
 ## 8. Observability
 
 - **Temporal UI:** per-file history, retries and stack traces.
-- **Grafana "Pipeline Live"** (provisioned JSON, 5 s refresh, SQL over `pixelmagic` and `temporal_visibility`). Tiles:
+- **Grafana "Pipeline Live"** (provisioned JSON, 5 s refresh, SQL over `pixelmagic` and `temporal_visibility`; the home page, viewable without a login, Grafana bound to 127.0.0.1). Tiles:
   - drop zone pending files and bytes (`scan_stats`)
   - running `FileWorkflow`s
   - backlog per stage (`contents` by state)
   - throughput per stage per minute (from `ingested_at`, `hashed_at`, `clustered_at`)
   - ETA (backlog ÷ 10-minute rate)
-  - copy groups, similar sets
+  - vault: distinct files stored and their total bytes
+  - copy groups with two or more contents; similar groups (sets of two or more copy groups)
   - duplicates removed (§6.5): the count, bytes reclaimed, and bytes of COPY files still pending removal
   - copy mismatches (duplicates kept because a re-hash disagreed or a file was missing): should read 0
   - quarantined by reason, FAILED count and the last 20 `last_error` values

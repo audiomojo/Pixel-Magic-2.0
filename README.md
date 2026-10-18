@@ -30,6 +30,9 @@ generation is cleaned up, never deleted.
 Configuration is via environment variables: copy `.env.example` to `.env` (compose reads it).
 Every tunable there is forwarded to the workers; one left unset uses its default.
 
+The dashboard is at <http://localhost:3000> (or `GRAFANA_PORT`), viewable without a login;
+the `admin` login is only needed to edit.
+
 Drop real files, not symlinks or aliases: links in the drop zone are never followed or
 ingested (each scan logs a warning while any are there).
 
