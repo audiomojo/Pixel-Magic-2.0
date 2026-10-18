@@ -36,8 +36,12 @@ async function lstatOrNull(path: string) {
 }
 
 type Stats = NonNullable<Awaited<ReturnType<typeof lstatOrNull>>>;
-const same = (a: Stats, b: Stats): boolean =>
-  a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
+/**
+ * Unchanged since `a` was taken: same size and mtime. Not the inode number: Docker Desktop's
+ * virtiofs renumbers inodes when its cache evicts them (see `sameFile`), and a large file's hash
+ * can take long enough for that; the hashes, not the inode, prove the bytes.
+ */
+const same = (a: Stats, b: Stats): boolean => a.size === b.size && a.mtimeNs === b.mtimeNs;
 
 export function makeCopies(deps: Deps) {
   const { pool, layout } = deps;
@@ -67,7 +71,7 @@ export function makeCopies(deps: Deps) {
     return 'MISMATCH';
   }
 
-  /** Hashes `path` and checks it did not change meanwhile (same inode, size and mtime). */
+  /** Hashes `path` and checks it did not change meanwhile (same size and mtime). */
   async function freshHash(path: string, before: Stats): Promise<string> {
     const h = await sha256File(path, beat);
     const after = await lstatOrNull(path);
