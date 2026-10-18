@@ -7,7 +7,7 @@ export type Verdict = 'copy' | 'similar';
 export interface Assignment {
   /** Root copy group of the new content after all merges. */
   copyGroup: number;
-  /** A copy union was refused because it would mix two different capture keys. */
+  /** A copy union was refused: it would mix two different capture keys or two frames of one burst. */
   ambiguous: boolean;
   /** Groups allocated by this add: always one copy group, at most one similar set. */
   created: Array<[id: number, kind: GroupKind]>;
@@ -22,6 +22,8 @@ export interface LoadedRow {
   copyGroup: number;
   similarSet: number | null;
   captured: CaptureKey | null;
+  burstUuid: string | null;
+  /** Ignored by grouping: the flag is persisted in `contents.copy_ambiguous` and never changes unions. */
   ambiguous: boolean;
 }
 
@@ -31,6 +33,8 @@ interface CopyGroup {
   members: string[];
   /** Distinct non-null capture keys of the members (roots only). */
   captures: CaptureKey[];
+  /** Burst UUIDs of the members (roots only); a copy group holds at most one frame per burst. */
+  bursts: Set<string>;
   /** Similar set id, possibly not a root (roots only). */
   similar: number | null;
 }
@@ -43,8 +47,10 @@ interface SimilarSet {
 
 const sameKey = (a: CaptureKey, b: CaptureKey): boolean => a.s === b.s && a.sub === b.sub;
 
-const anyConflict = (a: readonly CaptureKey[], b: readonly CaptureKey[]): boolean =>
-  a.some((x) => b.some((y) => captureConflict(x, y)));
+/** Would merging these groups mix two shots: conflicting capture keys, or two frames of one burst? */
+const mustNotMerge = (a: CopyGroup, b: CopyGroup): boolean =>
+  a.captures.some((x) => b.captures.some((y) => captureConflict(x, y))) ||
+  [...a.bursts].some((u) => b.bursts.has(u));
 
 /** Larger wins; on a tie the lower id wins. */
 const pick = (a: [id: number, size: number], b: [id: number, size: number]): [number, number] =>
@@ -67,11 +73,12 @@ export class Grouper {
     this.claim(row.sha256, row.copyGroup);
     let g = this.copy.get(row.copyGroup);
     if (g === undefined) {
-      g = { parent: row.copyGroup, members: [], captures: [], similar: null };
+      g = { parent: row.copyGroup, members: [], captures: [], bursts: new Set(), similar: null };
       this.copy.set(row.copyGroup, g);
     }
     g.members.push(row.sha256);
     if (row.captured !== null) addCapture(g, row.captured);
+    if (row.burstUuid !== null) g.bursts.add(row.burstUuid);
     if (row.similarSet !== null) {
       if (!this.similar.has(row.similarSet))
         this.similar.set(row.similarSet, { parent: row.similarSet, size: 0 });
@@ -94,6 +101,7 @@ export class Grouper {
       parent: gid,
       members: [f.sha256],
       captures: f.captured === null ? [] : [f.captured],
+      bursts: new Set(f.burstUuid === null ? [] : [f.burstUuid]),
       similar: null,
     });
     const asg: Assignment = {
@@ -110,7 +118,7 @@ export class Grouper {
     const pendingSets: number[] = [];
     for (const target of copyTargets) {
       const root = this.findCopy(gid);
-      if (anyConflict(this.group(root).captures, this.group(target).captures)) {
+      if (mustNotMerge(this.group(root), this.group(target))) {
         asg.ambiguous = true;
         continue;
       }
@@ -167,9 +175,11 @@ export class Grouper {
     }
     w.members.push(...l.members);
     for (const c of l.captures) addCapture(w, c);
+    for (const u of l.bursts) w.bursts.add(u);
     l.parent = winner;
     l.members = [];
     l.captures = [];
+    l.bursts = new Set();
     l.similar = null;
     asg.copyMerges.push([loser, winner]);
   }

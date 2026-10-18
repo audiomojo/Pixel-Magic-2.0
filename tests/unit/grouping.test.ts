@@ -1,13 +1,13 @@
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
-import { classify, looksAlike, type Facts } from '../../src/classify.js';
+import { captureConflict, classify, looksAlike, type Facts } from '../../src/classify.js';
 import { Grouper, type Assignment } from '../../src/grouping.js';
 import { F, NOEXIF, T } from '../helpers/facts.js';
 
 const range = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
 const mix = (i: number): bigint => BigInt.asUintN(64, BigInt(i + 1) * 0x9e3779b97f4a7c15n);
 
-/** Id allocator for Grouper; starts high so fresh ids never undercut ids loaded from "the DB". */
+/** Sequential id allocator for Grouper; tests that load rows pass a start above the loaded ids, like the DB sequence. */
 const counter = (start = 1) => {
   let n = start;
   return () => n++;
@@ -193,11 +193,13 @@ const row = (
   copyGroup: number,
   similarSet: number | null,
   captured = F(sha).captured,
+  burstUuid: string | null = null,
 ) => ({
   sha256: sha,
   copyGroup,
   similarSet,
   captured,
+  burstUuid,
   ambiguous: false,
 });
 
@@ -328,3 +330,103 @@ test('rejects unknown matches and duplicate contents', () => {
   expect(() => g.add(F('b'), [['nope', 'copy']])).toThrow(/unknown/);
   expect(() => g.load(row('a', 5, null))).toThrow(/already grouped/);
 });
+
+test('two frames of one burst with non-conflicting capture keys are never bridged into a copy', () => {
+  const facts = {
+    A: F('A', { captured: { s: 1, sub: '1' }, burstUuid: 'B' }),
+    C: F('C', { captured: { s: 1, sub: null }, burstUuid: 'B' }),
+    X: F('X', { phash: 1n, ...NOEXIF }),
+  };
+  for (const order of permutations(['A', 'C', 'X'] as const)) {
+    const g = new Grouper(counter());
+    const seen: Array<keyof typeof facts> = [];
+    for (const s of order) {
+      g.add(
+        facts[s],
+        seen.map((o) => [o, classify(facts[s], facts[o], T)] as const),
+      );
+      seen.push(s);
+    }
+    expect([...g.copyPartition()].some((grp) => grp.includes('A') && grp.includes('C'))).toBe(
+      false,
+    );
+    expect(g.similarPartition()).toEqual(new Set(['A,C,X']));
+  }
+});
+
+test('a loaded group refuses a second frame of its burst', () => {
+  const g = new Grouper(counter(100));
+  g.load(row('a', 10, null, { s: 1, sub: '1' }, 'B'));
+  g.load(row('x', 10, null, null));
+  const asg = g.add(F('n', { captured: { s: 1, sub: null }, burstUuid: 'B' }), [['x', 'copy']]);
+  expect(asg).toMatchObject({ copyGroup: 100, ambiguous: true, copyMerges: [] });
+  expect(g.copyPartition()).toEqual(new Set(['a,x', 'n']));
+  expect(g.similarPartition()).toEqual(new Set(['a,n,x']));
+});
+
+/** Random mixes of burst frames, partial capture keys and EXIF-less tight exports that bridge them. */
+const shotArb = fc.record({
+  exifless: fc.boolean(),
+  phash: fc.bigInt({ min: 0n, max: 15n }),
+  dhash: fc.bigInt({ min: 0n, max: 7n }),
+  s: fc.integer({ min: 1, max: 2 }),
+  sub: fc.constantFrom(null, '0', '1', '2'),
+  noCapture: fc.boolean(),
+  burstUuid: fc.constantFrom(null, 'B', 'C'),
+  width: fc.constantFrom(10, 20),
+  mime: fc.constantFrom('image/heic', 'image/jpeg'),
+  camera: fc.constantFrom(null, 'cam'),
+});
+const fixtureArb = fc.array(shotArb, { minLength: 3, maxLength: 10 }).chain((shots) =>
+  fc.tuple(
+    fc.constant(shots),
+    fc.shuffledSubarray(range(shots.length), {
+      minLength: shots.length,
+      maxLength: shots.length,
+    }),
+  ),
+);
+
+function components(facts: readonly Facts[]): Set<string> {
+  const parent = range(facts.length);
+  const root = (x: number): number => (parent[x] === x ? x : (parent[x] = root(parent[x]!)));
+  for (const i of range(facts.length))
+    for (const j of range(i)) if (looksAlike(facts[i]!, facts[j]!, T)) parent[root(i)] = root(j);
+  const comps = new Map<number, string[]>();
+  for (const i of range(facts.length))
+    comps.set(root(i), [...(comps.get(root(i)) ?? []), facts[i]!.sha256]);
+  return new Set([...comps.values()].map((l) => l.sort().join(',')));
+}
+
+test('copy groups never mix shots, and similar sets are the look-alike components, in any order', () =>
+  fc.assert(
+    fc.property(fixtureArb, ([shots, order]) => {
+      const facts = shots.map((x, i) =>
+        x.exifless
+          ? F(`n${i}`, { phash: x.phash, dhash: x.dhash, width: x.width, mime: x.mime, ...NOEXIF })
+          : F(`n${i}`, {
+              phash: x.phash,
+              dhash: x.dhash,
+              width: x.width,
+              mime: x.mime,
+              camera: x.camera,
+              captured: x.noCapture ? null : { s: x.s, sub: x.sub },
+              burstUuid: x.burstUuid,
+            }),
+      );
+      const g = runGrouper(lookAlikeEdges(facts), facts, order);
+      const bySha = new Map(facts.map((f) => [f.sha256, f]));
+      for (const grp of g.copyPartition()) {
+        const members = grp.split(',').map((sha) => bySha.get(sha)!);
+        for (const p of members)
+          for (const q of members) {
+            if (p === q) continue;
+            if (p.captured !== null && q.captured !== null)
+              expect(captureConflict(p.captured, q.captured)).toBe(false);
+            if (p.burstUuid !== null) expect(q.burstUuid).not.toBe(p.burstUuid);
+          }
+      }
+      expect(g.similarPartition()).toEqual(components(facts));
+    }),
+    { numRuns: 500 },
+  ));
