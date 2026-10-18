@@ -1,0 +1,164 @@
+x-app: &app
+  build:
+    context: .
+    args:
+      UID: ${UID:-501}
+      GID: ${GID:-20}
+  image: pixel-magic:local
+
+x-temporal-db: &temporal-db
+  DB: postgres12
+  DB_PORT: '5432'
+  POSTGRES_USER: postgres
+  POSTGRES_PWD: ${POSTGRES_PASSWORD:-pixelmagic}
+  POSTGRES_SEEDS: postgres
+
+x-worker-env: &worker-env
+  DATA_DIR: /data
+  DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-pixelmagic}@postgres:5432/pixelmagic
+  TEMPORAL_ADDRESS: temporal:7233
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pixelmagic}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d pixelmagic']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  temporal-admin:
+    image: temporalio/admin-tools:1.32.1
+    environment: *temporal-db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -eu
+        for db in temporal temporal_visibility; do
+          case "$$db" in
+            temporal) dir=/etc/temporal/schema/postgresql/v12/temporal/versioned ;;
+            *) dir=/etc/temporal/schema/postgresql/v12/visibility/versioned ;;
+          esac
+          tool="temporal-sql-tool --plugin postgres12 --ep $$POSTGRES_SEEDS -u $$POSTGRES_USER -p $$DB_PORT --db $$db"
+          SQL_PASSWORD="$$POSTGRES_PWD" $$tool setup-schema -v 0.0
+          SQL_PASSWORD="$$POSTGRES_PWD" $$tool update-schema -d "$$dir"
+        done
+
+  temporal:
+    image: temporalio/server:1.32.1
+    restart: unless-stopped
+    depends_on:
+      temporal-admin:
+        condition: service_completed_successfully
+    environment:
+      <<: *temporal-db
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      BIND_ON_IP: 0.0.0.0
+    ports:
+      - '127.0.0.1:7233:7233'
+    volumes:
+      - ./infra/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    # The 1.32 server image ships neither `temporal` nor `tctl`, so this is a TCP-level check.
+    healthcheck:
+      test: ['CMD', 'nc', '-z', 'localhost', '7233']
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 30
+
+  temporal-ns:
+    image: temporalio/admin-tools:1.32.1
+    depends_on:
+      temporal:
+        condition: service_healthy
+    # The server's port opens before the frontend is ready, so retry.
+    command:
+      - sh
+      - -c
+      - |
+        for i in $$(seq 1 30); do
+          temporal operator namespace describe default --address temporal:7233 \
+            || temporal operator namespace create default --address temporal:7233 && exit 0
+          sleep 2
+        done
+        exit 1
+
+  temporal-ui:
+    image: temporalio/ui:2.56.0
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - '127.0.0.1:8080:8080'
+
+  migrate:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-pixelmagic}@postgres:5432/pixelmagic
+    command: ['npx', 'node-pg-migrate', 'up', '-m', 'migrations']
+
+  worker:
+    <<: *app
+    restart: unless-stopped
+    depends_on:
+      temporal-ns:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *worker-env
+      WORKER_QUEUES: main,io,cpu,cluster
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    stop_grace_period: 60s
+
+  worker-extra:
+    <<: *app
+    restart: unless-stopped
+    depends_on:
+      temporal-ns:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *worker-env
+      WORKER_QUEUES: main,io,cpu
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    stop_grace_period: 60s
+    deploy:
+      replicas: 0
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:3000:3000'
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  pg-data:

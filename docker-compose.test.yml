@@ -1,0 +1,10 @@
+# Override for tests: random loopback host ports so a test stack never collides with the dev stack.
+services:
+  postgres:
+    ports: !override ['127.0.0.1::5432']
+  temporal:
+    ports: !override ['127.0.0.1::7233']
+  temporal-ui:
+    ports: !override ['127.0.0.1::8080']
+  grafana:
+    ports: !override ['127.0.0.1::3000']
