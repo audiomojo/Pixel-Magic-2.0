@@ -107,11 +107,13 @@ export interface SeedFile {
   seedName?: string;
   variant?: 'resize50' | 'q60-noexif' | 'png' | 'bridge';
   /**
-   * Synthetic ground truth vs `seedName` (§6.3). `copy-or-ambiguous` marks an EXIF-less copy of a
-   * burst frame (spec §12 R3): it ends up a copy of one of `bridges` or `copy_ambiguous`, and the
-   * two `bridges` frames are never in the same copy group.
+   * Synthetic ground truth vs `seedName` (§6.3). `copy-if-tight`: a §6.3 row that is a copy only
+   * within the copy distances, which this oracle can't measure; the e2e check takes them from
+   * the pair's stored hashes. `copy-or-ambiguous` marks an EXIF-less copy of a burst frame
+   * (spec §12 R3): it ends up a copy of one of `bridges` or `copy_ambiguous`, and the two
+   * `bridges` frames are never in the same copy group.
    */
-  expect?: 'copy' | 'similar' | 'copy-or-ambiguous';
+  expect?: 'copy' | 'copy-if-tight' | 'similar' | 'copy-or-ambiguous';
   /** `[seedName, its burst partner]` when `expect` is `copy-or-ambiguous`. */
   bridges?: [string, string];
   reason?: string;
@@ -885,10 +887,14 @@ export interface TruthFacts {
 }
 
 /**
- * The §6.3 classification of a pair that is already within the *copy* hash distances (true of
- * a synthetic variant and its seed by construction). Rows top to bottom, first match wins.
+ * The §6.3 classification of a look-alike pair (a synthetic variant and its seed). Rows top to
+ * bottom, first match wins. Rows 6–8 are copies only within the copy hash distances, which this
+ * oracle doesn't compute: `copy-if-tight`.
  */
-export function expectedRelation(a: TruthFacts, b: TruthFacts): 'copy' | 'similar' {
+export function expectedRelation(
+  a: TruthFacts,
+  b: TruthFacts,
+): 'copy' | 'copy-if-tight' | 'similar' {
   const both = <T>(x: T | null, y: T | null) => x !== null && y !== null;
   const sec = (t: string) => Math.floor(Date.parse(t) / 1000);
   const otherEncoding = a.width !== b.width || a.height !== b.height || a.mime !== b.mime;
@@ -897,9 +903,10 @@ export function expectedRelation(a: TruthFacts, b: TruthFacts): 'copy' | 'simila
   if (captured && sec(a.capturedAt!) !== sec(b.capturedAt!)) return 'similar';
   if (both(a.subsec, b.subsec) && a.subsec !== b.subsec) return 'similar';
   if (both(a.camera, b.camera) && a.camera !== b.camera) return 'similar';
-  if (captured) return both(a.subsec, b.subsec) || otherEncoding ? 'copy' : 'similar';
-  if (a.capturedAt !== null || b.capturedAt !== null) return 'copy';
-  return otherEncoding ? 'copy' : 'similar';
+  if (captured && both(a.subsec, b.subsec)) return 'copy';
+  if (captured) return otherEncoding ? 'copy-if-tight' : 'similar';
+  if (a.capturedAt !== null || b.capturedAt !== null) return 'copy-if-tight';
+  return otherEncoding ? 'copy-if-tight' : 'similar';
 }
 
 function truthFacts(f: Facts & Dims, e: Encoding): TruthFacts {
@@ -986,7 +993,7 @@ export async function synthesize(
     const v = truthFacts(out.facts[i]!, out.enc[i]!);
     const rel = expectedRelation(truth.get(m.seedName)!, v);
     const partner = partnerOf(m.seedName);
-    return rel === 'copy' && v.capturedAt === null && partner !== undefined
+    return rel !== 'similar' && v.capturedAt === null && partner !== undefined
       ? { ...m, origin: 'synthetic', expect: 'copy-or-ambiguous', bridges: [m.seedName, partner] }
       : { ...m, origin: 'synthetic', expect: rel };
   });

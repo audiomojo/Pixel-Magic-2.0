@@ -190,7 +190,7 @@ describe('relations', () => {
   });
 });
 
-describe('expectedRelation (§6.3, for a pair within the copy thresholds)', () => {
+describe('expectedRelation (§6.3 for a look-alike pair; copy-if-tight: the rows needing copy distances)', () => {
   const base: TruthFacts = {
     capturedAt: '2021-10-03T14:02:11.000Z',
     subsec: '120',
@@ -202,18 +202,20 @@ describe('expectedRelation (§6.3, for a pair within the copy thresholds)', () =
   };
   const jpgHalf = { width: 2016, height: 1512, mime: 'image/jpeg' };
   const none = { capturedAt: null, subsec: null, camera: null };
-  test.each<[string, Partial<TruthFacts>, Partial<TruthFacts>, 'copy' | 'similar']>([
+  test.each<
+    [string, Partial<TruthFacts>, Partial<TruthFacts>, 'copy' | 'copy-if-tight' | 'similar']
+  >([
     ['same BurstUUID', { burstUuid: 'u' }, { burstUuid: 'u', ...jpgHalf }, 'similar'],
     ['different second', {}, { capturedAt: '2021-10-03T14:02:12.000Z' }, 'similar'],
     ['same second, ms ignored', {}, { capturedAt: '2021-10-03T14:02:11.900Z' }, 'copy'],
     ['different subsec', {}, { subsec: '480' }, 'similar'],
     ['different camera', {}, { camera: 'Canon', ...jpgHalf }, 'similar'],
     ['same capture and subsec', {}, {}, 'copy'],
-    ['subsec missing, other encoding', {}, { subsec: null, ...jpgHalf }, 'copy'],
+    ['subsec missing, other encoding', {}, { subsec: null, ...jpgHalf }, 'copy-if-tight'],
     ['subsec missing, same encoding', {}, { subsec: null }, 'similar'],
-    ['one side has no capture', {}, { ...none }, 'copy'],
-    ['neither has capture, other mime', none, { ...none, mime: 'image/jpeg' }, 'copy'],
-    ['neither has capture, other size', none, { ...none, width: 2016 }, 'copy'],
+    ['one side has no capture', {}, { ...none }, 'copy-if-tight'],
+    ['neither has capture, other mime', none, { ...none, mime: 'image/jpeg' }, 'copy-if-tight'],
+    ['neither has capture, other size', none, { ...none, width: 2016 }, 'copy-if-tight'],
     ['neither has capture, same encoding', none, { ...none }, 'similar'],
   ])('%s', (_, a, b, want) => {
     expect(expectedRelation({ ...base, ...a }, { ...base, ...b })).toBe(want);
@@ -436,10 +438,11 @@ describe('seed', () => {
         .filter((f) => f.seedName === seedName && f.variant === variant)
         .map((f) => [f.expect, f.bridges ?? null]);
     // a.jpg has no capture time: a same-size, same-mime re-encode is only "similar" (§6.3 row 8).
-    expect(truthOf('a.jpg', 'resize50')).toEqual([['copy', null]]);
+    // Rows 7–8 (and 6) need the copy distances, which the oracle can't measure: copy-if-tight.
+    expect(truthOf('a.jpg', 'resize50')).toEqual([['copy-if-tight', null]]);
     expect(truthOf('a.jpg', 'q60-noexif')).toEqual([['similar', null]]);
-    expect(truthOf('a.jpg', 'png')).toEqual([['copy', null]]);
-    expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy', null]]);
+    expect(truthOf('a.jpg', 'png')).toEqual([['copy-if-tight', null]]);
+    expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy-if-tight', null]]);
     // b.jpg and c.jpg are a burst: EXIF-kept variants are copies, EXIF-less ones are bridges.
     expect(truthOf('b.jpg', 'resize50')).toEqual([['copy', null]]);
     expect(truthOf('b.jpg', 'png')).toEqual([['copy', null]]);

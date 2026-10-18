@@ -1,5 +1,7 @@
 // Ground-truth expectations for an e2e run, and the lookups the e2e tests assert with.
+import { DEFAULT_THRESHOLDS } from '../../src/classify.js';
 import { isIgnored } from '../../src/fsops.js';
+import { hamming, toUnsigned } from '../../src/hashing.js';
 import type { Manifest, SeedFile, SeedManifest } from '../../tools/corpus/lib.js';
 import { loadWorld, poolFor, type ContentRow, type World } from './db.js';
 import { stagedEntries, treeSnapshot } from './snapshot.js';
@@ -198,6 +200,16 @@ export async function diffExpectations(
   );
   const group = (sha: string) => w.contents.get(sha)?.copyGroup ?? null;
   const same = (a: string, b: string) => a === b || (group(a) !== null && group(a) === group(b));
+  const tight = (a: string, b: string): boolean => {
+    const [x, y] = [w.contents.get(a), w.contents.get(b)];
+    if (!x || !y || x.phash === null || y.phash === null || x.dhash === null || y.dhash === null)
+      return false;
+    const t = DEFAULT_THRESHOLDS; // the stacks run with the default thresholds
+    return (
+      hamming(toUnsigned(x.phash), toUnsigned(y.phash)) <= t.copyPhash &&
+      hamming(toUnsigned(x.dhash), toUnsigned(y.dhash)) <= t.copyDhash
+    );
+  };
   for (const v of seeded.filter((f) => f.origin === 'synthetic')) {
     const c = contentFor(v);
     const s = seedSha.get(v.seedName ?? '');
@@ -209,9 +221,13 @@ export async function diffExpectations(
       out.push(`${v.relPath}: expected CLUSTERED, got ${c.state}`);
       continue;
     }
-    if (v.expect === 'copy' && !same(v.sha256, s))
+    // Rows 6–8 of §6.3: a copy exactly when the pair is within the copy distances (measured on
+    // the stored hashes), otherwise only similar.
+    const expect =
+      v.expect === 'copy-if-tight' ? (tight(v.sha256, s) ? 'copy' : 'similar') : v.expect;
+    if (expect === 'copy' && !same(v.sha256, s))
       out.push(`${v.relPath}: expected a copy of ${String(v.seedName)}, not in its copy group`);
-    if (v.expect === 'similar') {
+    if (expect === 'similar') {
       // Within the look-alike distances by construction: always in the seed's similar set. Its
       // copy group only through another variant of the same seed that is a copy of both (an
       // EXIF-less re-encode bridging them, spec §6.3 transitive union).

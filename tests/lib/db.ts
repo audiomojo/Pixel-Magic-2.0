@@ -38,6 +38,9 @@ export interface ContentRow {
   capturedAt: Date | null;
   subsec: string | null;
   burstUuid: string | null;
+  /** Stored (signed) 64-bit hashes, null until hashed. */
+  phash: bigint | null;
+  dhash: bigint | null;
   ambiguous: boolean;
   /** Root copy group (resolved through `merged_into`), or null. */
   copyGroup: number | null;
@@ -85,11 +88,13 @@ export async function loadWorld(url: string): Promise<World> {
     captured_at: Date | null;
     subsec: string | null;
     burst_uuid: string | null;
+    phash: bigint | null;
+    dhash: bigint | null;
     copy_ambiguous: boolean;
     copy_group_id: bigint | null;
   }>(
     `SELECT sha256, kind, mime, state, quarantine_reason, last_error, captured_at, subsec,
-            burst_uuid, copy_ambiguous, copy_group_id FROM contents`,
+            burst_uuid, phash, dhash, copy_ambiguous, copy_group_id FROM contents`,
   );
   return {
     files: files.rows.map((r) => ({
@@ -115,6 +120,8 @@ export async function loadWorld(url: string): Promise<World> {
             capturedAt: r.captured_at,
             subsec: r.subsec,
             burstUuid: r.burst_uuid,
+            phash: r.phash,
+            dhash: r.dhash,
             ambiguous: r.copy_ambiguous,
             copyGroup,
             similarSet: s === null ? null : root(Number(s)),
