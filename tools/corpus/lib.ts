@@ -65,7 +65,7 @@ export interface Relations {
   exactGroups: string[][];
   /** Same stem as HEIC and JPG and the same capture instant. */
   heicJpgTwin: Pair[];
-  /** `[edit, original]`: `IMG_E1234.*` and `IMG_1234.*` of the same kind. */
+  /** `[edit, original]`: `IMG_Ennnn.*` and `IMG_nnnn.*` of the same kind. */
   editOf: Pair[];
   /** Name-only: `"X 1.ext"` vs `"X.ext"`. Never implies "copy". */
   spaceSuffixCopy: Pair[];

@@ -5,44 +5,39 @@ import type { Client } from '@temporalio/client';
 import type pg from 'pg';
 import type { DataLayout } from './fsops.js';
 import { sha256File } from './fsops.js';
+import type { ContentWorkflow } from './workflows.js';
 
 export interface RetryResult {
-  reset: number;
+  started: number;
   failed: { sha256: string; error: string }[];
 }
 
 /**
- * Resets every FAILED content to INGESTED and starts a `ContentWorkflow` for it. A row whose
- * workflow cannot be started goes back to FAILED (with its error), so a later run finds it again.
+ * Starts a `ContentWorkflow` for every FAILED content; the workflow itself reopens the row
+ * (`reopenFailed`) before decoding. This command changes no row, so a crash part-way leaves
+ * nothing half-done and a rerun is always safe (a row still FAILED is simply started again).
  */
 export async function retryFailed(
   pool: pg.Pool,
   client: Client,
+  opts: { poisonAttempts: number },
   now: () => number = Date.now,
 ): Promise<RetryResult> {
   const rows = (
-    await pool.query<{ sha256: string; ext: string; last_error: string | null }>(
-      `WITH failed AS (SELECT sha256, last_error FROM contents WHERE state = 'FAILED' FOR UPDATE)
-       UPDATE contents c SET state = 'INGESTED', last_error = NULL
-       FROM failed WHERE c.sha256 = failed.sha256
-       RETURNING c.sha256, c.ext, failed.last_error`,
+    await pool.query<{ sha256: string; ext: string }>(
+      `SELECT sha256, ext FROM contents WHERE state = 'FAILED' ORDER BY sha256`,
     )
   ).rows;
-  const result: RetryResult = { reset: 0, failed: [] };
+  const result: RetryResult = { started: 0, failed: [] };
   for (const row of rows) {
     try {
-      await client.workflow.start('ContentWorkflow', {
+      await client.workflow.start<typeof ContentWorkflow>('ContentWorkflow', {
         taskQueue: 'main',
         workflowId: `content-${row.sha256}-retry-${String(now())}`,
-        args: [row.sha256, row.ext],
+        args: [row.sha256, row.ext, { poisonAttempts: opts.poisonAttempts }],
       });
-      result.reset += 1;
+      result.started += 1;
     } catch (e) {
-      await pool.query(
-        `UPDATE contents SET state = 'FAILED', last_error = $2
-         WHERE sha256 = $1 AND state = 'INGESTED'`,
-        [row.sha256, row.last_error],
-      );
       result.failed.push({ sha256: row.sha256, error: e instanceof Error ? e.message : String(e) });
     }
   }

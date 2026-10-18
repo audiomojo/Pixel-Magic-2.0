@@ -31,15 +31,19 @@ export function createPool(url: string, max = 10): pg.Pool {
 
 export async function withTx<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
   const c = await pool.connect();
+  /** Set when ROLLBACK failed: the session may still be inside the aborted transaction. */
+  let broken: Error | undefined;
   try {
     await c.query('BEGIN');
     const out = await fn(c);
     await c.query('COMMIT');
     return out;
   } catch (e) {
-    await c.query('ROLLBACK').catch(() => undefined);
-    throw e;
+    await c.query('ROLLBACK').catch((r: unknown) => {
+      broken = r instanceof Error ? r : new Error(String(r));
+    });
+    throw e; // the original error, never the ROLLBACK's
   } finally {
-    c.release();
+    c.release(broken); // a broken client is discarded, never reused by the next pool.query
   }
 }

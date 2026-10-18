@@ -47,6 +47,7 @@ export async function checkSameDevice(layout: DataLayout, statFn: DevStat = stat
     ['dropzone', layout.dropzone],
     ['claimed', layout.claimed],
     ['vault', layout.vault],
+    ['vaultCopies', layout.vaultCopies],
     ['staging', layout.staging],
   ];
   for (const [name, dir] of dirs) {
@@ -85,15 +86,21 @@ async function statOrNull(path: string) {
  * Whether `a` and `b` are names of one file. Equal `(dev, ino)` decides. Docker Desktop's
  * virtiofs renumbers an inode when its cache evicts it, though, so two names of one file can
  * report different numbers. On a mismatch, two multiply-linked files with equal size and mtime
- * whose bytes both hash to `sha256` count as the same file.
+ * whose bytes both hash to `sha256` count as the same file. `onChunk` runs per MiB hashed (a
+ * caller's heartbeat: a large video on virtiofs takes longer than a heartbeat timeout).
  */
-export async function sameFile(a: string, b: string, sha256: string | null): Promise<boolean> {
+export async function sameFile(
+  a: string,
+  b: string,
+  sha256: string | null,
+  onChunk?: () => void,
+): Promise<boolean> {
   const [x, y] = await Promise.all([statOrNull(a), statOrNull(b)]);
   if (!x || !y) return false;
   if (x.dev === y.dev && x.ino === y.ino) return true;
   if (sha256 === null || x.nlink < 2n || y.nlink < 2n) return false;
   if (x.size !== y.size || x.mtimeNs !== y.mtimeNs) return false;
-  const [ha, hb] = await Promise.all([sha256File(a), sha256File(b)]);
+  const [ha, hb] = await Promise.all([sha256File(a, onChunk), sha256File(b, onChunk)]);
   return ha === sha256 && hb === sha256;
 }
 
@@ -109,21 +116,38 @@ export async function fsyncDir(dir: string): Promise<void> {
   }
 }
 
-/** Hardlink src to dest (never overwrites, never unlinks); `sha256` is the bytes' hash. */
+/**
+ * Hardlink src to dest (never overwrites, never unlinks); `sha256` is the bytes' hash. Every
+ * directory level it creates is made durable in its parent, and so is the link, also when a
+ * replay finds it already there (the crash may have come before its fsync).
+ */
 export async function linkIntoVault(
   src: string,
   dest: string,
   sha256: string,
+  opts: { onChunk?: () => void; fsync?: (dir: string) => Promise<void> } = {},
 ): Promise<LinkOutcome> {
-  await mkdir(dirname(dest), { recursive: true });
+  const sync = opts.fsync ?? fsyncDir;
+  const dir = dirname(dest);
+  const first = await mkdir(dir, { recursive: true });
+  if (first !== undefined) {
+    const created: string[] = [];
+    for (let d = dir; ; d = dirname(d)) {
+      created.unshift(d);
+      if (d === first || dirname(d) === d) break;
+    }
+    for (const d of created) await sync(dirname(d));
+  }
   try {
     await link(src, dest);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     // `sameFile`, not a bare inode compare: virtiofs may have renumbered the vault link.
-    return (await sameFile(src, dest, sha256)) ? 'ALREADY_LINKED' : 'EXISTS_OTHER';
+    if (!(await sameFile(src, dest, sha256, opts.onChunk))) return 'EXISTS_OTHER';
+    await sync(dir);
+    return 'ALREADY_LINKED';
   }
-  await fsyncDir(dirname(dest));
+  await sync(dir);
   return 'LINKED';
 }
 

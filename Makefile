@@ -22,7 +22,7 @@ fs-check:
 stage:
 	docker compose exec -T worker node dist/cli.js stage $(if $(FORCE),--force,)
 
-# Reset FAILED contents and start a ContentWorkflow for each.
+# Start a ContentWorkflow for each FAILED content (the workflow reopens it); safe to re-run.
 retry-failed:
 	docker compose exec -T worker node dist/cli.js retry-failed
 

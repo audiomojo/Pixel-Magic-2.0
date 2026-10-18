@@ -168,7 +168,7 @@ Rows are evaluated top to bottom; the first match wins.
 - A content whose copy union was refused is flagged `copy_ambiguous` and is never chosen as a best copy.
 - In one transaction: commit `state=CLUSTERED`, increment `cluster_state.version`, and write the group changes. Update the in-memory index only **after** the commit.
 
-**Order independence.** Every new hash is compared with all members. As a result, the **similar-set partition** (the connected components of the look-alike graph) never depends on arrival order. The **copy-group partition** doesn't either, except for `copy_ambiguous` contents: which conflicting group such a content joins depends on order (§12 R3).
+**Order independence.** Every new hash is compared with all members. As a result, the **similar-set partition** (the connected components of the look-alike graph) never depends on arrival order. The **copy-group partition** doesn't either, except for contents flagged `copy_ambiguous` in either run: which conflicting group such a content joins, and which key-less copies get flagged, depend on order (§12 R3).
 
 ### 6.4 `build_staging` (queue `io`, heartbeats)
 
@@ -271,7 +271,7 @@ Workers handle `SIGTERM` with a graceful shutdown timeout of 60 s. `make verify-
      - the vault plus `.copies` hold every seeded byte
      - `work/claimed/` is empty
      - no copy group contains two different known capture times
-   - "Equal" means: the similar-set partition and the copy-group partition (ignoring `copy_ambiguous` contents) are identical, and so is the staging tree snapshot (with ambiguous entries normalised).
+   - "Equal" means: the similar-set partition and the copy-group partition are identical, and so is the staging tree snapshot, except for contents flagged `copy_ambiguous` in **either** run (and their staged entries), which both comparisons leave out.
 
 ## 11. Settled defaults (from the old open questions)
 
@@ -290,7 +290,7 @@ These changes were made while writing the implementation plan. The sections abov
 
 - **R1 Ingest idempotency key.** `files.workflow_run_id` (unique) identifies the row. If an ingest is re-run after its commit (a crash before Temporal recorded completion), it returns the stored outcome instead of reporting the file as vanished. `files.ext` is stored at claim time.
 - **R2 Cluster cache.** `contents.cluster_seq` is replaced by a single-row `cluster_state.version`, so a cached index is never used after another worker has changed the groups. Only the `worker` service serves `cluster`; `worker-extra` replicas don't.
-- **R3 Order independence, stated precisely.** Refusing a capture-conflicting union means an EXIF-less export that bridges two burst frames can join either frame's group, depending on arrival order. Such contents are flagged `copy_ambiguous`, are never a best copy, and are excluded when partitions are compared. Similar sets are always order-independent. Two frames of one second without `subsec` (older cameras) look like a re-encoding pair, so §6.3 row 6 also needs the tight copy distances, and a union that would mix two different cameras is refused like a capture conflict; a refusal flags only contents with neither a capture key nor a burst.
+- **R3 Order independence, stated precisely.** Refusing a capture-conflicting union means an EXIF-less export that bridges two burst frames can join either frame's group, depending on arrival order. Such contents are flagged `copy_ambiguous`, are never a best copy, and are excluded when partitions are compared. Similar sets are always order-independent. Two frames of one second without `subsec` (older cameras) look like a re-encoding pair, so §6.3 row 6 also needs the tight copy distances, and a union that would mix two different cameras is refused like a capture conflict; a refusal flags only contents with neither a capture key nor a burst. With chains of key-less copies touching several bridges, *which* key-less contents end up flagged can depend on order. Keyed photos are never flagged. Partition and tree comparisons exclude contents flagged in **either** run.
 - **R4 Decode and record are split.** `decode_content` (cpu, no database, 5 attempts) is separate from `record_hash` (io, unlimited retries). A long database outage therefore never marks content FAILED. FAILED moved from `files.state` to `contents.state`. Quarantine is returned as an activity outcome rather than raised.
 - **R5 Deterministic staging names.** Group folders are named after their best copy's SHA-256 (`g-<sha8>`, `s-<sha8>`), not database ids, so a calm run and a chaos run produce identical trees.
 - **R6 FAILED contents** are staged under `quarantine/failed/`.

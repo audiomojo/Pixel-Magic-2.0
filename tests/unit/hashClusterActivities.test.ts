@@ -4,7 +4,7 @@ import { dirname, extname, join } from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 import { captureKey } from '../../src/activities/cluster.js';
-import { createDecodePool } from '../../src/activities/hashing.js';
+import { createDecodePool, type WorkerPool } from '../../src/activities/hashing.js';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import { classify, type Facts } from '../../src/classify.js';
 import { DataLayout, sha256File, vaultRel } from '../../src/fsops.js';
@@ -182,6 +182,27 @@ test('decodeContent: a missing vault file is an ordinary (transient) error, not 
   expect((err as Error).message).toMatch(/ENOENT/);
   expect(err).not.toMatchObject({ type: 'Poison' });
 }, 30_000);
+
+test('decodeContent: a pool failure is Poison whatever the case of its message', async () => {
+  const pool = {
+    exec: () => ({ timeout: () => Promise.reject(new Error('Worker Terminating')) }),
+  } as unknown as WorkerPool;
+  const a = createActivities({ ...deps, decodePool: pool });
+  await expect(runActivity(a.decodeContent, ['0'.repeat(64), 'jpg'])).rejects.toMatchObject({
+    type: 'Poison',
+  });
+});
+
+test('reopenFailed puts a FAILED content back to INGESTED and touches nothing else', async () => {
+  const failed = await seedContent({ state: 'FAILED' });
+  await pool.query(`UPDATE contents SET last_error = 'x' WHERE sha256 = $1`, [failed]);
+  const hashed = await seedContent({ state: 'HASHED' });
+  await runActivity(acts.reopenFailed, [failed]);
+  await runActivity(acts.reopenFailed, [hashed]);
+  await runActivity(acts.reopenFailed, [failed]); // a rerun is a no-op
+  expect(await stateOf(failed)).toEqual({ state: 'INGESTED', last_error: null });
+  expect(await stateOf(hashed)).toEqual({ state: 'HASHED', last_error: null });
+});
 
 // ---------------------------------------------------------------- recordHash / markFailed
 

@@ -13,6 +13,8 @@ export interface CliDeps {
   temporal?: Client;
   pool?: pg.Pool;
   layout?: DataLayout;
+  /** `POISON_ATTEMPTS` for retried contents; defaults to the configured value. */
+  poisonAttempts?: number;
 }
 
 const USAGE = 'usage: cli stage [--force] | retry-failed | verify-vault [--sample N] | doctor\n';
@@ -38,9 +40,9 @@ async function stage(client: Client, force: boolean): Promise<number> {
   return 0;
 }
 
-async function retry(pool: pg.Pool, client: Client): Promise<number> {
-  const r = await retryFailed(pool, client);
-  out(`reset and restarted ${String(r.reset)} failed contents`);
+async function retry(pool: pg.Pool, client: Client, poisonAttempts: number): Promise<number> {
+  const r = await retryFailed(pool, client, { poisonAttempts });
+  out(`started ${String(r.started)} failed contents again`);
   for (const f of r.failed) process.stderr.write(`could not start ${f.sha256}: ${f.error}\n`);
   return r.failed.length === 0 ? 0 : 1;
 }
@@ -100,7 +102,11 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
       case 'stage':
         return await stage(await needClient(), force);
       case 'retry-failed':
-        return await retry(needPool(), await needClient());
+        return await retry(
+          needPool(),
+          await needClient(),
+          deps.poisonAttempts ?? loadSettings().poisonAttempts,
+        );
       case 'verify-vault':
         return await verify(needLayout(), sample);
       default:
@@ -112,7 +118,17 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
   }
 }
 
+/** `main`, with any failure reported as one `error:` line (no stack trace) and exit code 1. */
+export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
+  try {
+    return await main(argv, deps);
+  } catch (e) {
+    process.stderr.write(`error: ${e instanceof Error ? e.message : String(e)}\n`);
+    return 1;
+  }
+}
+
 const isEntry =
   process.argv[1] !== undefined &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-if (isEntry) process.exitCode = await main(process.argv.slice(2));
+if (isEntry) process.exitCode = await run(process.argv.slice(2));

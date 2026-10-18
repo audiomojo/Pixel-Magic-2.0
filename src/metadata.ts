@@ -55,9 +55,14 @@ function parseDate(raw: unknown, offset: unknown): Date | null {
     number,
     number,
   ];
+  // A corrupt field must not become a plausible wrong capture key (they decide copy verdicts):
+  // no rollover of out-of-range values (Date.UTC turns 30 Feb into 2 Mar, 24:00 into tomorrow).
   if (y === 0 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  if (h > 23 || mi > 59 || se > 59) return null;
   const ms = Date.UTC(y, mo - 1, d, h, mi, se);
+  if (new Date(ms).getUTCDate() !== d) return null;
   const o = OFFSET.exec(str(offset) ?? '');
+  if (o && (Number(o[3]) > 59 || Number(o[2]) * 60 + Number(o[3]) > 14 * 60)) return null; // ±14:00 max
   const offsetMin = o ? (o[1] === '-' ? -1 : 1) * (Number(o[2]) * 60 + Number(o[3])) : 0;
   const t = new Date(ms - offsetMin * 60_000);
   return Number.isNaN(t.getTime()) ? null : t;

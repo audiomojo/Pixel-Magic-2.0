@@ -574,7 +574,7 @@ test.each([['IMG_E8719.HEIC', 'still', 'jpg'], ['IMG_0004.MOV', 'motion', 'mov']
            ['AUXA4949.BMP', 'still', 'bmp']])('real %s', async (n, kind, ext) => {
   const m = await reader.read(C(n)); expect([m.kind, m.ext]).toEqual([kind, ext]);
 });
-test('AAE is other', async () => expect((await reader.read(C('IMG_0066.AAE'))).kind).toBe('other'));
+test('AAE is other', async () => expect((await reader.read(C('IMG_nnnn.AAE'))).kind).toBe('other'));
 test('a Live Photo pair shares a content id', async () => {
   const [h, m] = [await reader.read(C('IMG_2834 1.HEIC')), await reader.read(C('IMG_2834 1.MOV'))];
   expect(h.liveContentId).not.toBeNull(); expect(m.liveContentId).toBe(h.liveContentId);

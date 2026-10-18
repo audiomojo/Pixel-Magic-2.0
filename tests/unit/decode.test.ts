@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ExifTool } from 'exiftool-vendored';
+import heicDecode from 'heic-decode';
 import sharp from 'sharp';
 import { afterAll, afterEach, expect, test, vi } from 'vitest';
 import workerpool from 'workerpool';
@@ -138,6 +139,30 @@ test("RAW preview takes the RAW's IFD0 orientation", async () => {
   expect([f.width, f.height]).toEqual([640, 480]); // preview stored 480×640
   expect(hamming(upright.phash, f.phash)).toBeLessThanOrEqual(4);
 }, 30_000);
+
+test('RAW dimensions are the sensor size, not the smaller preview (RAW must outrank its JPEG)', async () => {
+  const d = await tmpDir();
+  const f = await computeImageFacts(await rawWithPreview(d, { size: [1280, 960] }), 'dng');
+  expect([f.width, f.height]).toEqual([1280, 960]); // the preview is 640×480
+  const portrait = await computeImageFacts(
+    await rawWithPreview(d, { size: [1280, 960], orientation: 6 }),
+    'dng',
+  );
+  expect([portrait.width, portrait.height]).toEqual([1280, 960]); // stored 960×1280, Orientation 6
+  // A reported size below the preview's is not believed (a thumbnail IFD): keep the preview's.
+  const small = await computeImageFacts(await rawWithPreview(d, { size: [320, 240] }), 'dng');
+  expect([small.width, small.height]).toEqual([640, 480]);
+}, 30_000);
+
+test.each([
+  new RangeError('WebAssembly.Memory.grow(): Maximum memory size exceeded'),
+  new Error('Out of memory'),
+])('a HEIC decode that runs out of memory (%s) is transient, not a decode_error', async (err) => {
+  vi.spyOn(heicDecode, 'all').mockRejectedValueOnce(err);
+  const e: unknown = await computeImageFacts(HEIC_SCENE0, 'heic').catch((x: unknown) => x);
+  expect(e).toBe(err);
+  expect(e).not.toBeInstanceOf(QuarantineError);
+});
 
 test('a RAW preview extraction that fails for environmental reasons stays transient', async () => {
   const d = await tmpDir();

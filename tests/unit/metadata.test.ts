@@ -93,7 +93,29 @@ describe('parseMetadata', () => {
       parseMetadata({ ...heic, 'EXIF:OffsetTimeOriginal': 'junk' }).capturedAt?.toISOString(),
     ).toBe('2021-10-03T14:02:11.000Z');
   });
-  test.each(['0000:00:00 00:00:00', 'garbage', ''])('invalid date %j becomes null', (d) =>
+  test.each([
+    '0000:00:00 00:00:00',
+    'garbage',
+    '',
+    // M5: a corrupt field must not become a plausible wrong capture key (they drive copy verdicts)
+    '2021:02:30 10:00:00', // no 30 February (Date.UTC would roll it to 2 March)
+    '2021:04:31 10:00:00',
+    '2021:10:03 24:00:00',
+    '2021:10:03 14:60:00',
+    '2021:10:03 14:02:60',
+  ])('invalid date %j becomes null', (d) =>
     expect(parseMetadata({ ...heic, 'EXIF:DateTimeOriginal': d }).capturedAt).toBeNull(),
   );
+  test.each(['+99:99', '+15:00', '-14:60'])('an out-of-range offset %j makes the date null', (o) =>
+    expect(parseMetadata({ ...heic, 'EXIF:OffsetTimeOriginal': o }).capturedAt).toBeNull(),
+  );
+  test('edge values that exist are kept', () => {
+    expect(
+      parseMetadata({
+        ...jpeg,
+        'EXIF:DateTimeOriginal': '2024:02:29 23:59:59',
+        'EXIF:OffsetTimeOriginal': '+14:00',
+      }).capturedAt?.toISOString(),
+    ).toBe('2024-02-29T09:59:59.000Z');
+  });
 });

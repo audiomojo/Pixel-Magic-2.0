@@ -12,9 +12,9 @@ const median = (xs: number[]): number => {
 };
 
 describe.skipIf(!hasCorpus)('decode on the sample corpus', () => {
-  // IMG_0034.HEIC/.JPG share a name only (iPhone 14 Pro Max 2025 vs iPhone 8 Plus 2019).
+  // IMG_0034.HEIC/.JPG share a name only (different cameras and years).
   // The corpus's one HEIC/JPG capture twin is "IMG_6941 1.HEIC" and its edit IMG_E6941.JPG
-  // (same DateTimeOriginal, SubSec and Model; the JPG is a 1574×2100 export).
+  // (same capture time and camera; the JPG is a smaller export).
   test('HEIC and its JPG twin hash within copy range', async () =>
     expect(
       hamming(

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { link, stat, utimes, writeFile } from 'node:fs/promises';
+import { link, mkdir, stat, utimes, writeFile } from 'node:fs/promises';
 import { describe, expect, test } from 'vitest';
 import {
   DataLayout,
@@ -156,4 +156,53 @@ describe('sameFile', () => {
     await writeFile(`${d}/a`, 'bytes');
     expect(await sameFile(`${d}/a`, `${d}/nope`, sha('bytes'))).toBe(false);
   });
+});
+
+test('checkSameDevice covers vault/.copies (EXDEV there would retry forever)', async () => {
+  const l = new DataLayout(await tmpDir());
+  await l.ensure();
+  const fake = async (p: string) => {
+    const st = await stat(p);
+    return { dev: p === l.vaultCopies ? st.dev + 1 : st.dev };
+  };
+  await expect(checkSameDevice(l, fake)).rejects.toThrow(/vaultCopies/);
+});
+
+test('linkIntoVault fsyncs every directory level it created, and the link on every outcome', async () => {
+  const d = await tmpDir();
+  await writeFile(`${d}/a`, '1');
+  await mkdir(`${d}/v`);
+  const sha = createHash('sha256').update('1').digest('hex');
+  const synced: string[] = [];
+  const fsync = (dir: string) => {
+    synced.push(dir);
+    return Promise.resolve();
+  };
+  expect(await linkIntoVault(`${d}/a`, `${d}/v/ab/cd/x.jpg`, sha, { fsync })).toBe('LINKED');
+  // v/ab is new (its entry lives in v), v/ab/cd is new (in v/ab), the link lives in v/ab/cd.
+  expect(synced).toEqual([`${d}/v`, `${d}/v/ab`, `${d}/v/ab/cd`]);
+  synced.length = 0;
+  // A replay after a crash between link and fsync: the link may not be durable yet.
+  expect(await linkIntoVault(`${d}/a`, `${d}/v/ab/cd/x.jpg`, sha, { fsync })).toBe(
+    'ALREADY_LINKED',
+  );
+  expect(synced).toEqual([`${d}/v/ab/cd`]);
+});
+
+test('sameFile and linkIntoVault report hashing progress (heartbeats for big videos)', async () => {
+  const d = await tmpDir();
+  const body = Buffer.alloc(3 << 20, 7);
+  const sha = createHash('sha256').update(body).digest('hex');
+  for (const f of ['a', 'v']) {
+    await writeFile(`${d}/${f}`, body);
+    await link(`${d}/${f}`, `${d}/${f}2`);
+    await utimes(`${d}/${f}`, 1_700_000_000, 1_700_000_000);
+  }
+  let chunks = 0;
+  const onChunk = () => void chunks++;
+  expect(await sameFile(`${d}/a`, `${d}/v`, sha, onChunk)).toBe(true);
+  expect(chunks).toBeGreaterThanOrEqual(6); // 3 MiB, hashed on both sides
+  chunks = 0;
+  expect(await linkIntoVault(`${d}/a`, `${d}/v`, sha, { onChunk })).toBe('ALREADY_LINKED');
+  expect(chunks).toBeGreaterThanOrEqual(6);
 });

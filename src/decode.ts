@@ -193,6 +193,8 @@ async function fromHeic(absPath: string): Promise<ImageFacts> {
     }
   } catch (err) {
     if (err instanceof QuarantineError) throw err;
+    // The WASM decoder failing to grow its memory says nothing about the file: transient.
+    if (err instanceof RangeError || /memory/i.test(String(err))) throw err;
     throw new QuarantineError('decode_error', `HEIC: ${String(err)}`);
   }
   const { width, height, data } = decoded;
@@ -245,7 +247,9 @@ async function fromBmp(absPath: string): Promise<ImageFacts> {
 /**
  * RAW files are hashed from their embedded preview, extracted to a temp file and removed.
  * Previews usually carry no orientation (it lives in the RAW's IFD0), so the RAW's numeric
- * Orientation is copied onto the preview before the usual `.rotate()` pipeline.
+ * Orientation is copied onto the preview before the usual `.rotate()` pipeline. Width and
+ * height are the RAW's own (oriented) image size, not the smaller preview's, so a RAW outranks
+ * the camera's JPEG on pixels (best-copy rule 1); a size below the preview's is not believed.
  * Only a missing preview is permanent; any other exiftool failure (spawn, timeout) is transient.
  */
 async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts> {
@@ -262,7 +266,9 @@ async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts
       throw err;
     }
     if (await isMissing(preview)) throw new QuarantineError('decode_error', 'RAW has no preview');
-    const { Orientation } = await exiftool.readRaw(absPath, { readArgs: ['-Orientation', '-n'] });
+    const { Orientation, ImageWidth, ImageHeight } = await exiftool.readRaw(absPath, {
+      readArgs: ['-Orientation', '-ImageWidth', '-ImageHeight', '-n'],
+    });
     if (typeof Orientation === 'number' && Orientation !== 1)
       await exiftool.write(
         preview,
@@ -271,11 +277,17 @@ async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts
           writeArgs: [`-Orientation#=${Orientation}`, '-overwrite_original'],
         },
       );
-    return { ...(await factsFrom(preview)), mime };
+    const facts = { ...(await factsFrom(preview)), mime };
+    if (!isDim(ImageWidth) || !isDim(ImageHeight)) return facts;
+    const swap = typeof Orientation === 'number' && Orientation >= 5 && Orientation <= 8;
+    const [width, height] = swap ? [ImageHeight, ImageWidth] : [ImageWidth, ImageHeight];
+    return width * height >= facts.width * facts.height ? { ...facts, width, height } : facts;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+const isDim = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
 /** exiftool-vendored's explicit "nothing extracted" result for a binary tag. */
 const NO_PREVIEW = /\b0 output files? created/i;

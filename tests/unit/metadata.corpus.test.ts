@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { MetadataReader } from '../../src/metadata.js';
-import { C, hasCorpus } from '../helpers/corpus.js';
+import { C, corpusNames, hasCorpus } from '../helpers/corpus.js';
 
 describe.skipIf(!hasCorpus)('metadata (real corpus)', () => {
   let reader: MetadataReader;
@@ -20,8 +20,11 @@ describe.skipIf(!hasCorpus)('metadata (real corpus)', () => {
     const m = await reader.read(C(n));
     expect([m.kind, m.ext]).toEqual([kind, ext]);
   });
-  test('AAE is other', async () =>
-    expect((await reader.read(C('IMG_0066.AAE'))).kind).toBe('other'));
+  // Any AAE sidecar, picked at run time: no corpus name beyond the pinned set is committed.
+  const aae = corpusNames((n) => /\.aae$/i.test(n))[0];
+  test.skipIf(aae === undefined)('AAE is other', async () =>
+    expect((await reader.read(C(aae!))).kind).toBe('other'),
+  );
   test('a Live Photo pair shares a content id', async () => {
     const [h, m] = [
       await reader.read(C('IMG_2834 1.HEIC')),
@@ -31,7 +34,7 @@ describe.skipIf(!hasCorpus)('metadata (real corpus)', () => {
     expect(m.liveContentId).toBe(h.liveContentId);
   });
   test('HEIC/JPG twin share capturedAt', async () => {
-    // IMG_0034.HEIC/.JPG are NOT twins (different phones, years apart)
+    // IMG_0034.HEIC/.JPG share a name only (different cameras and years)
     const [h, j] = [await reader.read(C('IMG_6941 1.HEIC')), await reader.read(C('IMG_E6941.JPG'))];
     expect(h.capturedAt).not.toBeNull();
     expect(j.capturedAt?.getTime()).toBe(h.capturedAt?.getTime());

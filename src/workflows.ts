@@ -5,6 +5,7 @@ import {
   ApplicationFailure,
   isCancellation,
   log,
+  patched,
   proxyActivities,
   sleep,
   type ActivityOptions,
@@ -48,6 +49,7 @@ export const ACTIVITY_OPTIONS = {
     retry: TRANSIENT_RETRY,
   },
   markFailed: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
+  reopenFailed: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
   maybeBuildStaging: {
     taskQueue: 'io',
     startToCloseTimeout: '2h',
@@ -66,6 +68,7 @@ const { ingestFile } = proxyActivities<Activities>(ACTIVITY_OPTIONS.ingestFile);
 const { recordHash } = proxyActivities<Activities>(ACTIVITY_OPTIONS.recordHash);
 const { clusterContent } = proxyActivities<Activities>(ACTIVITY_OPTIONS.clusterContent);
 const { markFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.markFailed);
+const { reopenFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.reopenFailed);
 const { maybeBuildStaging } = proxyActivities<Activities>(ACTIVITY_OPTIONS.maybeBuildStaging);
 const { scanAndStart } = proxyActivities<Activities>(ACTIVITY_OPTIONS.scanAndStart);
 
@@ -131,12 +134,17 @@ export async function FileWorkflow(
   return runContentSteps(r.sha256, r.ext, opts.poisonAttempts ?? DEFAULT_POISON_ATTEMPTS);
 }
 
-/** The content steps alone (used by `retry-failed`). */
+/**
+ * `retry-failed`: reopen the FAILED content (a no-op for any other state), then the content
+ * steps. The reopen is inside the workflow so the CLI changes no row and a rerun is safe.
+ * `patched`: histories started before the reopen step existed replay without it.
+ */
 export async function ContentWorkflow(
   sha256: string,
   ext: string,
   opts: { poisonAttempts?: number } = {},
 ): Promise<string> {
+  if (patched('content-reopen-failed')) await reopenFailed(sha256);
   return runContentSteps(sha256, ext, opts.poisonAttempts ?? DEFAULT_POISON_ATTEMPTS);
 }
 

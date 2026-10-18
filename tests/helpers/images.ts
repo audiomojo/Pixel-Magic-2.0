@@ -200,11 +200,19 @@ export const HEIC_SCENE0 = fileURLToPath(new URL('../fixtures/scene0.heic', impo
  * With `orientation: 6`, IFD0 carries Orientation 6 and the preview (like a camera's) carries
  * no orientation tag and holds the pixels un-rotated (270°), so it displays as scene 0 upright.
  */
-export async function rawWithPreview(dir: string, opts: { orientation?: 6 } = {}): Promise<string> {
+/**
+ * A TIFF-based DNG: the main image ("sensor", `size`, default 640×480) plus a 640×480 JPEG
+ * preview. With `orientation: 6` both are stored rotated, as a camera stores a portrait shot.
+ */
+export async function rawWithPreview(
+  dir: string,
+  opts: { orientation?: 6; size?: [number, number] } = {},
+): Promise<string> {
   const p = nextPath(dir, 'dng');
-  await sharp(await readFile(await photo(dir, 'tif', { scene: 3 })))
-    .tiff()
-    .toFile(p);
+  const main = sharp(
+    await readFile(await photo(dir, 'tif', { scene: 3, ...(opts.size && { size: opts.size }) })),
+  );
+  await (opts.orientation === 6 ? main.rotate(270) : main).tiff().toFile(p);
   let preview = await photo(dir, 'jpg');
   const args = ['-overwrite_original'];
   if (opts.orientation === 6) {

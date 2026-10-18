@@ -36,6 +36,7 @@ type Impl = Pick<
   | 'decodeContent'
   | 'recordHash'
   | 'markFailed'
+  | 'reopenFailed'
   | 'clusterContent'
   | 'maybeBuildStaging'
   | 'scanAndStart'
@@ -97,6 +98,7 @@ function fakes(o: Overrides): Fakes {
       decodeContent: rec('decodeContent', () => value(o.decode, DECODED)),
       recordHash: rec('recordHash', () => value<'HASHED' | 'QUARANTINED'>(o.record, 'HASHED')),
       markFailed: rec('markFailed', () => Promise.resolve()),
+      reopenFailed: rec('reopenFailed', () => Promise.resolve()),
       clusterContent: rec('clusterContent', () => value(o.cluster, 7)),
       maybeBuildStaging: rec('maybeBuildStaging', (force: boolean) =>
         Promise.resolve(o.stage ? o.stage(force) : { gen: 1, entries: 2, skipped: false }),
@@ -118,6 +120,7 @@ const NAMES = [
   'decodeContent',
   'recordHash',
   'markFailed',
+  'reopenFailed',
   'clusterContent',
   'maybeBuildStaging',
   'scanAndStart',
@@ -306,7 +309,8 @@ test('UnexpectedState from recordHash fails the workflow visibly', async () => {
 test('ContentWorkflow runs content steps only', async () => {
   const f = fakes({});
   expect(await runContent(f, 'a'.repeat(64), 'heic')).toBe('CLUSTERED');
-  expect(f.calls).toEqual(['decodeContent', 'recordHash', 'clusterContent']);
+  expect(f.calls).toEqual(['reopenFailed', 'decodeContent', 'recordHash', 'clusterContent']);
+  expect(f.args['reopenFailed']).toEqual([['a'.repeat(64)]]);
 });
 
 test('ContentWorkflow marks FAILED on poison', async () => {

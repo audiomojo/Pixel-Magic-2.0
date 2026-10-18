@@ -79,7 +79,8 @@ export function makeIngestFile(deps: Deps) {
   async function finish(id: string, keep: string, sha: string): Promise<void> {
     const k = await statOrNull(keep);
     if (!k) return;
-    if (await sameFile(claimedPath(id), keep, sha)) await unlink(claimedPath(id));
+    if (await sameFile(claimedPath(id), keep, sha, () => heartbeat()))
+      await unlink(claimedPath(id));
     if ((k.mode & 0o777) !== 0o444) await chmod(keep, 0o444);
   }
 
@@ -187,7 +188,7 @@ export function makeIngestFile(deps: Deps) {
     const row = r.rows[0];
     if (row?.sha256 && row.ext) {
       const keep = row.state === 'COPY' ? copiesPath(id, row.ext) : vaultPath(row.sha256, row.ext);
-      if (await sameFile(claimed, keep, row.sha256)) return;
+      if (await sameFile(claimed, keep, row.sha256, () => heartbeat())) return;
     }
     const dest = join(layout.dropzone, ref.relPath);
     await mkdir(dirname(dest), { recursive: true });
@@ -325,7 +326,9 @@ export function makeIngestFile(deps: Deps) {
     await guarded(pool, row.id, `ext = $3`, ['CLAIMED'], [ext]);
 
     // Step 5: vault link. A different inode already there means a byte-identical copy.
-    const outcome = await linkIntoVault(claimed, vaultPath(sha, ext), sha);
+    const outcome = await linkIntoVault(claimed, vaultPath(sha, ext), sha, {
+      onChunk: () => heartbeat(),
+    });
     await checkpoint('link');
     if (outcome === 'EXISTS_OTHER') {
       await rename(claimed, copiesPath(row.id, ext));

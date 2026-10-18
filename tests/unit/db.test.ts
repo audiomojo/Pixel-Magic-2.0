@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { createPool } from '../../src/db.js';
+import type pg from 'pg';
+import { createPool, withTx } from '../../src/db.js';
 import { logger } from '../../src/logger.js';
 
 afterEach(() => {
@@ -21,4 +22,26 @@ test('an idle client error logs its code and message, not the pg client', async 
     'idle postgres client error',
   );
   await pool.end();
+});
+
+test('a client whose ROLLBACK failed is discarded, never returned to the pool mid-transaction', async () => {
+  const released: unknown[] = [];
+  const client = {
+    query: (sql: string) =>
+      sql === 'ROLLBACK' ? Promise.reject(new Error('connection lost')) : Promise.resolve({}),
+    release: (err?: unknown) => released.push(err),
+  };
+  const pool = { connect: () => Promise.resolve(client) } as unknown as pg.Pool;
+  await expect(
+    withTx(pool, () => {
+      throw new Error('boom');
+    }),
+  ).rejects.toThrow('boom');
+  expect(released).toEqual([expect.objectContaining({ message: 'connection lost' })]);
+  // A clean rollback hands the client back for reuse.
+  const ok = { ...client, query: () => Promise.resolve({}) };
+  released.length = 0;
+  const pool2 = { connect: () => Promise.resolve(ok) } as unknown as pg.Pool;
+  await expect(withTx(pool2, () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+  expect(released).toEqual([undefined]);
 });

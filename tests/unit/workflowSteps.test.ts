@@ -23,6 +23,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => {
     ...actual,
     log: { warn: () => undefined },
     sleep: () => Promise.resolve(),
+    patched: () => true, // a new run: every patch applies
     proxyActivities: (opts: unknown) =>
       new Proxy(
         {},
@@ -75,6 +76,7 @@ beforeEach(() => {
     recordHash: () => 'HASHED',
     clusterContent: () => 1,
     markFailed: () => undefined,
+    reopenFailed: () => undefined,
     maybeBuildStaging: (force) => ({ gen: force ? 1 : null, entries: 0, skipped: !force }),
     scanAndStart: () => ({ started: 1, pendingFiles: 1, pendingBytes: '1' }),
   };
@@ -121,6 +123,7 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
     'markFailed',
     'maybeBuildStaging',
     'recordHash',
+    'reopenFailed',
     'scanAndStart',
   ]);
   for (const [k, v] of all) {
@@ -128,6 +131,7 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
     if (k !== 'decodeContent') expect(v.retry?.maximumAttempts, k).toBeUndefined();
   }
   expect(o.markFailed).toMatchObject({ taskQueue: 'io', startToCloseTimeout: '1m' });
+  expect(o.reopenFailed).toMatchObject({ taskQueue: 'io', startToCloseTimeout: '1m' });
   expect(o.maybeBuildStaging).toMatchObject({
     taskQueue: 'io',
     startToCloseTimeout: '2h',
@@ -209,4 +213,13 @@ test('ScanWorkflow and StagingWorkflow delegate to their activities', async () =
   expect(await wf.ScanWorkflow()).toEqual({ started: 1, pendingFiles: 1, pendingBytes: '1' });
   expect(await wf.StagingWorkflow()).toEqual({ gen: null, entries: 0, skipped: true });
   expect(await wf.StagingWorkflow(true)).toEqual({ gen: 1, entries: 0, skipped: false });
+});
+
+test('ContentWorkflow reopens its FAILED content first, then runs the steps with poisonAttempts', async () => {
+  h.impl['decodeContent'] = () => {
+    throw activityFailure(ApplicationFailure.retryable('timed out', 'Poison'));
+  };
+  expect(await wf.ContentWorkflow(SHA, 'jpg', { poisonAttempts: 2 })).toBe('FAILED');
+  expect(names()).toEqual(['reopenFailed', 'decodeContent', 'decodeContent', 'markFailed']);
+  expect(h.calls[0]).toMatchObject({ args: [SHA], opts: { taskQueue: 'io' } });
 });

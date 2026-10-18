@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import type { Client } from '@temporalio/client';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import type { Deps } from '../../src/activities/index.js';
-import { main } from '../../src/cli.js';
-import { vaultRel, type DataLayout } from '../../src/fsops.js';
+import { main, run } from '../../src/cli.js';
+import { DataLayout, vaultRel } from '../../src/fsops.js';
 import { testDeps } from '../helpers/activityEnv.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
@@ -176,30 +176,35 @@ test('verify-vault rejects a bad --sample', async () => {
   expect(err()).toMatch(/usage/i);
 });
 
-test('retry-failed resets and starts', async () => {
+test('retry-failed starts a ContentWorkflow per FAILED content, which reopens it itself', async () => {
   await seedContent({ state: 'FAILED', lastError: 'x' });
   await seedContent({ state: 'FAILED', lastError: 'decode_killed: child got SIGKILL' });
   await seedContent({ state: 'CLUSTERED' });
   const f = recordingClient();
   const out = capture('stdout');
-  expect(await main(['retry-failed'], { ...deps, temporal: f.client })).toBe(0);
+  expect(await main(['retry-failed'], { ...deps, temporal: f.client, poisonAttempts: 3 })).toBe(0);
+  // The CLI changes no row: a crash between listing and starting leaves nothing half-done.
   const states = (await pgh.pool.query<{ state: string }>('SELECT state FROM contents')).rows;
-  expect(states.map((r) => r.state).sort()).toEqual(['CLUSTERED', 'INGESTED', 'INGESTED']);
+  expect(states.map((r) => r.state).sort()).toEqual(['CLUSTERED', 'FAILED', 'FAILED']);
   expect(f.started.map((w) => w.workflowType)).toEqual(['ContentWorkflow', 'ContentWorkflow']);
   expect(f.started.every((w) => /^content-[0-9a-f]{64}-retry-\d+$/.test(w.workflowId))).toBe(true);
   expect(f.started.every((w) => w.taskQueue === 'main')).toBe(true);
-  expect(f.started[0]!.args).toEqual([expect.stringMatching(/^[0-9a-f]{64}$/), 'jpg']);
-  expect(out()).toContain('2');
+  expect(f.started[0]!.args).toEqual([
+    expect.stringMatching(/^[0-9a-f]{64}$/),
+    'jpg',
+    { poisonAttempts: 3 },
+  ]);
+  expect(out()).toContain('started 2');
 });
 
-test('retry-failed puts a row back to FAILED when its workflow cannot start', async () => {
+test('retry-failed leaves a row FAILED when its workflow cannot start', async () => {
   const hash = await seedContent({ state: 'FAILED', lastError: 'boom' });
   const client = {
     workflow: { start: () => Promise.reject(new Error('temporal down')) },
   } as unknown as Client;
   const err = capture('stderr');
   capture('stdout');
-  expect(await main(['retry-failed'], { ...deps, temporal: client })).toBe(1);
+  expect(await main(['retry-failed'], { ...deps, temporal: client, poisonAttempts: 5 })).toBe(1);
   const row = (
     await pgh.pool.query<{ state: string; last_error: string }>(
       'SELECT state, last_error FROM contents WHERE sha256 = $1',
@@ -218,16 +223,24 @@ test('retry-failed reports a non-Error start failure', async () => {
   } as unknown as Client;
   const err = capture('stderr');
   capture('stdout');
-  expect(await main(['retry-failed'], { ...deps, temporal: client })).toBe(1);
+  expect(await main(['retry-failed'], { ...deps, temporal: client, poisonAttempts: 5 })).toBe(1);
   expect(err()).toContain('plain string');
 });
 
 test('retry-failed with nothing failed starts nothing', async () => {
   const f = recordingClient();
   const out = capture('stdout');
-  expect(await main(['retry-failed'], { ...deps, temporal: f.client })).toBe(0);
+  expect(await main(['retry-failed'], { ...deps, temporal: f.client, poisonAttempts: 5 })).toBe(0);
   expect(f.started).toEqual([]);
   expect(out()).toContain('0');
+});
+
+test('a failing command prints one error line (no stack trace) and exits 1', async () => {
+  const err = capture('stderr');
+  const missing = new DataLayout(join(layout.root, 'no-such-dir'));
+  expect(await run(['verify-vault'], { layout: missing })).toBe(1);
+  expect(err()).toMatch(/^error: .*ENOENT.*\n$/);
+  expect(err()).not.toMatch(/\n\s+at /);
 });
 
 async function seedFile(state: string, attempts = 0): Promise<string> {

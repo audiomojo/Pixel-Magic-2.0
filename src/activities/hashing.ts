@@ -32,13 +32,14 @@ type WireError = { name?: unknown; message?: unknown; reason?: unknown };
 function isPoolFailure(e: WireError): boolean {
   if (e.name === 'TimeoutError') return true;
   return (
-    typeof e.message === 'string' && /^Workerpool Worker|^Worker (is )?terminat/.test(e.message)
+    typeof e.message === 'string' && /^Workerpool Worker|^Worker (is )?terminat/i.test(e.message)
   );
 }
 
 /**
  * The child was killed by a signal (the kernel's OOM killer, an operator, a crash). That says
- * nothing about the file: transient, retried without limit by the workflow (never FAILED).
+ * nothing about the file: transient, retried by the workflow up to `MAX_DECODE_ATTEMPTS`, then
+ * FAILED `decode_killed` (which `retry-failed` recovers).
  */
 function isSignalDeath(e: WireError): boolean {
   return typeof e.message === 'string' && /signalCode: `?SIG[A-Z0-9]+/.test(e.message);
@@ -117,6 +118,14 @@ export function makeHashing(deps: Deps) {
     );
   }
 
+  /** Queue `io`. First step of a `retry-failed` ContentWorkflow: FAILED → INGESTED (else a no-op). */
+  async function reopenFailed(sha256: string): Promise<void> {
+    await pool.query(
+      `UPDATE contents SET state = 'INGESTED', last_error = NULL WHERE sha256 = $1 AND state = 'FAILED'`,
+      [sha256],
+    );
+  }
+
   /** Queue `io`. After decode attempts run out: FAILED, unless the row has already moved on. */
   async function markFailed(sha256: string, error: string): Promise<void> {
     await pool.query(
@@ -125,5 +134,5 @@ export function makeHashing(deps: Deps) {
     );
   }
 
-  return { decodeContent, recordHash, markFailed };
+  return { decodeContent, recordHash, markFailed, reopenFailed };
 }
