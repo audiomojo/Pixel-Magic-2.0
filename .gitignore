@@ -22,3 +22,8 @@ __pycache__/
 node_modules/
 dist/
 coverage/
+
+# Personal photo test sets: never commit
+test-automation/
+# Moved-aside dev data
+data-old-*/
