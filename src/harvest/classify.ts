@@ -46,6 +46,7 @@ export const ROOT_CONTEXT: DirContext = Object.freeze({
   library: 'none',
 });
 
+const SYSTEM_FILES = set('.ds_store thumbs.db');
 const ALBUM_ART_STEMS = set('folder cover front back');
 const PHOTO_DIRS = new Set(['photos', 'pictures', 'my pictures', 'dcim', 'camera roll']);
 const PROJECT_FILES = set(
@@ -144,13 +145,15 @@ export async function classify(
   minSize: number,
   readMake: () => Promise<string | null>,
 ): Promise<Verdict> {
+  const lower = f.name.toLowerCase();
+  // Rule 2 is by name alone, so it applies whatever the extension.
+  if (SYSTEM_FILES.has(lower)) return { kind: 'junk', reason: 'system-file' };
   const ext = extOf(f.name);
   const raw = RAW_EXTS.has(ext);
   const tagged = TAGGED_EXTS.has(ext);
   const bmp = FOLDER_ONLY_EXTS.has(ext);
   if (!raw && !tagged && !bmp && !MAYBE_EXTS.has(ext)) return { kind: 'ignored' };
 
-  const lower = f.name.toLowerCase();
   if (f.name.startsWith('._')) return { kind: 'junk', reason: 'appledouble' };
   if (f.size < minSize) return { kind: 'junk', reason: 'too-small' };
   if (lower.startsWith('screenshot') || lower.startsWith('screen shot')) {

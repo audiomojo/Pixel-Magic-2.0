@@ -53,6 +53,30 @@ describe('rules apply in order', () => {
       'Canon',
       { kind: 'junk', reason: 'appledouble' },
     ],
+    [
+      '2 system-file .DS_Store',
+      '.DS_Store',
+      BIG,
+      ROOT_CONTEXT,
+      null,
+      { kind: 'junk', reason: 'system-file' },
+    ],
+    [
+      '2 system-file Thumbs.db',
+      'thumbs.DB',
+      BIG,
+      dcim,
+      null,
+      { kind: 'junk', reason: 'system-file' },
+    ],
+    [
+      '2 before 3 (size 10)',
+      'Thumbs.db',
+      10,
+      ROOT_CONTEXT,
+      null,
+      { kind: 'junk', reason: 'system-file' },
+    ],
     ['3 too-small', 'a.jpg', 20479, dcim, 'Canon', { kind: 'junk', reason: 'too-small' }],
     ['3 threshold kept', 'a.cr2', 20480, ROOT_CONTEXT, null, { kind: 'photo' }],
     [
@@ -158,8 +182,6 @@ describe('ignored extensions', () => {
     'noext',
     'x.jpg.zip',
     '.jpg',
-    '.DS_Store',
-    'Thumbs.db',
     '._a.psd',
   ])('%s', async (n) => {
     expect(await run(n, ROOT_CONTEXT, 'Canon', 10)).toEqual({ kind: 'ignored' });
