@@ -31,6 +31,12 @@ export async function startPg(): Promise<PgHandle> {
       await pool.query(
         'UPDATE scan_stats SET pending_files = 0, pending_bytes = 0, scanned_at = NULL WHERE id = 1',
       );
+      await pool.query(
+        'TRUNCATE harvest_run_folders, harvest_items, harvest_runs, harvest_folders, harvest_sources RESTART IDENTITY CASCADE',
+      );
+      await pool.query(
+        'UPDATE harvest_host_state SET heartbeat_at = NULL, version = NULL WHERE id = 1',
+      );
       await pool.query('UPDATE copy_sweep_state SET after_id = 0 WHERE id = 1');
     },
     async stop() {

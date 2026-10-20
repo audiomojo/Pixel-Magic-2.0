@@ -167,3 +167,22 @@ test('the duplicate sweep cursor is a singleton that truncate resets', async () 
     code: '23514',
   });
 });
+
+test('harvest_items rejects a duplicate (source, path_key, size, mtime) and a bad state', async () => {
+  const s = await one<{ id: bigint }>(
+    `INSERT INTO harvest_sources(identity, label, kind) VALUES ('id1','L','local') RETURNING id`,
+  );
+  const item = `INSERT INTO harvest_items(source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+    VALUES ($1,'A.jpg','a.jpg',10,5,'photo',$2)`;
+  await pool.query(item, [s.id, 'PLANNED']);
+  await expect(pool.query(item, [s.id, 'PLANNED'])).rejects.toMatchObject({ code: '23505' });
+  await expect(
+    pool.query(item.replace("'a.jpg',10,5", "'b.jpg',10,5"), [s.id, 'NOPE']),
+  ).rejects.toMatchObject({ code: '23514' });
+});
+test('harvest_host_state singleton seeded; contents_size_idx exists', async () => {
+  expect((await rows('SELECT 1 FROM harvest_host_state WHERE id=1')).length).toBe(1);
+  expect((await rows(`SELECT 1 FROM pg_indexes WHERE indexname='contents_size_idx'`)).length).toBe(
+    1,
+  );
+});
