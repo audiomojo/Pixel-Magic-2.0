@@ -40,6 +40,7 @@ export default defineConfig({
         'src/harvest/system.ts',
         'src/harvest/host.ts',
         'src/harvest/hostLogEnv.ts',
+        'src/harvest/ui/{app.js,index.html,app.css}', // the browser page: checked by hand
         'src/worker.ts',
         'src/decodeWorker.ts',
         'tools/corpus/{buildManifest,seed,verify,synth}.ts',

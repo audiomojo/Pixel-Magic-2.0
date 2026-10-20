@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Harvest</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="top">
+      <h1>Harvest</h1>
+      <nav aria-label="Views">
+        <a href="#/" data-nav="sources">Sources</a>
+        <a href="#/review" data-nav="review"
+          >Review <span id="review-badge" class="badge" hidden></span
+        ></a>
+        <a href="#/where" data-nav="where">Find a photo</a>
+        <a href="#/history" data-nav="history">History</a>
+      </nav>
+    </header>
+    <div id="banner" class="banner bad" role="alert" hidden></div>
+    <section id="run-panel" class="panel" aria-label="Run" hidden></section>
+    <main id="main" tabindex="-1"><p class="muted">Loading…</p></main>
+    <dialog id="confirm" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <h2 id="confirm-title"></h2>
+        <p id="confirm-text"></p>
+        <div class="row end">
+          <button value="no" class="btn">Back</button>
+          <button value="yes" class="btn primary" id="confirm-yes"></button>
+        </div>
+      </form>
+    </dialog>
+    <noscript>This page needs JavaScript.</noscript>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
