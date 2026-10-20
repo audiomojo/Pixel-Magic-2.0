@@ -1,6 +1,7 @@
 import * as fsp from 'node:fs/promises';
 import { basename, dirname, resolve, sep } from 'node:path';
 import type pg from 'pg';
+import { logger } from '../logger.js';
 
 export interface MountEntry {
   device: string;
@@ -181,7 +182,10 @@ export async function detectSources(
       if (await bounded(containsDataDir(m.mountPoint, dataDir, fs), fsTimeoutMs)) continue;
     } catch (e) {
       if (!(e instanceof FsTimeout)) throw e;
-      console.warn(`harvest: ${m.mountPoint} did not answer within ${fsTimeoutMs} ms, skipped`);
+      logger.warn(
+        { mountPoint: m.mountPoint, fsTimeoutMs },
+        'harvest: mount did not answer, skipped',
+      );
       continue;
     }
     found.push(src);
@@ -231,7 +235,12 @@ export async function registerSources(
           [d0.mountPath],
         );
         if (known.rows.length !== 1) {
-          console.warn(`harvest: diskutil failed for unknown volume ${d0.mountPath}, skipped`);
+          logger.warn(
+            { mountPath: d0.mountPath, matches: known.rows.length },
+            known.rows.length === 0
+              ? 'harvest: diskutil failed for unknown volume, skipped'
+              : 'harvest: diskutil failed and the mount path is ambiguous, skipped',
+          );
           continue;
         }
         d = { ...d0, identity: known.rows[0]!.identity };

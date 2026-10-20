@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
+import { logger } from '../../src/logger.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 import {
   detectSources,
@@ -162,6 +163,13 @@ test('DATA_DIR containment is also found by device+inode (real directories)', as
   }
 });
 
+beforeEach(() => {
+  vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 test('a stale mount whose fs calls hang is skipped within the timeout', async () => {
   const out =
     '/dev/disk20s1 on /Volumes/Stale (exfat, local)\n/dev/disk21s1 on /Volumes/Fine (exfat, local)';
@@ -289,4 +297,25 @@ test('probe failure on a known volume reuses its row; unknown volume is skipped;
   const d = await detectSources(noUuid, NOPE);
   expect(d[0]).toMatchObject({ identity: 'local-name:Plain' });
   expect(d[0]!.probeFailed).toBeUndefined();
+});
+
+test('probe failure with two local rows at the same mount path is ambiguous: skipped, no new row', async () => {
+  const mk = (identity: string, labelBase: string): DetectedSource => ({
+    identity,
+    labelBase,
+    kind: 'local',
+    mountPath: '/Volumes/Same',
+  });
+  await registerSources(pgh.pool, [mk('local:A', 'A')]);
+  await registerSources(pgh.pool, [mk('local:B', 'B')]);
+  const bad = fake('/dev/disk9s1 on /Volumes/Same (exfat, local)', () => Promise.resolve(null));
+  const rows = await registerSources(pgh.pool, await detectSources(bad, NOPE));
+  expect(rows.map((r) => [r.identity, r.mounted])).toEqual([
+    ['local:A', false],
+    ['local:B', false],
+  ]);
+  expect(logger.warn).toHaveBeenCalledWith(
+    expect.objectContaining({ matches: 2 }),
+    expect.stringContaining('ambiguous'),
+  );
 });
