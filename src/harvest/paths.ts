@@ -1,3 +1,5 @@
+import type { BigIntStats } from 'node:fs';
+import { constants } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 
@@ -37,31 +39,53 @@ export class OutsideAllowedRootError extends Error {
   }
 }
 
-/** Every filesystem call GuardedFs makes goes through this seam (tests can record them). */
+/**
+ * Every filesystem call GuardedFs and the send path make goes through this seam (tests can
+ * record them). The only way to open a file without a write guard is `openRead` (O_RDONLY).
+ */
 export interface FsOps {
   mkdir(path: string, opts: { recursive: true }): Promise<unknown>;
   open(path: string, flags: string, mode: number): Promise<fsp.FileHandle>;
+  /** Read-only open (O_RDONLY): the only way a source file is opened. */
+  openRead(path: string): Promise<fsp.FileHandle>;
   chmod(path: string, mode: number): Promise<void>;
   utimes(path: string, atime: number, mtime: number): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
+  link(existing: string, newPath: string): Promise<void>;
+  copyFile(src: string, dest: string, mode: number): Promise<void>;
   lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
+  /** lstat with bigint fields (exact ns times, dev). */
+  stat(path: string): Promise<BigIntStats>;
   realpath(path: string): Promise<string>;
   /** mtime as exact nanoseconds. */
   mtimeNs(path: string): Promise<bigint>;
 }
 
+/** Opens `path` read-only. Harvest code reads files through this (or FsOps.openRead). */
+export const openReadOnly = (path: string): Promise<fsp.FileHandle> =>
+  fsp.open(path, constants.O_RDONLY);
+
 export const realFsOps: FsOps = {
   mkdir: (p, o) => fsp.mkdir(p, o),
   open: (p, f, m) => fsp.open(p, f, m),
+  openRead: openReadOnly,
   chmod: (p, m) => fsp.chmod(p, m),
   utimes: (p, a, m) => fsp.utimes(p, a, m),
   rename: (a, b) => fsp.rename(a, b),
   unlink: (p) => fsp.unlink(p),
+  link: (a, b) => fsp.link(a, b),
+  copyFile: (a, b, m) => fsp.copyFile(a, b, m),
   lstat: (p) => fsp.lstat(p),
+  stat: (p) => fsp.lstat(p, { bigint: true }),
   realpath: (p) => fsp.realpath(p),
   mtimeNs: async (p) => (await fsp.lstat(p, { bigint: true })).mtimeNs,
 };
+
+const COPY_CHUNK = 1024 * 1024;
+const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+/** A failed clone with one of these is a real outcome, not "cloning unsupported". */
+const NO_FALLBACK = new Set(['EEXIST', 'ENOENT', 'ENOSPC', 'EDQUOT']);
 
 /** The only way harvest code writes to disk: each mutation is confined to the allowed roots. */
 export class GuardedFs {
@@ -140,6 +164,67 @@ export class GuardedFs {
 
   async unlink(path: string): Promise<void> {
     await this.ops.unlink(await this.check(path));
+  }
+
+  /**
+   * Copies `src` (opened O_RDONLY only; never written) into a new file `dest` (exclusive
+   * create, guarded). `clone` tries `copyFile` with COPYFILE_FICLONE_FORCE first and falls back
+   * to a streamed byte copy when cloning is refused (ENOSYS, ENOTSUP, EXDEV …). `onChunk` is
+   * called with the bytes written so far after each 1 MiB (it may throw to abort the copy).
+   * On failure `dest` may be left behind: the caller removes it.
+   */
+  async copyInto(
+    src: string,
+    dest: string,
+    opts: { clone: boolean; onChunk?: (written: number) => void },
+  ): Promise<void> {
+    const d = await this.check(dest);
+    if (opts.clone) {
+      try {
+        await this.ops.copyFile(src, d, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE_FORCE);
+        return;
+      } catch (e) {
+        if (NO_FALLBACK.has(errCode(e) ?? '')) throw e;
+        // A refused clone leaves nothing behind, but make sure before the exclusive create.
+        await this.ops.unlink(d).catch((u: unknown) => {
+          if (errCode(u) !== 'ENOENT') throw u;
+        });
+      }
+    }
+    const from = await this.ops.openRead(src);
+    try {
+      const to = await this.ops.open(d, 'wx', 0o600);
+      try {
+        const buf = Buffer.allocUnsafe(COPY_CHUNK);
+        let written = 0;
+        for (;;) {
+          const { bytesRead } = await from.read(buf, 0, COPY_CHUNK, written);
+          if (bytesRead === 0) break;
+          let off = 0;
+          while (off < bytesRead) {
+            const { bytesWritten } = await to.write(buf, off, bytesRead - off, written + off);
+            off += bytesWritten;
+          }
+          written += bytesRead;
+          opts.onChunk?.(written);
+        }
+        await to.datasync();
+      } finally {
+        await to.close();
+      }
+    } finally {
+      await from.close();
+    }
+  }
+
+  /**
+   * Publishes `part` under `final` without ever replacing an existing file: link (fails with
+   * EEXIST if `final` exists — the caller picks another name), then unlink the part.
+   */
+  async publishNoReplace(part: string, final: string): Promise<void> {
+    const p = await this.check(part);
+    await this.ops.link(p, await this.check(final));
+    await this.ops.unlink(p);
   }
 
   /** Read-only (lstat): no guard needed. */

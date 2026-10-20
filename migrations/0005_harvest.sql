@@ -71,6 +71,7 @@ CREATE TABLE harvest_items (
   sha256         char(64),
   head_hash      char(64),
   dropzone_path  text,
+  dropzone_mtime_ns bigint,                 -- the copy's on-disk mtime (utimes is not ns-exact)
   file_id        bigint,
   duplicate_of   bigint REFERENCES harvest_items(id),
   attempts       int NOT NULL DEFAULT 0,
@@ -87,6 +88,9 @@ CREATE INDEX harvest_items_state_source_idx ON harvest_items (state, source_id);
 CREATE INDEX harvest_items_size_idx ON harvest_items (size_bytes);
 CREATE INDEX harvest_items_sha256_idx ON harvest_items (sha256);
 CREATE INDEX harvest_items_dropzone_unlinked_idx ON harvest_items (dropzone_path) WHERE file_id IS NULL;
+-- sendBatch's name choice: is this drop-zone name (casefolded) held by another unlinked item?
+CREATE INDEX harvest_items_dropzone_lower_idx ON harvest_items (lower(dropzone_path))
+  WHERE file_id IS NULL;
 -- The throttle gate counts recently sent, not yet linked items on every file.
 CREATE INDEX harvest_items_sent_unlinked_idx ON harvest_items (sent_at)
   WHERE state = 'SENT' AND file_id IS NULL;

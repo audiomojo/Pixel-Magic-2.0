@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { open } from 'node:fs/promises';
 import { join } from 'node:path';
 import type pg from 'pg';
 import { sha256File } from '../fsops.js';
+import { openReadOnly } from './paths.js';
 
 /** The head hash covers the first 64 KiB; a file no larger has the whole file as its head. */
 export const HEAD_BYTES = 64 * 1024;
@@ -47,7 +47,7 @@ const cmp = (a: [number, bigint], b: [number, bigint]) =>
 
 /** sha256 of the first 64 KiB (opened read-only). */
 async function headOf(path: string, size: bigint): Promise<string> {
-  const fh = await open(path, 'r');
+  const fh = await openReadOnly(path);
   try {
     const want = Number(size < BigInt(HEAD_BYTES) ? size : BigInt(HEAD_BYTES));
     const buf = Buffer.alloc(want);

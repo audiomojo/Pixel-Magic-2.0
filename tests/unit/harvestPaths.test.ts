@@ -10,13 +10,14 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, expect, test } from 'vitest';
+import { afterAll, describe, expect, test } from 'vitest';
 import {
   GuardedFs,
   OutsideAllowedRootError,
   dropzoneName,
   partPath,
   pathKey,
+  realFsOps,
   sameMtime,
   type FsOps,
 } from '../../src/harvest/paths.js';
@@ -121,6 +122,10 @@ test('a non-existent allowed root is still usable once created; all calls go thr
       (await import('node:fs/promises')).lstat(p, { bigint: true }).then((s) => s.mtimeNs)
     ),
     realpath: async (p) => (calls.push('realpath'), (await import('node:fs/promises')).realpath(p)),
+    openRead: (p) => (calls.push('openRead'), realFsOps.openRead(p)),
+    link: (a, b) => (calls.push('link'), realFsOps.link(a, b)),
+    copyFile: (a, b, m) => (calls.push('copyFile'), realFsOps.copyFile(a, b, m)),
+    stat: (p) => (calls.push('stat'), realFsOps.stat(p)),
   };
   const g2 = new GuardedFs([root], ops);
   await g2.mkdirp(join(root, 'q'));
@@ -151,4 +156,69 @@ test('a root that does not exist anywhere under an existing ancestor is resolved
   const g3 = new GuardedFs([join(base, 'later')]);
   await g3.mkdirp(join(base, 'later', 'a'));
   expect(existsSync(join(base, 'later', 'a'))).toBe(true);
+});
+
+describe('copyInto and publishNoReplace', () => {
+  const src = join(outside, 'src.bin');
+  const bytes = Buffer.from('0123456789'.repeat(300_000)); // 3 MB: several 1 MiB chunks
+  writeFileSync(src, bytes);
+  const enotsup = () => Promise.reject(Object.assign(new Error('no clone'), { code: 'ENOTSUP' }));
+
+  test('a byte copy reads the source read-only and never replaces; refuses outside', async () => {
+    const seen: number[] = [];
+    const dest = join(root, 'c1.part');
+    await g.copyInto(src, dest, { clone: false, onChunk: (n) => seen.push(n) });
+    expect(readFileSync(dest)).toEqual(bytes);
+    expect(seen).toEqual([1048576, 2097152, 3000000]);
+    await expect(g.copyInto(src, dest, { clone: false })).rejects.toMatchObject({ code: 'EEXIST' });
+    await expect(g.copyInto(src, join(outside, 'x'), { clone: true })).rejects.toBeInstanceOf(
+      OutsideAllowedRootError,
+    );
+  });
+
+  test('a refused clone falls back, removing what it left; real outcomes do not', async () => {
+    const left: FsOps = {
+      ...realFsOps,
+      copyFile: async (_s, d) => {
+        writeFileSync(d, 'junk');
+        return enotsup();
+      },
+    };
+    const dest = join(root, 'c2.part');
+    await new GuardedFs([root], left).copyInto(src, dest, { clone: true });
+    expect(readFileSync(dest)).toEqual(bytes);
+    const full: FsOps = {
+      ...realFsOps,
+      copyFile: () => Promise.reject(Object.assign(new Error('full'), { code: 'ENOSPC' })),
+    };
+    await expect(
+      new GuardedFs([root], full).copyInto(src, join(root, 'c3.part'), { clone: true }),
+    ).rejects.toMatchObject({ code: 'ENOSPC' });
+    const stuck: FsOps = {
+      ...realFsOps,
+      copyFile: enotsup,
+      unlink: () => Promise.reject(Object.assign(new Error('busy'), { code: 'EBUSY' })),
+    };
+    await expect(
+      new GuardedFs([root], stuck).copyInto(src, join(root, 'c4.part'), { clone: true }),
+    ).rejects.toMatchObject({ code: 'EBUSY' });
+    expect(existsSync(join(root, 'c4.part'))).toBe(false);
+  });
+
+  test('publishNoReplace links then unlinks; an existing name is left untouched', async () => {
+    const part = join(root, '.p.h1.part');
+    writeFileSync(part, 'new');
+    writeFileSync(join(root, 'taken'), 'old');
+    await expect(g.publishNoReplace(part, join(root, 'taken'))).rejects.toMatchObject({
+      code: 'EEXIST',
+    });
+    expect(readFileSync(join(root, 'taken'), 'utf8')).toBe('old');
+    expect(readFileSync(part, 'utf8')).toBe('new');
+    await g.publishNoReplace(part, join(root, 'free'));
+    expect(readFileSync(join(root, 'free'), 'utf8')).toBe('new');
+    expect(existsSync(part)).toBe(false);
+    await expect(g.publishNoReplace(join(root, 'free'), join(outside, 'f'))).rejects.toBeInstanceOf(
+      OutsideAllowedRootError,
+    );
+  });
 });
