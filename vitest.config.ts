@@ -37,6 +37,7 @@ export default defineConfig({
       include: ['src/**', 'tools/corpus/lib.ts'],
       exclude: [
         'src/fscheck.ts',
+        'src/harvest/system.ts',
         'src/worker.ts',
         'src/decodeWorker.ts',
         'tools/corpus/{buildManifest,seed,verify,synth}.ts',
