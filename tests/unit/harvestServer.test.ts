@@ -117,15 +117,16 @@ async function setup(
   const control: RunControl = {
     start: (id) => {
       calls.push(`start ${id}`);
-      return Promise.resolve();
+      return Promise.resolve('started' as const);
     },
+    describe: () => Promise.resolve('running' as const),
     signal: (id, n) => {
       calls.push(`signal ${id} ${n}`);
       return Promise.resolve();
     },
     cancel: (id) => {
       calls.push(`cancel ${id}`);
-      return Promise.resolve();
+      return Promise.resolve('requested' as const);
     },
     ...o.control,
   };
@@ -508,6 +509,17 @@ describe('runs', () => {
     expect((await e.post(`/api/runs/${q}/cancel`, {})).status).toBe(409);
     expect((await e.post('/api/runs/999/pause', {})).status).toBe(404);
     expect((await e.post('/api/runs/abc/pause', {})).status).toBe(404);
+  });
+
+  test('cancel of an active run whose workflow is gone finishes it and starts the next', async () => {
+    const e = await setup({ control: { cancel: () => Promise.resolve('gone' as const) } });
+    const id = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: '' }], false);
+    const next = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: 'DCIM' }], false);
+    await setRunState(pgh.pool, id, 'paused', 'Drive unplugged');
+    const r = await e.post(`/api/runs/${id}/cancel`, {});
+    expect(r.status).toBe(200);
+    expect(await e.runState(id)).toBe('cancelled');
+    expect(e.calls).toEqual([`start ${next}`]);
   });
 
   test('a Temporal failure while signalling is a 502', async () => {

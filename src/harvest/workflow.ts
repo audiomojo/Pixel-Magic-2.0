@@ -72,10 +72,15 @@ export interface HarvestInput {
   runId: string;
   phase?: 'scan' | 'send';
   batches?: number;
+  /** History length that triggers continue-as-new (default 10 000; tests lower it). */
+  maxHistory?: number;
 }
 
 export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'cancelled'> {
   const { runId } = input;
+  const maxHistory = input.maxHistory ?? MAX_HISTORY;
+  /** Carried into the next execution (only set when not the default). */
+  const carry = input.maxHistory === undefined ? {} : { maxHistory };
   let phase: 'scan' | 'send' | 'done' = input.phase ?? 'scan';
   let paused = false;
   let resumes = 0;
@@ -136,6 +141,15 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
           if (folder.state === 'done') continue;
           for (;;) {
             await userPause('scanning');
+            // A long unplug retries every 60 s (~11 events each): restart before the history
+            // limit. Done folders are skipped and the scan cursor is in the database.
+            if (workflowInfo().historyLength > maxHistory) {
+              return await continueAsNew<typeof HarvestWorkflow>({
+                runId,
+                phase: 'scan',
+                ...carry,
+              });
+            }
             const res = await scanFolder(runId, folder.folderId);
             if (res.outcome === 'DONE') {
               await show('scanning');
@@ -156,8 +170,13 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     await show('sending');
     for (;;) {
       await userPause('sending');
-      if (batches >= BATCHES_PER_RUN || workflowInfo().historyLength > MAX_HISTORY) {
-        return await continueAsNew<typeof HarvestWorkflow>({ runId, phase: 'send', batches: 0 });
+      if (batches >= BATCHES_PER_RUN || workflowInfo().historyLength > maxHistory) {
+        return await continueAsNew<typeof HarvestWorkflow>({
+          runId,
+          phase: 'send',
+          batches: 0,
+          ...carry,
+        });
       }
       approved = false;
       const res = await sendBatch(runId);

@@ -431,3 +431,21 @@ test('a non-Temporal error finishes the run failed and fails the workflow', asyn
     'startNextQueued',
   ]);
 });
+
+test('a long unplug during the scan continues as new before the history limit', async () => {
+  let n = 0;
+  const f = fakes({
+    scan: (_r, folder) =>
+      folder === 'f1' && n++ < 30
+        ? { ...SCAN_DONE, outcome: 'SOURCE_GONE', reason: 'Drive unplugged' }
+        : SCAN_DONE,
+  });
+  const h = await begin(f, { runId: '7', maxHistory: 100 });
+  expect(await h.result()).toBe('done');
+  expect(count(f, 'scanFolder f1')).toBe(31);
+  expect(count(f, 'finishRun done')).toBe(1);
+  const d = await h.describe();
+  expect(d.runId).not.toBe(h.firstExecutionRunId);
+  // Every new execution starts in the scan phase (done folders are skipped, the cursor is in the DB).
+  expect(count(f, 'loadRun 7')).toBeGreaterThan(1);
+});

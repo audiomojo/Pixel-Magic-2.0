@@ -407,7 +407,18 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         // Not yet running (or just offered to Temporal): remove it from the queue.
         await finishRunRows(pool, id, 'cancelled');
         await control.cancel(id).catch(() => {});
-      } else await viaTemporal('cancel', () => control.cancel(id));
+      } else {
+        const outcome: { v?: 'requested' | 'gone' } = {};
+        await viaTemporal('cancel', async () => {
+          outcome.v = await control.cancel(id);
+        });
+        if (outcome.v === 'gone') {
+          // No workflow left to finish the row (it ended without doing so): finish it here, so
+          // the queue is not stuck behind it.
+          await finishRunRows(pool, id, 'cancelled');
+          await viaTemporal('starting the next run', () => startNextQueued(pool, control));
+        }
+      }
     } else {
       await viaTemporal(action, () => control.signal(id, action as 'pause' | 'resume'));
     }

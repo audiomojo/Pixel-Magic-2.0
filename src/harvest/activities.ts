@@ -10,9 +10,16 @@ import type { DetectOptions, SystemProbe } from './sources.js';
 
 /** Starts, signals and cancels harvest workflows (implemented by Task 8). */
 export interface RunControl {
-  start(runId: string): Promise<void>;
+  /**
+   * Starts the run's workflow. `running`: it already runs (a duplicate start); `closed`: a
+   * workflow with that id already ended, so the run can never be started again.
+   */
+  start(runId: string): Promise<'started' | 'running' | 'closed'>;
+  /** Whether the run's workflow is running, has ended, or does not exist (any more). */
+  describe(runId: string): Promise<'running' | 'closed' | 'missing'>;
   signal(runId: string, name: 'pause' | 'resume' | 'itemsApproved'): Promise<void>;
-  cancel(runId: string): Promise<void>;
+  /** `gone`: there is no running workflow to cancel (never started, ended, or deleted). */
+  cancel(runId: string): Promise<'requested' | 'gone'>;
 }
 
 export interface HarvestDeps {

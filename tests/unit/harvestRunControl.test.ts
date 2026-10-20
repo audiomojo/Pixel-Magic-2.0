@@ -1,4 +1,5 @@
 import { WorkflowExecutionAlreadyStartedError, type Client } from '@temporalio/client';
+import { WorkflowNotFoundError } from '@temporalio/common';
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createHarvestActivities, type RunControl } from '../../src/harvest/activities.js';
 import { temporalRunControl } from '../../src/harvest/control.js';
@@ -20,18 +21,28 @@ afterAll(async () => {
 });
 beforeEach(() => pgh.truncate());
 
-function control(): RunControl & { started: string[] } {
+/** A fake control; `closed` lists runs whose workflow already closed (start and describe say so). */
+function control(closed: string[] = []): RunControl & { started: string[] } {
   const started: string[] = [];
   return {
     started,
     start: (id) => {
+      if (closed.includes(id)) return Promise.resolve('closed' as const);
       started.push(id);
-      return Promise.resolve();
+      return Promise.resolve('started' as const);
     },
+    describe: (id) => Promise.resolve(closed.includes(id) ? 'closed' : 'running'),
     signal: () => Promise.resolve(),
-    cancel: () => Promise.resolve(),
+    cancel: () => Promise.resolve('requested' as const),
   };
 }
+const runRow = async (id: string) =>
+  (
+    await pgh.pool.query<{ state: string; error: string | null }>(
+      'SELECT state, error FROM harvest_runs WHERE id = $1',
+      [id],
+    )
+  ).rows[0]!;
 
 async function queuedRun(dry = false): Promise<string> {
   const { rows } = await pgh.pool.query<{ id: string }>(
@@ -68,6 +79,42 @@ describe('startNextQueued', () => {
     expect(await startNextQueued(pgh.pool, c)).toBeNull();
     const next = await queuedRun();
     expect(await startNextQueued(pgh.pool, c)).toBe(next);
+  });
+
+  test('a queued run whose workflow already closed is failed and the next one starts', async () => {
+    const stale = await queuedRun();
+    const next = await queuedRun();
+    const c = control([stale]);
+    expect(await startNextQueued(pgh.pool, c)).toBe(next);
+    expect(c.started).toEqual([next]);
+    expect(await runRow(stale)).toEqual({ state: 'failed', error: 'workflow closed unexpectedly' });
+  });
+
+  test.each(['scanning', 'sending', 'paused'] as const)(
+    'a %s run whose workflow is gone no longer blocks the queue',
+    async (state) => {
+      const dead = await queuedRun();
+      const next = await queuedRun();
+      await setRunState(pgh.pool, dead, state, state === 'paused' ? 'Drive unplugged' : null);
+      const c = control([dead]);
+      expect(await startNextQueued(pgh.pool, c)).toBe(next);
+      expect(await runRow(dead)).toEqual({
+        state: 'failed',
+        error: 'workflow closed unexpectedly',
+      });
+    },
+  );
+
+  test('host startup: with no queued run nothing is started (spec §10.7)', async () => {
+    // The host calls startNextQueued once at startup: it may only start an already-queued run.
+    const c = control();
+    expect(await startNextQueued(pgh.pool, c)).toBeNull();
+    for (const state of ['done', 'cancelled', 'failed']) {
+      const id = await queuedRun();
+      await pgh.pool.query('UPDATE harvest_runs SET state = $2 WHERE id = $1', [id, state]);
+    }
+    expect(await startNextQueued(pgh.pool, c)).toBeNull();
+    expect(c.started).toEqual([]);
   });
 
   test('the activity needs run control', async () => {
@@ -115,11 +162,19 @@ describe('send-only runs', () => {
 });
 
 describe('temporalRunControl', () => {
-  function fakeClient(startError?: Error) {
+  function fakeClient(
+    startError?: Error,
+    o: { status?: string; describeError?: Error; cancelError?: Error } = {},
+  ) {
     const signal = vi.fn(() => Promise.resolve());
-    const cancel = vi.fn(() => Promise.resolve());
+    const cancel = vi.fn(() => (o.cancelError ? Promise.reject(o.cancelError) : Promise.resolve()));
     const start = vi.fn(() => (startError ? Promise.reject(startError) : Promise.resolve()));
-    const getHandle = vi.fn(() => ({ signal, cancel }));
+    const describe = vi.fn(() =>
+      o.describeError
+        ? Promise.reject(o.describeError)
+        : Promise.resolve({ status: { name: o.status ?? 'RUNNING' } }),
+    );
+    const getHandle = vi.fn(() => ({ signal, cancel, describe }));
     return {
       client: { workflow: { start, getHandle } } as unknown as Client,
       signal,
@@ -128,6 +183,7 @@ describe('temporalRunControl', () => {
       getHandle,
     };
   }
+  const notFound = () => new WorkflowNotFoundError('workflow execution already completed', 'h', '');
 
   test('start uses workflow id harvest-<runId> on the harvest queue, rejecting duplicates', async () => {
     const f = fakeClient();
@@ -145,10 +201,37 @@ describe('temporalRunControl', () => {
 
   test('an already-started workflow is success; other errors propagate', async () => {
     const dup = new WorkflowExecutionAlreadyStartedError('x', 'harvest-1', 'HarvestWorkflow');
-    await expect(temporalRunControl(fakeClient(dup).client).start('1')).resolves.toBeUndefined();
+    await expect(temporalRunControl(fakeClient().client).start('1')).resolves.toBe('started');
+    await expect(temporalRunControl(fakeClient(dup).client).start('1')).resolves.toBe('running');
     await expect(
       temporalRunControl(fakeClient(new Error('down')).client).start('1'),
     ).rejects.toThrow('down');
+  });
+
+  test('a duplicate whose workflow already closed is reported closed', async () => {
+    const dup = new WorkflowExecutionAlreadyStartedError('x', 'harvest-1', 'HarvestWorkflow');
+    for (const status of ['COMPLETED', 'FAILED', 'TERMINATED', 'TIMED_OUT', 'CANCELLED']) {
+      const c = temporalRunControl(fakeClient(dup, { status }).client);
+      await expect(c.start('1')).resolves.toBe('closed');
+    }
+  });
+
+  test('describe: running, closed, or missing', async () => {
+    await expect(temporalRunControl(fakeClient().client).describe('1')).resolves.toBe('running');
+    const closed = fakeClient(undefined, { status: 'TERMINATED' });
+    await expect(temporalRunControl(closed.client).describe('1')).resolves.toBe('closed');
+    const gone = fakeClient(undefined, { describeError: notFound() });
+    await expect(temporalRunControl(gone.client).describe('1')).resolves.toBe('missing');
+    const down = fakeClient(undefined, { describeError: new Error('down') });
+    await expect(temporalRunControl(down.client).describe('1')).rejects.toThrow('down');
+  });
+
+  test('cancel of a workflow that no longer exists or already closed is "gone"', async () => {
+    const gone = fakeClient(undefined, { cancelError: notFound() });
+    await expect(temporalRunControl(gone.client).cancel('1')).resolves.toBe('gone');
+    await expect(temporalRunControl(fakeClient().client).cancel('1')).resolves.toBe('requested');
+    const down = fakeClient(undefined, { cancelError: new Error('down') });
+    await expect(temporalRunControl(down.client).cancel('1')).rejects.toThrow('down');
   });
 
   test('signal and cancel go to the run workflow', async () => {

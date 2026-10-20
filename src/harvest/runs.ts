@@ -166,24 +166,41 @@ export async function loadRun(
   };
 }
 
+/** The error a run gets when its workflow ended without finishing the run row. */
+export const WORKFLOW_CLOSED = 'workflow closed unexpectedly';
+
 /**
  * Starts the oldest queued run unless one is already active (scanning, sending or paused).
  * Returns the started run's id, or null. Callers are serialised by an advisory lock; a run the
  * workflow has not yet moved out of `queued` may be offered twice, which `control.start` absorbs
  * (workflow id `harvest-<runId>`, duplicates rejected and treated as success).
+ *
+ * A run whose workflow already ended (terminated at the history limit, say) can never finish
+ * its own row: an active one whose workflow is not running, or a queued one whose start finds a
+ * closed workflow, is marked failed ("workflow closed unexpectedly") and the queue moves on.
  */
 export async function startNextQueued(pool: pg.Pool, control: RunControl): Promise<string | null> {
-  const next = await withTx(pool, async (c) => {
-    await c.query("SELECT pg_advisory_xact_lock(hashtext('harvest_start_next'))");
-    const active = await c.query(
-      "SELECT 1 FROM harvest_runs WHERE state IN ('scanning', 'sending', 'paused') LIMIT 1",
-    );
-    if (active.rowCount) return null;
-    const q = await c.query<{ id: string }>(
-      "SELECT id::text AS id FROM harvest_runs WHERE state = 'queued' ORDER BY id LIMIT 1",
-    );
-    return q.rows[0]?.id ?? null;
-  });
-  if (next !== null) await control.start(next);
-  return next;
+  for (;;) {
+    const pick = await withTx(pool, async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(hashtext('harvest_start_next'))");
+      const active = await c.query<{ id: string }>(
+        `SELECT id::text AS id FROM harvest_runs WHERE state IN ('scanning', 'sending', 'paused')
+         ORDER BY id LIMIT 1`,
+      );
+      if (active.rows[0]) return { id: active.rows[0].id, active: true };
+      const q = await c.query<{ id: string }>(
+        "SELECT id::text AS id FROM harvest_runs WHERE state = 'queued' ORDER BY id LIMIT 1",
+      );
+      return q.rows[0] ? { id: q.rows[0].id, active: false } : null;
+    });
+    if (pick === null) return null;
+    if (pick.active) {
+      if ((await control.describe(pick.id)) === 'running') return null;
+    } else {
+      const started = await control.start(pick.id);
+      if (started !== 'closed') return pick.id;
+    }
+    // finishRunRows changes nothing if the run finished meanwhile (its workflow just ended).
+    await finishRunRows(pool, pick.id, 'failed', WORKFLOW_CLOSED);
+  }
 }

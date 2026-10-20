@@ -257,7 +257,7 @@ describe('scanFolder', () => {
       '8.cr2': 500,
     });
     const whole = await env.scan();
-    await pgh.pool.query('TRUNCATE harvest_items RESTART IDENTITY');
+    await pgh.pool.query('TRUNCATE harvest_items RESTART IDENTITY CASCADE');
 
     let n = 0;
     const { runId, folderId } = await env.newRun();
@@ -288,7 +288,7 @@ describe('scanFolder', () => {
     });
     const whole = await env.scan();
     for (let stopAfter = 1; stopAfter <= whole.res.dirs; stopAfter++) {
-      await pgh.pool.query('TRUNCATE harvest_items RESTART IDENTITY');
+      await pgh.pool.query('TRUNCATE harvest_items RESTART IDENTITY CASCADE');
       let n = 0;
       const { runId, folderId } = await env.newRun();
       const crashing = createHarvestActivities({
