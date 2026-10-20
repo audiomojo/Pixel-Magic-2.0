@@ -57,6 +57,8 @@ export class Stack {
   /** Per-stack compose override holding `workerEnv` (next to the data dir, not inside it). */
   private readonly envFile: string | null;
 
+  private temporal: string | null = null;
+
   /** `workerEnv`: extra environment for `worker` and `worker-extra` (e.g. `CPU_CONCURRENCY`). */
   constructor(
     readonly runId: string,
@@ -71,6 +73,12 @@ export class Stack {
   get dbUrl(): string {
     if (this.url === null) throw new Error(`stack ${this.project} is not up`);
     return this.url;
+  }
+
+  /** `127.0.0.1:<port>`: the mapped host port of the Temporal frontend (after `up`). */
+  get temporalAddress(): string {
+    if (this.temporal === null) throw new Error(`stack ${this.project} is not up`);
+    return this.temporal;
   }
 
   private dbUrlFor(db: string): string {
@@ -139,6 +147,10 @@ export class Stack {
       await closePool(this.dbUrlFor('temporal_visibility'));
     }
     this.url = url;
+    const t = (await this.compose('port', 'temporal', '7233')).trim();
+    const tport = t.slice(t.lastIndexOf(':') + 1);
+    if (!/^\d+$/.test(tport)) throw new Error(`no host port for temporal: ${JSON.stringify(t)}`);
+    this.temporal = `127.0.0.1:${tport}`;
     registerDataDir(url, this.dataDir);
   }
 

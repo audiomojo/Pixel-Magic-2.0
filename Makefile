@@ -1,7 +1,7 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
 	corpus-manifest corpus-verify \
 	harvest-install harvest-uninstall harvest-stop harvest-start harvester harvest-status \
-	test-smoke test-standard update-golden golden-smoke chaos
+	test-smoke test-standard test-harvest update-golden golden-smoke chaos
 
 CORPUS := test-automation/sample-images
 
@@ -69,6 +69,9 @@ test-smoke:
 
 test-standard:
 	$(call e2e,TIER=standard npm run test:e2e)
+
+test-harvest:
+	$(call e2e,TIER=harvest npm run test:e2e)
 
 # Task 13: a calm and a chaos standard run (kills, restarts, a pause) must end the same.
 chaos:
