@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { withTx } from '../db.js';
 import type { RunControl } from './activities.js';
+import { pathKey } from './paths.js';
 
 /**
  * Creates a queued run over the given folders: upserts `harvest_folders`, then the run and its
@@ -89,6 +90,54 @@ export async function runFolders(pool: pg.Pool, runId: string): Promise<RunFolde
     relPath: r.rel_path,
     state: r.state,
   }));
+}
+
+export interface ScopeFolder {
+  folderId: string;
+  sourceId: string;
+  /** pathKey of the folder's rel_path ('' = the whole source). */
+  key: string;
+}
+
+/** A run's send scope: its folders in position order, and whether only its own items count. */
+export interface SendScope {
+  runId: string;
+  sendOnly: boolean;
+  folders: ScopeFolder[];
+}
+
+export async function loadScope(pool: pg.Pool, runId: string): Promise<SendScope> {
+  const run = await pool.query<{ send_only: boolean }>(
+    'SELECT send_only FROM harvest_runs WHERE id = $1',
+    [runId],
+  );
+  const folders = await runFolders(pool, runId);
+  return {
+    runId,
+    sendOnly: run.rows[0]?.send_only ?? false,
+    folders: folders.map((f) => ({
+      folderId: f.folderId,
+      sourceId: f.sourceId,
+      key: pathKey(f.relPath),
+    })),
+  };
+}
+
+/** True if `key` lies under the folder key `folder` ('' = everything). */
+export const underKey = (key: string, folder: string): boolean =>
+  folder === '' || key.startsWith(`${folder}/`);
+
+/**
+ * The run folder an item of `sourceId` / `key` is sent under: the deepest selected folder
+ * holding it (the first by position among equal ones), or null when outside the run.
+ */
+export function folderOf(scope: SendScope, sourceId: string, key: string): number | null {
+  let best: number | null = null;
+  for (const [i, f] of scope.folders.entries()) {
+    if (f.sourceId !== sourceId || !underKey(key, f.key)) continue;
+    if (best === null || f.key.length > scope.folders[best]!.key.length) best = i;
+  }
+  return best;
 }
 
 export type RunState =

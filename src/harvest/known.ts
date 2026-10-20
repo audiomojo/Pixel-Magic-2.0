@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import type pg from 'pg';
 import { sha256File } from '../fsops.js';
-import { openReadOnly, sourcePath, type SourcePath } from './paths.js';
+import { openReadOnly, readFsOps, sameMtime, sourcePath, type SourcePath } from './paths.js';
+import { folderOf, loadScope, type SendScope } from './runs.js';
 
 /** The head hash covers the first 64 KiB; a file no larger has the whole file as its head. */
 export const HEAD_BYTES = 64 * 1024;
@@ -20,33 +22,68 @@ export interface KnownItem {
   kind: 'photo' | 'maybe';
   sha256: string | null;
   headHash: string | null;
+  /** NFC + casefold of the item's rel_path: its place in the run's send order. */
+  pathKey: string;
+  /** The run being sent (PLANNED candidates qualify only inside its scope), or null. */
+  runId: string | null;
 }
 
-/** Test seam: the full-hash reader. */
 export interface KnownOptions {
+  /** Test seam: the full-hash reader. */
   sha256File?: (path: SourcePath, onChunk?: () => void) => Promise<string>;
   /** Called after each 1 MiB read of a full hash (sendBatch heartbeats from it). */
   onChunk?: () => void;
+  /**
+   * A source's current mount, found by its identity (detection, not `last_mount_path`), or
+   * null when it is not mounted. Without it no PLANNED candidate is read.
+   */
+  mountOf?: (sourceId: string) => Promise<string | null>;
+  /** The drop-zone root. Without it no unlinked SENT candidate is read. */
+  dropzone?: string;
 }
 
 interface Candidate {
   id: string;
+  source_id: string;
   state: 'SENT' | 'PLANNED';
   kind: 'photo' | 'maybe';
+  /** The stored sha256, else (a linked SENT item) the pipeline's `files.sha256`. */
   sha256: string | null;
   head_hash: string | null;
   rel_path: string;
   rel_path_raw: Buffer | null;
-  mount: string | null;
+  path_key: string;
+  mtime_ns: string;
+  dropzone_path: string | null;
+  dropzone_mtime_ns: string | null;
+  linked: boolean;
+  /** For a send-only run: the candidate is one of its approved items. */
+  in_run: boolean;
 }
 
-/** Send order for ties: photo before maybe, then item id ascending. */
+/** Tie order among candidates: photo before maybe, then item id ascending. */
 const order = (kind: string, id: string): [number, bigint] => [
   kind === 'photo' ? 0 : 1,
   BigInt(id),
 ];
 const cmp = (a: [number, bigint], b: [number, bigint]) =>
   a[0] !== b[0] ? a[0] - b[0] : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0;
+
+/** Send order within a run: photo before maybe, then folder position, path_key bytes, id. */
+type SendOrder = [number, number, Buffer, bigint];
+const sendOrder = (kind: string, pos: number, key: string, id: string): SendOrder => [
+  kind === 'photo' ? 0 : 1,
+  pos,
+  Buffer.from(key),
+  BigInt(id),
+];
+const before = (a: SendOrder, b: SendOrder): boolean => {
+  if (a[0] !== b[0]) return a[0] < b[0];
+  if (a[1] !== b[1]) return a[1] < b[1];
+  const k = Buffer.compare(a[2], b[2]);
+  if (k !== 0) return k < 0;
+  return a[3] < b[3];
+};
 
 /** sha256 of the first 64 KiB (opened read-only). */
 async function headOf(path: SourcePath, size: bigint): Promise<string> {
@@ -137,20 +174,48 @@ export async function checkKnown(
     // 2. Another ledger item with this size. DUP rows are left out: each is subsumed by its
     // target, which has the same bytes and is itself a candidate when it qualifies.
     const { rows } = await pool.query<Candidate>(
-      `SELECT i.id::text AS id, i.state, i.kind, i.sha256, i.head_hash, i.rel_path, i.rel_path_raw,
-              s.last_mount_path AS mount
-       FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
+      `SELECT i.id::text AS id, i.source_id::text AS source_id, i.state, i.kind,
+              COALESCE(i.sha256, f.sha256) AS sha256, i.head_hash, i.rel_path, i.rel_path_raw,
+              i.path_key, i.mtime_ns::text AS mtime_ns, i.dropzone_path,
+              i.dropzone_mtime_ns::text AS dropzone_mtime_ns, i.file_id IS NOT NULL AS linked,
+              EXISTS (SELECT 1 FROM harvest_run_items ri
+                      WHERE ri.run_id = $3::bigint AND ri.item_id = i.id) AS in_run
+       FROM harvest_items i LEFT JOIN files f ON f.id = i.file_id
        WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED')`,
-      [item.sizeBytes.toString(), item.id],
+      [item.sizeBytes.toString(), item.id, item.runId],
     );
-    const mine = order(item.kind, item.id);
+    // A PLANNED candidate wins only if this run sends it, and sends it before this item: it is
+    // in the run's scope (a send-only run: one of its items), and earlier in its send order.
+    let scope: SendScope | null = null;
+    if (item.runId !== null && rows.some((c) => c.state === 'PLANNED')) {
+      scope = await loadScope(pool, item.runId);
+    }
+    const myPos = scope && folderOf(scope, item.sourceId, item.pathKey);
+    const qualifies = (c: Candidate): boolean => {
+      if (c.state === 'SENT') return true;
+      if (scope === null || myPos === null || myPos === undefined) return false;
+      if (scope.sendOnly && !c.in_run) return false;
+      const pos = folderOf(scope, c.source_id, c.path_key);
+      if (pos === null) return false;
+      return before(
+        sendOrder(c.kind, pos, c.path_key, c.id),
+        sendOrder(item.kind, myPos, item.pathKey, item.id),
+      );
+    };
     const candidates = rows
-      .filter((c) => c.state !== 'PLANNED' || cmp(order(c.kind, c.id), mine) < 0)
+      .filter(qualifies)
       .sort((a, b) => cmp(order(a.kind, a.id), order(b.kind, b.id)));
 
+    const readable = (c: Candidate) => candidatePath(c, item.sizeBytes, opts);
     for (const c of candidates) {
       if (
-        await sameBytes(pool, c, item.sizeBytes, { cur, ensureHead, ensureSha, theirs: fullHash })
+        await sameBytes(pool, c, item.sizeBytes, {
+          cur,
+          ensureHead,
+          ensureSha,
+          theirs: fullHash,
+          path: readable,
+        })
       ) {
         const s = cur.sha!;
         return { state: 'DUP', sha256: s, duplicateOf: c.id };
@@ -167,9 +232,43 @@ export async function checkKnown(
 }
 
 /**
+ * The file that holds a candidate's bytes, or null when none may be read (spec §7.4, I2):
+ * - SENT: never its source (it may have changed since the copy). An unlinked one is read through
+ *   its drop-zone copy while that is still the file we wrote (size and `dropzone_mtime_ns`); a
+ *   linked one belongs to the pipeline now (its `files.sha256` stands in).
+ * - PLANNED: its source on the mount found by the source's identity, only while it is still the
+ *   scanned file (a regular file, same size, same mtime up to the exFAT/SMB tolerance).
+ */
+async function candidatePath(
+  c: Candidate,
+  size: bigint,
+  opts: KnownOptions,
+): Promise<SourcePath | null> {
+  let path: SourcePath;
+  if (c.state === 'SENT') {
+    if (c.linked || !opts.dropzone || c.dropzone_path === null || c.dropzone_mtime_ns === null) {
+      return null;
+    }
+    path = join(opts.dropzone, c.dropzone_path);
+  } else {
+    const mount = opts.mountOf ? await opts.mountOf(c.source_id).catch(() => null) : null;
+    if (mount === null) return null;
+    path = sourcePath(mount, c.rel_path, c.rel_path_raw);
+  }
+  const st = await readFsOps.stat(path).catch(() => null);
+  if (!st?.isFile() || st.size !== size) return null;
+  const same =
+    c.state === 'SENT'
+      ? st.mtimeNs === BigInt(c.dropzone_mtime_ns!)
+      : sameMtime(st.mtimeNs, BigInt(c.mtime_ns));
+  return same ? path : null;
+}
+
+/**
  * Whether candidate `c` holds this item's bytes. Compares stored full hashes when both
  * exist; otherwise heads first, and full hashes only where heads collide. Errors reading
- * this item propagate; an unreadable candidate just does not match (the item is then sent).
+ * this item propagate; an unreadable candidate just does not match (the item is then sent),
+ * and nothing is stored for it.
  */
 async function sameBytes(
   pool: pg.Pool,
@@ -180,17 +279,22 @@ async function sameBytes(
     ensureHead: () => Promise<string>;
     ensureSha: () => Promise<string>;
     theirs: (path: SourcePath) => Promise<string>;
+    path: (c: Candidate) => Promise<SourcePath | null>;
   },
 ): Promise<boolean> {
   const small = size <= BigInt(HEAD_BYTES);
   let theirSha = c.sha256;
   let theirHead = c.head_hash;
-  const path = c.mount === null ? null : sourcePath(c.mount, c.rel_path, c.rel_path_raw);
   if (me.cur.sha !== null && theirSha !== null) return me.cur.sha === theirSha;
 
   if (small) theirHead ??= theirSha;
+  // Their full hash but no head (a linked SENT item): our full hash decides, no read of theirs.
+  if (theirHead === null && theirSha !== null) return (await me.ensureSha()) === theirSha;
   const myHead = await me.ensureHead();
+  let resolved: SourcePath | null | undefined;
+  const pathOnce = async () => (resolved === undefined ? (resolved = await me.path(c)) : resolved);
   if (theirHead === null) {
+    const path = await pathOnce();
     if (path === null) return false;
     try {
       if (small) {
@@ -208,6 +312,7 @@ async function sameBytes(
   if (myHead !== theirHead) return false;
   const mine = await me.ensureSha();
   if (theirSha === null) {
+    const path = await pathOnce();
     if (path === null) return false;
     try {
       theirSha = await me.theirs(path);
