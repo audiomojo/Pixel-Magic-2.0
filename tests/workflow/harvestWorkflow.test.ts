@@ -27,11 +27,15 @@ const batch = (outcome: SendBatchResult['outcome'], reason?: string): SendBatchR
   known: 0,
   dups: 0,
   failed: 0,
+  cursor: null,
+  consecutive: 0,
   ...(reason ? { reason } : {}),
 });
 
 interface Fakes {
   calls: string[];
+  /** The state argument of each sendBatch call. */
+  sendStates: unknown[];
   scan: (runId: string, folderId: string) => Promise<ScanFolderResult> | ScanFolderResult;
   send: () => Promise<SendBatchResult> | SendBatchResult;
   dryRun: boolean;
@@ -41,6 +45,7 @@ interface Fakes {
 function fakes(o: Partial<Fakes> = {}): Fakes {
   return {
     calls: [],
+    sendStates: [],
     scan: () => SCAN_DONE,
     send: () => batch('DONE'),
     dryRun: false,
@@ -71,8 +76,9 @@ const activities = {
     cur.calls.push(`scanFolder ${folderId}`);
     return cur.scan(runId, folderId);
   },
-  sendBatch: async () => {
+  sendBatch: async (_runId: string, state?: unknown) => {
     cur.calls.push('sendBatch');
+    cur.sendStates.push(state);
     return cur.send();
   },
   setRunState: (_runId: string, state: string, reason?: string | null) => {
@@ -448,4 +454,56 @@ test('a long unplug during the scan continues as new before the history limit', 
   expect(d.runId).not.toBe(h.firstExecutionRunId);
   // Every new execution starts in the scan phase (done folders are skipped, the cursor is in the DB).
   expect(count(f, 'loadRun 7')).toBeGreaterThan(1);
+});
+
+test('the send cursor and error count are carried between batches and across continue-as-new', async () => {
+  let n = 0;
+  const f = fakes({
+    send: () => {
+      n++;
+      if (n === 3) {
+        return {
+          ...batch('PAUSED_ERRORS', '25 errors in a row'),
+          cursor: { pos: 0, key: 'k3', id: '3' },
+          consecutive: 25,
+        };
+      }
+      if (n >= 60) return batch('DONE');
+      return { ...batch('MORE'), cursor: { pos: 0, key: `k${n}`, id: String(n) }, consecutive: 1 };
+    },
+  });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('state paused: 25 errors in a row'));
+  await h.signal('resume');
+  expect(await h.result()).toBe('done');
+  const st = f.sendStates as { cursor: { key: string } | null; consecutive: number }[];
+  expect(st[0]).toEqual({ cursor: null, consecutive: 0 });
+  expect(st[1]).toEqual({ cursor: { pos: 0, key: 'k1', id: '1' }, consecutive: 1 });
+  // After a resume from PAUSED_ERRORS the count starts again; the cursor is kept.
+  expect(st[3]).toEqual({ cursor: { pos: 0, key: 'k3', id: '3' }, consecutive: 0 });
+  // Batch 51 runs in a new execution with the cursor of batch 50.
+  expect(st[50]).toEqual({ cursor: { pos: 0, key: 'k50', id: '50' }, consecutive: 1 });
+  const d = await h.describe();
+  expect(d.runId).not.toBe(h.firstExecutionRunId);
+});
+
+test('DONE with an approval starts a new pass from the first folder', async () => {
+  let n = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const f = fakes({
+    send: async () => {
+      if (n++ === 0) {
+        await gate;
+        return { ...batch('DONE'), cursor: { pos: 1, key: 'z', id: '9' } };
+      }
+      return batch('DONE');
+    },
+  });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('sendBatch'));
+  await h.signal('itemsApproved');
+  release();
+  expect(await h.result()).toBe('done');
+  expect(f.sendStates[1]).toEqual({ cursor: null, consecutive: 0 });
 });

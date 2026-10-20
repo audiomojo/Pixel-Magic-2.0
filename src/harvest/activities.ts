@@ -38,6 +38,8 @@ export interface HarvestDeps {
   scanHeartbeatMs?: number;
   /** Filesystem seam for the send path (tests record calls or inject faults). */
   fsOps?: FsOps;
+  /** Items per sendBatch (default 500); tests lower it. */
+  sendBatchSize?: number;
   /** Known-content check override (tests interleave state changes). */
   knownCheck?: (pool: pg.Pool, item: KnownItem, opts?: KnownOptions) => Promise<KnownOutcome>;
 }

@@ -18,6 +18,20 @@ import { finishRunRows, runFolders } from './runs.js';
 import { resolveMount } from './sources.js';
 import { checkGate } from './throttle.js';
 
+/** Where the send pass stands: the run folder (index in position order) and the last item. */
+export interface SendCursor {
+  pos: number;
+  key: string;
+  id: string;
+}
+
+/** What the workflow carries from one sendBatch to the next (and across continue-as-new). */
+export interface SendState {
+  cursor?: SendCursor | null;
+  /** Consecutive item errors so far (25 pause the run), carried across batches. */
+  consecutive?: number;
+}
+
 export interface SendBatchResult {
   outcome: 'MORE' | 'DONE' | 'GATED' | 'SOURCE_GONE' | 'PAUSED_ERRORS' | 'DISK_FULL';
   sent: number;
@@ -25,6 +39,9 @@ export interface SendBatchResult {
   dups: number;
   failed: number;
   reason?: string;
+  /** The cursor for the next call (null: start a new pass from the first folder). */
+  cursor: SendCursor | null;
+  consecutive: number;
 }
 
 export const SEND_BATCH = 500;
@@ -53,6 +70,7 @@ interface Item {
   rel_path: string;
   /** The on-disk bytes of rel_path when they differ from its NFC string (see scan listDir). */
   raw: Buffer | null;
+  path_key: string;
   size_bytes: string;
   mtime_ns: string;
   kind: 'photo' | 'maybe';
@@ -61,7 +79,10 @@ interface Item {
   dropzone_path: string | null;
   dropzone_mtime_ns: string | null;
   label: string;
+  source_kind: string | null;
   folder_id: string;
+  /** Index of the item's run folder in position order. */
+  pos: number;
 }
 
 type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
@@ -69,47 +90,132 @@ type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
 type ItemOutcome =
   'sent' | 'known' | 'dup' | 'vanished' | 'failed' | 'error' | 'capped' | 'skipped' | Stop;
 
-const escapeLike = (s: string): string => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+export interface ScopeFolder {
+  folderId: string;
+  sourceId: string;
+  /** pathKey of the folder's rel_path ('' = the whole source). */
+  key: string;
+}
+
+/** A run's send scope: its folders in position order, and whether only its own items count. */
+export interface SendScope {
+  runId: string;
+  sendOnly: boolean;
+  folders: ScopeFolder[];
+}
+
+export async function loadScope(pool: pg.Pool, runId: string): Promise<SendScope> {
+  const run = await pool.query<{ send_only: boolean }>(
+    'SELECT send_only FROM harvest_runs WHERE id = $1',
+    [runId],
+  );
+  const folders = await runFolders(pool, runId);
+  return {
+    runId,
+    sendOnly: run.rows[0]?.send_only ?? false,
+    folders: folders.map((f) => ({
+      folderId: f.folderId,
+      sourceId: f.sourceId,
+      key: pathKey(f.relPath),
+    })),
+  };
+}
+
+/** True if `key` lies under the folder key `folder` ('' = everything). */
+export const underKey = (key: string, folder: string): boolean =>
+  folder === '' || key.startsWith(`${folder}/`);
 
 /**
- * The run's next PLANNED items (spec §7.1): under one of its folders by `path_key` (the folder
- * key itself or a `key/…` prefix), ordered by folder position, then `rel_path` (byte order, as
- * the scan walks). An item under
- * nested selected folders counts for the deepest one.
+ * The run folder an item of `sourceId` / `key` is sent under: the deepest selected folder
+ * holding it (the first by position among equal ones), or null when outside the run.
  */
-async function nextItems(pool: pg.Pool, runId: string, limit: number): Promise<Item[]> {
-  const folders = await runFolders(pool, runId);
-  if (folders.length === 0) return [];
-  const keys = folders.map((f) => pathKey(f.relPath));
-  const { rows } = await pool.query<Item>(
-    `WITH rf AS (
-       SELECT * FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::text[], $6::int[])
-         AS t(folder_id, source_id, key, pat, pos)
-     ), m AS (
-       SELECT DISTINCT ON (i.id) i.*, rf.folder_id AS run_folder_id, rf.pos
-       FROM harvest_items i JOIN rf ON rf.source_id = i.source_id
-         AND (rf.key = '' OR i.path_key = rf.key OR i.path_key LIKE rf.pat ESCAPE '\\')
-       WHERE i.state = 'PLANNED'
-       ORDER BY i.id, length(rf.key) DESC
-     )
-     SELECT m.id::text AS id, m.source_id::text AS source_id, m.rel_path,
-            m.rel_path_raw AS raw, m.size_bytes::text AS size_bytes,
-            m.mtime_ns::text AS mtime_ns, m.kind, m.sha256, m.head_hash, m.dropzone_path,
-            m.dropzone_mtime_ns::text AS dropzone_mtime_ns, s.label,
-            m.run_folder_id::text AS folder_id
-     FROM m JOIN harvest_sources s ON s.id = m.source_id
-     ORDER BY m.pos, m.rel_path COLLATE "C", m.id
-     LIMIT $1`,
-    [
-      limit,
-      folders.map((f) => f.folderId),
-      folders.map((f) => f.sourceId),
-      keys,
-      keys.map((k) => `${escapeLike(k)}/%`),
-      folders.map((_, i) => i),
-    ],
+export function folderOf(scope: SendScope, sourceId: string, key: string): number | null {
+  let best: number | null = null;
+  for (const [i, f] of scope.folders.entries()) {
+    if (f.sourceId !== sourceId || !underKey(key, f.key)) continue;
+    if (best === null || f.key.length > scope.folders[best]!.key.length) best = i;
+  }
+  return best;
+}
+
+/**
+ * One page of a run folder's PLANNED items (spec §7.3) in send order — `path_key` byte order,
+ * then id — after `after` (keyset). Items under a deeper selected folder are left to it; a
+ * send-only run takes only its own approved items (`harvest_run_items`). The key range
+ * `[key/, key0)` in "C" collation is exactly the prefix `key/`, and is a range scan of
+ * `harvest_items_planned_key_idx`.
+ */
+export function pageQuery(
+  scope: SendScope,
+  pos: number,
+  after: { key: string; id: string } | null,
+  limit: number,
+): { text: string; values: unknown[] } {
+  const f = scope.folders[pos]!;
+  const values: unknown[] = [f.sourceId];
+  const p = (v: unknown): string => `$${values.push(v)}`;
+  const where = ['i.source_id = $1', "i.state = 'PLANNED'"];
+  if (f.key !== '') {
+    where.push(`i.path_key COLLATE "C" >= ${p(`${f.key}/`)}`);
+    where.push(`i.path_key COLLATE "C" < ${p(`${f.key}0`)}`);
+  }
+  const deeper = scope.folders.filter(
+    (d, i) => i !== pos && d.sourceId === f.sourceId && d.key !== f.key && underKey(d.key, f.key),
   );
-  return rows;
+  if (deeper.length) {
+    where.push(
+      `NOT EXISTS (SELECT 1 FROM unnest(${p(deeper.map((d) => `${d.key}/`))}::text[],
+                                        ${p(deeper.map((d) => `${d.key}0`))}::text[]) AS d(lo, hi)
+                   WHERE i.path_key COLLATE "C" >= d.lo AND i.path_key COLLATE "C" < d.hi)`,
+    );
+  }
+  if (scope.sendOnly) {
+    where.push(
+      `EXISTS (SELECT 1 FROM harvest_run_items ri
+               WHERE ri.run_id = ${p(scope.runId)} AND ri.item_id = i.id)`,
+    );
+  }
+  if (after) {
+    where.push(
+      `(i.path_key COLLATE "C", i.id) > (${p(after.key)}::text COLLATE "C", ${p(after.id)}::bigint)`,
+    );
+  }
+  const text = `/* harvest:next-items */
+     SELECT i.id::text AS id, i.source_id::text AS source_id, i.rel_path, i.rel_path_raw AS raw,
+            i.path_key, i.size_bytes::text AS size_bytes, i.mtime_ns::text AS mtime_ns, i.kind,
+            i.sha256, i.head_hash, i.dropzone_path,
+            i.dropzone_mtime_ns::text AS dropzone_mtime_ns, s.label, s.kind AS source_kind
+     FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
+     WHERE ${where.join('\n       AND ')}
+     ORDER BY i.path_key COLLATE "C", i.id
+     LIMIT ${p(limit)}`;
+  return { text, values };
+}
+
+/** The run's next ≤ `limit` PLANNED items from `cursor`, folder by folder in position order. */
+async function nextItems(
+  pool: pg.Pool,
+  scope: SendScope,
+  cursor: SendCursor | null,
+  limit: number,
+): Promise<Item[]> {
+  const out: Item[] = [];
+  for (let pos = cursor?.pos ?? 0; pos < scope.folders.length && out.length < limit; pos++) {
+    const after = cursor && pos === cursor.pos ? cursor : null;
+    const q = pageQuery(scope, pos, after, limit - out.length);
+    const { rows } = await pool.query<Omit<Item, 'folder_id' | 'pos'>>(q.text, q.values);
+    for (const r of rows) out.push({ ...r, folder_id: scope.folders[pos]!.folderId, pos });
+  }
+  return out;
+}
+
+/** Whether any item of the run's scope is still PLANNED (one LIMIT 1 page per folder). */
+async function anyPlanned(pool: pg.Pool, scope: SendScope): Promise<boolean> {
+  for (let pos = 0; pos < scope.folders.length; pos++) {
+    const q = pageQuery(scope, pos, null, 1);
+    if ((await pool.query(q.text, q.values)).rowCount) return true;
+  }
+  return false;
 }
 
 /**
@@ -150,12 +256,12 @@ export function makeSendBatch(deps: HarvestDeps) {
   const ops: ReadFsOps = deps.fsOps ?? readFsOps;
   const known = deps.knownCheck ?? checkKnown;
 
-  async function sendBatch(runId: string): Promise<SendBatchResult> {
+  async function sendBatch(runId: string, state: SendState = {}): Promise<SendBatchResult> {
     const ctx = Context.current();
     const signal = ctx.cancellationSignal;
     const gfs = new GuardedFs([join(layout.dropzone, 'harvest')], deps.fsOps);
     const dz = layout.dropzone;
-    const res: SendBatchResult = { outcome: 'DONE', sent: 0, known: 0, dups: 0, failed: 0 };
+    const res = { sent: 0, known: 0, dups: 0, failed: 0 };
     const counts = () => ({ sent: res.sent, known: res.known, dups: res.dups, failed: res.failed });
 
     const checkpoint = async (name: string): Promise<void> => {
@@ -452,8 +558,29 @@ export function makeSendBatch(deps: HarvestDeps) {
       }
     };
 
-    let consecutive = 0;
-    const batch = await nextItems(pool, runId, SEND_BATCH);
+    // The gate first (cheap): a shut gate never pages the items, however often it is retried.
+    const gate = await checkGate(deps, runId, 0n);
+    if (!gate.open) {
+      return {
+        ...res,
+        outcome: 'GATED',
+        reason: gate.reason,
+        cursor: state.cursor ?? null,
+        consecutive: state.consecutive ?? 0,
+      };
+    }
+    let consecutive = state.consecutive ?? 0;
+    let cursor: SendCursor | null = state.cursor ?? null;
+    const scope = await loadScope(pool, runId);
+    const limit = deps.sendBatchSize ?? SEND_BATCH;
+    const batch = await nextItems(pool, scope, cursor, limit);
+    const stopped = (outcome: SendBatchResult['outcome'], reason: string): SendBatchResult => ({
+      ...res,
+      outcome,
+      reason,
+      cursor,
+      consecutive,
+    });
     for (const it of batch) {
       signal.throwIfAborted();
       let out: ItemOutcome;
@@ -462,19 +589,22 @@ export function makeSendBatch(deps: HarvestDeps) {
       } catch (e) {
         throw e instanceof Crash ? e.cause : e;
       }
-      if (typeof out === 'object') return { ...res, outcome: out.stop, reason: out.reason };
+      // A stop leaves the cursor before this item: it is tried again first.
+      if (typeof out === 'object') return stopped(out.stop, out.reason);
+      cursor = { pos: it.pos, key: it.path_key, id: it.id };
       if (out === 'sent') res.sent++;
       else if (out === 'known') res.known++;
       else if (out === 'dup') res.dups++;
       else if (out === 'failed' || out === 'capped') res.failed++;
       consecutive = out === 'error' || out === 'capped' ? consecutive + 1 : 0;
       ctx.heartbeat({ ...counts(), item: it.rel_path });
-      if (consecutive >= MAX_CONSECUTIVE_ERRORS) {
-        return { ...res, outcome: 'PAUSED_ERRORS', reason: lastError };
-      }
+      if (consecutive >= MAX_CONSECUTIVE_ERRORS) return stopped('PAUSED_ERRORS', lastError);
     }
-    const more = (await nextItems(pool, runId, 1)).length > 0;
-    return { ...res, outcome: more ? 'MORE' : 'DONE' };
+    // A full batch: more may follow the cursor. Otherwise the pass is over; items left PLANNED
+    // behind it (an error under the cap, an approval, a promoted duplicate) start a new pass.
+    if (batch.length === limit) return { ...res, outcome: 'MORE', cursor, consecutive };
+    const again = await anyPlanned(pool, scope);
+    return { ...res, outcome: again ? 'MORE' : 'DONE', cursor: null, consecutive };
   }
 
   return sendBatch;

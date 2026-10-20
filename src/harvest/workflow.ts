@@ -18,6 +18,7 @@ import {
   type RetryPolicy,
 } from '@temporalio/workflow';
 import type { createHarvestActivities } from './activities.js';
+import type { SendCursor } from './send.js';
 import { STALLED_REASON } from './constants.js';
 
 export const pauseSignal = defineSignal('pause');
@@ -72,6 +73,9 @@ export interface HarvestInput {
   runId: string;
   phase?: 'scan' | 'send';
   batches?: number;
+  /** The send pass position and the consecutive error count (see sendBatch). */
+  cursor?: SendCursor | null;
+  consecutive?: number;
   /** History length that triggers continue-as-new (default 10 000; tests lower it). */
   maxHistory?: number;
 }
@@ -167,6 +171,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     }
 
     let batches = input.batches ?? 0;
+    let send = { cursor: input.cursor ?? null, consecutive: input.consecutive ?? 0 };
     await show('sending');
     for (;;) {
       await userPause('sending');
@@ -175,11 +180,13 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
           runId,
           phase: 'send',
           batches: 0,
+          ...send,
           ...carry,
         });
       }
       approved = false;
-      const res = await sendBatch(runId);
+      const res = await sendBatch(runId, send);
+      send = { cursor: res.cursor, consecutive: res.consecutive };
       batches++;
       switch (res.outcome) {
         case 'MORE':
@@ -188,7 +195,9 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
         case 'DONE':
           await show('sending');
           if (approved) {
+            // Approved items may lie anywhere in the run: a new pass from the first folder.
             approved = false;
+            send = { ...send, cursor: null };
             break;
           }
           phase = 'done';
@@ -208,6 +217,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
           break;
         case 'PAUSED_ERRORS':
           await waitPaused('sending', res.reason ?? 'too many errors');
+          send = { ...send, consecutive: 0 };
           break;
         default:
           throw new Error(`unexpected sendBatch outcome: ${String(res.outcome)}`);

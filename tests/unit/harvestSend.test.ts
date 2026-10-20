@@ -19,7 +19,12 @@ import { loadHarvestSettings } from '../../src/harvest/config.js';
 import { checkKnown } from '../../src/harvest/known.js';
 import { realFsOps, type FsOps } from '../../src/harvest/paths.js';
 import { createRun, runFolders, setRunState } from '../../src/harvest/runs.js';
-import type { SendBatchResult } from '../../src/harvest/send.js';
+import {
+  loadScope,
+  pageQuery,
+  type SendBatchResult,
+  type SendState,
+} from '../../src/harvest/send.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { DataLayout } from '../../src/fsops.js';
 import { runActivity } from '../helpers/activityEnv.js';
@@ -88,7 +93,7 @@ interface Env {
   folderId: string;
   /** Scans the run's folder (creates the PLANNED items). */
   scan: () => Promise<void>;
-  send: (extra?: Partial<HarvestDeps>) => Promise<SendBatchResult>;
+  send: (extra?: Partial<HarvestDeps>, state?: SendState) => Promise<SendBatchResult>;
   /** A new run over the same folder, scanned; replaces runId. */
   rerun: () => Promise<void>;
 }
@@ -145,9 +150,9 @@ async function setup(
       const r = await runActivity(scanFolder, [env.runId, env.folderId]);
       expect(r.outcome).toBe('DONE');
     },
-    send: async (extra = {}) => {
+    send: async (extra = {}, state = {}) => {
       const { sendBatch } = createHarvestActivities({ ...deps, ...extra });
-      return runActivity(sendBatch, [env.runId]);
+      return runActivity(sendBatch, [env.runId, state]);
     },
     rerun: async () => {
       env.runId = await createRun(
@@ -273,10 +278,11 @@ describe('copy protocol', () => {
     const srcOpens = rec.calls
       .filter((c) => c.op === 'openRead' && c.paths[0]!.startsWith(e.root))
       .map((c) => c.paths[0]);
+    // Send order is path_key byte order (casefolded): c.nef before DCIM/.
     expect(srcOpens).toEqual([
+      join(e.root, 'c.nef'),
       join(e.root, 'DCIM/a.cr2'),
       join(e.root, 'DCIM/sub/b.cr2'),
-      join(e.root, 'c.nef'),
     ]);
     for (const c of rec.calls.filter((c) => c.op === 'openRead' && !c.paths[0]!.startsWith(e.root)))
       expect(c.paths[0]!.startsWith(join(await fsp.realpath(e.dz), 'harvest'))).toBe(true);
@@ -768,7 +774,8 @@ describe('errors and pauses', () => {
       { statfs: { blocks: 100n, bavail: 0n, bsize: 1n } },
     );
     const res = await e.send();
-    expect(res).toMatchObject({ outcome: 'GATED', sent: 0, reason: 'disk 600.0 %' });
+    // Checked once before paging the items (no file size yet).
+    expect(res).toMatchObject({ outcome: 'GATED', sent: 0, reason: 'disk 100.0 %' });
     expect(await listDz(e.dz)).toEqual([]);
     for (const r of await items())
       expect(r).toMatchObject({ state: 'PLANNED', dropzone_path: null });
@@ -849,6 +856,165 @@ describe('known content', () => {
     expect(beats.map((b) => b.item).filter(Boolean)).toEqual(['B/w.cr2', 'A/x.cr2']);
     expect((await item('A_b/y.cr2')).state).toBe('PLANNED');
     expect((await item('A%/z.cr2')).state).toBe('PLANNED');
+  });
+});
+
+/** The pool, recording every query's text (pg.Pool's own methods stay bound to it). */
+function recordingPool(log: string[]): typeof pgh.pool {
+  return new Proxy(pgh.pool, {
+    get(t, p) {
+      if (p === 'query') {
+        return (...a: Parameters<typeof t.query>) => {
+          const q = a[0] as unknown;
+          log.push(typeof q === 'string' ? q : String((q as { text?: string }).text));
+          return (t.query as (...x: unknown[]) => unknown)(...a);
+        };
+      }
+      const v = Reflect.get(t, p) as unknown;
+      return typeof v === 'function' ? (v as (...x: unknown[]) => unknown).bind(t) : v;
+    },
+  });
+}
+/** Queries that page the run's PLANNED items (the old and the new nextItems both match). */
+const pageQueries = (log: string[]) =>
+  log.filter((q) => /FROM harvest_items i[\s\S]*i\.state = 'PLANNED'/.test(q)).length;
+
+describe('paging (I5)', () => {
+  const five: TreeSpec = {
+    'DCIM/a.cr2': 201,
+    'DCIM/b.cr2': 202,
+    'DCIM/c.cr2': 203,
+    'DCIM/d.cr2': 204,
+    'DCIM/e.cr2': 205,
+  };
+
+  test('batches page through the run from a cursor; a full batch is MORE', async () => {
+    const e = await setup(five);
+    const small = { sendBatchSize: 2 };
+    const r1 = await e.send(small);
+    expect(r1).toMatchObject({ outcome: 'MORE', sent: 2, cursor: { pos: 0, key: 'dcim/b.cr2' } });
+    const r2 = await e.send(small, { cursor: r1.cursor });
+    expect(r2).toMatchObject({ outcome: 'MORE', sent: 2, cursor: { pos: 0, key: 'dcim/d.cr2' } });
+    const r3 = await e.send(small, { cursor: r2.cursor });
+    expect(r3).toMatchObject({ outcome: 'DONE', sent: 1 });
+    expect((await items()).every((i) => i.state === 'SENT')).toBe(true);
+  });
+
+  test('a full batch decides MORE without a second item query', async () => {
+    const e = await setup(five);
+    const log: string[] = [];
+    const r = await e.send({ sendBatchSize: 2, pool: recordingPool(log) });
+    expect(r.outcome).toBe('MORE');
+    expect(pageQueries(log)).toBe(1);
+  });
+
+  test('a shut gate returns GATED before any item query', async () => {
+    const e = await setup(five, { statfs: { blocks: 100n, bavail: 0n, bsize: 1n } });
+    const log: string[] = [];
+    expect((await e.send({ pool: recordingPool(log) })).outcome).toBe('GATED');
+    expect(pageQueries(log)).toBe(0);
+  });
+
+  test('an item left PLANNED behind the cursor is retried on the next pass', async () => {
+    const e = await setup(five);
+    let failed = false;
+    const once: FsOps = {
+      ...realFsOps,
+      openRead: (p) => {
+        if (!failed && String(p).endsWith('b.cr2')) {
+          failed = true;
+          return Promise.reject(errno('EACCES'));
+        }
+        return realFsOps.openRead(p);
+      },
+    };
+    const r1 = await e.send({ fsOps: once, sendBatchSize: 3 });
+    expect(r1).toMatchObject({ outcome: 'MORE', sent: 2 });
+    const r2 = await e.send({ fsOps: once, sendBatchSize: 3 }, { cursor: r1.cursor });
+    // The pass ended with b still PLANNED: a new pass (cursor reset) picks it up.
+    expect(r2).toMatchObject({ outcome: 'MORE', sent: 2, cursor: null });
+    const r3 = await e.send({ fsOps: once, sendBatchSize: 3 }, { cursor: r2.cursor });
+    expect(r3).toMatchObject({ outcome: 'DONE', sent: 1 });
+    expect((await item('DCIM/b.cr2')).state).toBe('SENT');
+  });
+
+  test('nested folders: an item counts for the deepest selected folder, in position order', async () => {
+    const e = await setup(
+      { 'A/x.cr2': 300, 'A/B/y.cr2': 301, 'A/z.cr2': 302, 'C/w.cr2': 303 },
+      { relPath: '' },
+    );
+    const run = await createRun(
+      pgh.pool,
+      [
+        { sourceId: e.sourceId, relPath: 'A' },
+        { sourceId: e.sourceId, relPath: 'C' },
+        { sourceId: e.sourceId, relPath: 'A/B' },
+      ],
+      false,
+    );
+    const scope = await loadScope(pgh.pool, run);
+    expect(scope.folders.map((f) => f.key)).toEqual(['a', 'c', 'a/b']);
+    const { sendBatch } = createHarvestActivities(e.deps);
+    const beats: { item?: string }[] = [];
+    await runActivity(sendBatch, [run, {}], {
+      onHeartbeat: (d) => beats.push(d as { item?: string }),
+    });
+    expect(beats.map((b) => b.item).filter(Boolean)).toEqual([
+      'A/x.cr2',
+      'A/z.cr2',
+      'C/w.cr2',
+      'A/B/y.cr2',
+    ]);
+    const c = await pgh.pool.query<{ rel_path: string; sent: number }>(
+      `SELECT f.rel_path, rf.sent::int FROM harvest_run_folders rf
+       JOIN harvest_folders f ON f.id = rf.folder_id WHERE rf.run_id = $1 ORDER BY rf.position`,
+      [run],
+    );
+    expect(c.rows).toEqual([
+      { rel_path: 'A', sent: 2 },
+      { rel_path: 'C', sent: 1 },
+      { rel_path: 'A/B', sent: 1 },
+    ]);
+  });
+
+  test('EXPLAIN on 120k PLANNED rows: the page query is an index range scan, no sort', async () => {
+    const { rows } = await pgh.pool.query<{ id: string }>(
+      `INSERT INTO harvest_sources (identity, label, kind) VALUES ('local:X', 'X', 'local')
+       RETURNING id::text AS id`,
+    );
+    const sid = rows[0]!.id;
+    await pgh.pool.query(
+      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+       SELECT $1, d || '/f' || g || '.cr2', lower(d || '/f' || g || '.cr2'), 1000 + g, g, 'photo',
+              CASE WHEN g % 10 = 0 THEN 'SENT' WHEN g % 10 = 1 THEN 'DUP' ELSE 'PLANNED' END
+       FROM generate_series(1, 120000) AS g,
+            LATERAL (SELECT 'D' || (g % 40) AS d) AS dd`,
+      [sid],
+    );
+    // Each DUP row points at the SENT row just before it.
+    await pgh.pool.query(
+      "UPDATE harvest_items SET duplicate_of = id - 1 WHERE state = 'DUP' AND id > 1",
+    );
+    await pgh.pool.query('ANALYZE harvest_items');
+    const run = await createRun(pgh.pool, [{ sourceId: sid, relPath: 'D7' }], false);
+    const scope = await loadScope(pgh.pool, run);
+    const explain = async (after: { key: string; id: string } | null) => {
+      const q = pageQuery(scope, 0, after, 500);
+      const r = await pgh.pool.query<{ 'QUERY PLAN': string }>(`EXPLAIN ${q.text}`, q.values);
+      return r.rows.map((x) => x['QUERY PLAN']).join('\n');
+    };
+    for (const plan of [await explain(null), await explain({ key: 'd7/f5007.cr2', id: '5007' })]) {
+      expect(plan).toMatch(/Index Scan using harvest_items_planned_key_idx/);
+      expect(plan).not.toMatch(/Seq Scan|Sort/);
+      console.log(`EXPLAIN page query (120k rows):\n${plan}`);
+    }
+    const dup = await pgh.pool.query<{ 'QUERY PLAN': string }>(
+      `EXPLAIN SELECT id FROM harvest_items WHERE duplicate_of = 50 AND state = 'DUP'
+       ORDER BY (kind = 'maybe'), id FOR UPDATE`,
+    );
+    const dplan = dup.rows.map((x) => x['QUERY PLAN']).join('\n');
+    expect(dplan).toMatch(/harvest_items_duplicate_of_idx/);
+    console.log(`EXPLAIN promoteDuplicates lookup (120k rows):\n${dplan}`);
   });
 });
 
