@@ -24,6 +24,8 @@ export interface ScanFolderResult {
   maybes: number;
   junk: Record<string, number>;
   errors: number;
+  /** For SOURCE_GONE: `<label> unplugged`, the run's pause reason. */
+  reason?: string;
 }
 
 export const SCAN_HEARTBEAT_MS = 5000;
@@ -227,8 +229,9 @@ export function makeScanFolder(deps: HarvestDeps) {
   const { pool, settings } = deps;
 
   async function scanFolder(runId: string, folderId: string): Promise<ScanFolderResult> {
-    const f = await pool.query<{ source_id: string; rel_path: string }>(
-      'SELECT source_id::text AS source_id, rel_path FROM harvest_folders WHERE id = $1',
+    const f = await pool.query<{ source_id: string; rel_path: string; label: string }>(
+      `SELECT f.source_id::text AS source_id, f.rel_path, s.label
+       FROM harvest_folders f JOIN harvest_sources s ON s.id = f.source_id WHERE f.id = $1`,
       [folderId],
     );
     const folder = f.rows[0];
@@ -272,6 +275,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       outcome,
       ...total,
       junk: { ...total.junk },
+      ...(outcome === 'SOURCE_GONE' ? { reason: `${folder.label} unplugged` } : {}),
     });
 
     const mount = await resolveMount(

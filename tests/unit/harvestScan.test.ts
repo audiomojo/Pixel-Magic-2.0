@@ -431,7 +431,7 @@ describe('scanFolder', () => {
   test('SOURCE_GONE when the mount is absent', async () => {
     const env = await setup(FIXTURE, {}, false);
     const { runId, res } = await env.scan();
-    expect(res.outcome).toBe('SOURCE_GONE');
+    expect(res).toMatchObject({ outcome: 'SOURCE_GONE', reason: 'Drive unplugged' });
     expect(res.dirs).toBe(0);
     expect((await counters(runId)).state).toBe('scanning');
   });

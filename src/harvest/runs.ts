@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import { withTx } from '../db.js';
+import type { RunControl } from './activities.js';
 
 /**
  * Creates a queued run over the given folders: upserts `harvest_folders`, then the run and its
@@ -142,4 +143,39 @@ export async function finishRunRows(
     }
     return true;
   });
+}
+
+/** What the workflow needs to plan a run: the dry-run flag and its folders in order. */
+export async function loadRun(
+  pool: pg.Pool,
+  runId: string,
+): Promise<{ dryRun: boolean; folders: RunFolder[] }> {
+  const { rows } = await pool.query<{ dry_run: boolean }>(
+    'SELECT dry_run FROM harvest_runs WHERE id = $1',
+    [runId],
+  );
+  if (!rows[0]) throw new Error(`harvest run ${runId} not found`);
+  return { dryRun: rows[0].dry_run, folders: await runFolders(pool, runId) };
+}
+
+/**
+ * Starts the oldest queued run unless one is already active (scanning, sending or paused).
+ * Returns the started run's id, or null. Callers are serialised by an advisory lock; a run the
+ * workflow has not yet moved out of `queued` may be offered twice, which `control.start` absorbs
+ * (workflow id `harvest-<runId>`, duplicates rejected and treated as success).
+ */
+export async function startNextQueued(pool: pg.Pool, control: RunControl): Promise<string | null> {
+  const next = await withTx(pool, async (c) => {
+    await c.query("SELECT pg_advisory_xact_lock(hashtext('harvest_start_next'))");
+    const active = await c.query(
+      "SELECT 1 FROM harvest_runs WHERE state IN ('scanning', 'sending', 'paused') LIMIT 1",
+    );
+    if (active.rowCount) return null;
+    const q = await c.query<{ id: string }>(
+      "SELECT id::text AS id FROM harvest_runs WHERE state = 'queued' ORDER BY id LIMIT 1",
+    );
+    return q.rows[0]?.id ?? null;
+  });
+  if (next !== null) await control.start(next);
+  return next;
 }

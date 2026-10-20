@@ -3,7 +3,7 @@ import type { DataLayout } from '../fsops.js';
 import type { HarvestSettings } from './config.js';
 import type { KnownItem, KnownOptions, KnownOutcome } from './known.js';
 import type { FsOps, SourcePath } from './paths.js';
-import { setRunState, type RunState } from './runs.js';
+import { loadRun, setRunState, startNextQueued, type RunState } from './runs.js';
 import { makeScanFolder } from './scan.js';
 import { linkFiles, makeFinishRun, makeSendBatch } from './send.js';
 import type { DetectOptions, SystemProbe } from './sources.js';
@@ -43,5 +43,10 @@ export function createHarvestActivities(deps: HarvestDeps) {
     linkFiles: (): Promise<number> => linkFiles(deps.pool),
     setRunState: (runId: string, state: RunState, reason?: string | null): Promise<void> =>
       setRunState(deps.pool, runId, state, reason ?? null),
+    loadRun: (runId: string) => loadRun(deps.pool, runId),
+    startNextQueued: (): Promise<string | null> => {
+      if (!deps.temporal) throw new Error('startNextQueued: no Temporal run control configured');
+      return startNextQueued(deps.pool, deps.temporal);
+    },
   };
 }
