@@ -100,8 +100,9 @@ harvest-start:
 	node dist/harvest/cli.js start
 
 # Run the harvester in the foreground (run `make harvest-stop` first: both would use the port).
+# UV_THREADPOOL_SIZE as in the launchd agent: a hung SMB share must not hold every libuv thread.
 harvester: build
-	node --env-file-if-exists=.env dist/harvest/host.js
+	UV_THREADPOOL_SIZE=32 node --env-file-if-exists=.env dist/harvest/host.js
 
 # Active run, item counts, gate and the host heartbeat.
 harvest-status:

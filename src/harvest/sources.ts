@@ -121,6 +121,28 @@ async function containsDataDir(root: string, dataDir: string, fs: FsProbe): Prom
   }
 }
 
+/**
+ * Containment probes still running, per fs seam and (mount point, data dir). A probe on a hung
+ * SMB share never returns and holds a libuv thread: later detections (the page, every
+ * sendBatch, every scan) wait on the same one instead of starting another, so a hung share
+ * cannot exhaust the thread pool and freeze all file I/O.
+ */
+const pendingProbes = new WeakMap<FsProbe, Map<string, Promise<boolean>>>();
+
+function probeContainment(root: string, dataDir: string, fs: FsProbe): Promise<boolean> {
+  let byMount = pendingProbes.get(fs);
+  if (!byMount) pendingProbes.set(fs, (byMount = new Map<string, Promise<boolean>>()));
+  const key = `${root}\0${dataDir}`;
+  let probe = byMount.get(key);
+  if (!probe) {
+    probe = containsDataDir(root, dataDir, fs);
+    byMount.set(key, probe);
+    const done = () => byMount.delete(key);
+    probe.then(done, done);
+  }
+  return probe;
+}
+
 /** Applies the spec §4.1 exclusions and the §4.2 identities to the current mounts. */
 export async function detectSources(
   sys: SystemProbe,
@@ -179,7 +201,7 @@ export async function detectSources(
     }
     if (isReservedLabel(src.labelBase)) continue;
     try {
-      if (await bounded(containsDataDir(m.mountPoint, dataDir, fs), fsTimeoutMs)) continue;
+      if (await bounded(probeContainment(m.mountPoint, dataDir, fs), fsTimeoutMs)) continue;
     } catch (e) {
       if (!(e instanceof FsTimeout)) throw e;
       logger.warn(

@@ -95,6 +95,11 @@ Approving possible photos sends only those files: an approval never scans a driv
 harvester cannot identify shows greyed on the page as "couldn't identify this drive"; press
 **Refresh drives** to retry.
 
+A network share that stops answering can hang file calls until it returns. The harvester
+probes such a share only once at a time and runs with `UV_THREADPOOL_SIZE=32` (set in the
+launchd agent, `make harvester` and `npm run harvester`), so a hung share does not freeze the
+page or the other drives. A foreground run started some other way should set it too.
+
 The dev/compose stack (Postgres and Temporal) must be up and migrated (`make up`) before the
 harvester can work; it retries until they answer.
 

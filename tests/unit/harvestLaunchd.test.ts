@@ -23,6 +23,8 @@ test('renders the agent definition', () => {
   expect(p).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
   expect(p).toContain('<string>/data/logs/harvester.launchd.log</string>');
   expect(p).toContain('/usr/bin:/bin:/usr/sbin:/sbin');
+  // A hung SMB share holds libuv threads: a larger pool keeps other file I/O moving (I4).
+  expect(p).toMatch(/<key>UV_THREADPOOL_SIZE<\/key>\s*<string>32<\/string>/);
   expect(p.match(/harvester\.launchd\.log/g)).toHaveLength(2);
 });
 

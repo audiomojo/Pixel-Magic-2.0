@@ -185,6 +185,30 @@ test('a stale mount whose fs calls hang is skipped within the timeout', async ()
   expect(Date.now() - t0).toBeLessThan(2000);
 });
 
+test('a hung mount probe is reused, not stacked, by repeated detections (I4)', async () => {
+  const out = '/dev/disk20s1 on /Volumes/Stale (exfat, local)';
+  let release!: (p: string) => void;
+  const hang = new Promise<string>((r) => (release = r));
+  const realpaths: string[] = [];
+  const slow = {
+    realpath: (p: string) => {
+      realpaths.push(p);
+      return p.includes('Stale') ? hang : Promise.resolve(p);
+    },
+    stat: () => Promise.reject(new Error('ENOENT')),
+  };
+  // Each probe that hangs holds a libuv thread: five detections must not start five.
+  for (let i = 0; i < 5; i++) {
+    expect(await detectSources(fake(out), NOPE, { fsTimeoutMs: 20, fs: slow })).toEqual([]);
+  }
+  expect(realpaths.filter((p) => p.includes('Stale'))).toHaveLength(1);
+  // Once it answers, the pending probe is gone and the next detection probes afresh.
+  release('/Volumes/Stale');
+  await new Promise((r) => setTimeout(r, 10));
+  const d = await detectSources(fake(out), NOPE, { fsTimeoutMs: 20, fs: slow });
+  expect(d.map((x) => x.labelBase)).toEqual(['Stale']);
+});
+
 let pgh: PgHandle;
 beforeAll(async () => {
   pgh = await startPg();

@@ -16,7 +16,7 @@
     "test:corpus": "vitest run --project corpus",
     "test:e2e": "vitest run --project e2e",
     "test:chaos": "vitest run --project chaos",
-    "harvester": "node --env-file-if-exists=.env dist/harvest/host.js"
+    "harvester": "UV_THREADPOOL_SIZE=32 node --env-file-if-exists=.env dist/harvest/host.js"
   },
   "dependencies": {
     "@temporalio/activity": "^1.24.0",
