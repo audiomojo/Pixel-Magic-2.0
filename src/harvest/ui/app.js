@@ -825,12 +825,12 @@ async function openReviewFiles() {
   const back = h('p', {}, h('a', { href: '#/review' }, '← Possible photos'));
   m.replaceChildren(
     back,
-    h('h2', {}, path || '(top of source)'),
+    h('h2', {}, path || '(top of drive)'),
     h('p', { className: 'muted' }, 'Loading…'),
   );
-  let files;
+  let files, label, problem;
   try {
-    ({ files } = await api(
+    ({ files, label, problem } = await api(
       `/api/review?sourceId=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`,
     ));
   } catch (e) {
@@ -860,13 +860,15 @@ async function openReviewFiles() {
   for (const f of files) {
     const fig = h('figure');
     fig.append(
-      h('img', {
-        src: `/api/thumb/${encodeURIComponent(f.id)}`,
-        loading: 'lazy',
-        alt: f.name,
-        width: 256,
-        height: 256,
-      }),
+      problem
+        ? h('div', { className: 'thumb-note' }, problem.tile)
+        : h('img', {
+            src: `/api/thumb/${encodeURIComponent(f.id)}`,
+            loading: 'lazy',
+            alt: f.name,
+            width: 256,
+            height: 256,
+          }),
       h('figcaption', {}, `${f.name} · ${bytes(f.sizeBytes)}`),
       h(
         'div',
@@ -887,7 +889,8 @@ async function openReviewFiles() {
   }
   m.replaceChildren(
     back,
-    h('h2', {}, path || '(top of source)'),
+    h('h2', {}, `${label} · ${path || '(top of drive)'}`),
+    problem && files.length ? message(problem.detail, true) : '',
     msg,
     files.length ? grid : h('p', {}, 'No files left in this folder.'),
   );

@@ -95,7 +95,7 @@ export function withDefaults(d: CliDeps): Required<Omit<CliDeps, 'pool'>> {
   };
 }
 
-const BOOTSTRAP_TRIES = 3;
+const BOOTSTRAP_TRIES = 10;
 const BOOTSTRAP_DELAY_MS = 1000;
 
 /**

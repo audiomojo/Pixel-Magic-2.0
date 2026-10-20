@@ -577,7 +577,15 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
        WHERE state = 'REVIEW' AND source_id = $1 AND ${PARENT_SQL} = $2 ORDER BY rel_path, id`,
       [sourceId, path],
     );
+    const label =
+      (
+        await pool.query<{ label: string }>('SELECT label FROM harvest_sources WHERE id = $1', [
+          sourceId,
+        ])
+      ).rows[0]?.label ?? `source ${String(sourceId)}`;
     return {
+      label,
+      problem: rows.length === 0 ? null : await sourceProblem(String(sourceId), label),
       files: rows.map((r) => ({
         id: r.id,
         name: r.rel_path.slice(r.rel_path.lastIndexOf('/') + 1),
@@ -586,6 +594,28 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         mtime: new Date(Number(BigInt(r.mtime_ns) / 1_000_000n)).toISOString(),
       })),
     };
+  }
+
+  /**
+   * Why the files of a source cannot be shown (their thumbnails would be grey): not connected,
+   * or macOS refuses to list its top folder. Null when it can be read (or another error, which
+   * the thumbnails then show as before).
+   */
+  async function sourceProblem(
+    sourceId: string,
+    label: string,
+  ): Promise<{ tile: string; detail: string } | null> {
+    const mount = await mountOf(sourceId);
+    if (mount === null)
+      return { tile: `${label} is not connected`, detail: `${label} is not connected.` };
+    try {
+      await timeout(listDir(mount), treeTimeoutMs, 'listing the drive');
+      return null;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EACCES') return null;
+      return { tile: `can't read ${label}: permission denied`, detail: PERMISSION_HINT };
+    }
   }
 
   async function reviewPost(body: unknown): Promise<Json> {

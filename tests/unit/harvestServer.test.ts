@@ -704,8 +704,36 @@ describe('review', () => {
     const f = (await e.get(`/api/review?sourceId=${e.sourceId}&path=Pics`)).json;
     expect(f.files.map((x: { name: string }) => x.name)).toEqual(['a.png', 'b.png']);
     expect(f.files[0]).toMatchObject({ relPath: 'Pics/a.png', sizeBytes: 10 });
+    expect(f).toMatchObject({ label: 'Drive', problem: null });
     expect((await e.get(`/api/review?sourceId=${e.sourceId}`)).json.files).toHaveLength(1); // path ''
     expect((await e.get('/api/review?sourceId=x')).status).toBe(400);
+  });
+
+  test('review files say when their drive cannot be read or is not connected', async () => {
+    const eperm = () => Promise.reject(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
+    const e = await setup({ deps: { listDir: eperm } });
+    await item(e, 'Pics/a.png', 'REVIEW');
+    const f = (await e.get(`/api/review?sourceId=${e.sourceId}&path=Pics`)).json;
+    expect(f.problem).toEqual({
+      tile: "can't read Drive: permission denied",
+      detail: expect.stringContaining('Removable Volumes') as unknown,
+    });
+    expect(f.files).toHaveLength(1);
+    // no files: nothing to explain
+    expect((await e.get(`/api/review?sourceId=${e.sourceId}&path=Other`)).json.problem).toBeNull();
+    e.mounted.value = false;
+    const g = (await e.get(`/api/review?sourceId=${e.sourceId}&path=Pics`)).json;
+    expect(g.problem).toEqual({
+      tile: 'Drive is not connected',
+      detail: 'Drive is not connected.',
+    });
+  });
+
+  test('another listing error does not hide the thumbnails', async () => {
+    const eio = () => Promise.reject(Object.assign(new Error('EIO'), { code: 'EIO' }));
+    const e = await setup({ deps: { listDir: eio } });
+    await item(e, 'Pics/a.png', 'REVIEW');
+    expect((await e.get(`/api/review?sourceId=${e.sourceId}&path=Pics`)).json.problem).toBeNull();
   });
 
   test('review send flips REVIEW→PLANNED and signals itemsApproved; skip → REJECTED', async () => {

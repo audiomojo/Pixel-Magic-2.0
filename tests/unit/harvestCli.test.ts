@@ -119,12 +119,12 @@ test('install retries bootstrap on an Input/output error (bootout still tearing 
   expect(sleeps).toEqual([1000]);
 });
 
-test('install gives up after 3 bootstrap attempts', async () => {
+test('install gives up after 10 bootstrap attempts', async () => {
   const got = capture();
   const io = { code: 5, stderr: 'Input/output error' };
-  result = [{ code: 0, stderr: '' }, io, io, io];
+  result = [{ code: 0, stderr: '' }, ...Array<typeof io>(10).fill(io)];
   expect(await run(['install'], deps())).toBe(1);
-  expect(calls.filter((c) => c[0] === 'bootstrap')).toHaveLength(3);
+  expect(calls.filter((c) => c[0] === 'bootstrap')).toHaveLength(10);
   expect(got().err).toContain('Input/output error');
 });
 

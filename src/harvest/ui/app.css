@@ -287,6 +287,17 @@ ul.tree ul {
   object-fit: contain;
   background: var(--bg);
 }
+.grid .thumb-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--bg);
+}
 .grid figcaption {
   font-size: 0.8rem;
   margin: 0.3rem 0;
