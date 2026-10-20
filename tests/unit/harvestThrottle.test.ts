@@ -228,3 +228,21 @@ describe('stall', () => {
 test('defaults now to the clock', async () => {
   expect(await checkGate(deps(0n), await newRun(), 1n)).toEqual({ open: true });
 });
+
+test('the backlog queries can use the sent-unlinked index', async () => {
+  const client = await pgh.pool.connect();
+  try {
+    await client.query('SET enable_seqscan = off');
+    for (const sql of [
+      `SELECT count(*) FROM harvest_items WHERE state = 'SENT' AND file_id IS NULL AND sent_at > $1`,
+      `SELECT 1 FROM harvest_items WHERE state = 'SENT' AND file_id IS NULL AND sent_at > $1 LIMIT 1`,
+    ]) {
+      const { rows } = await client.query<{ 'QUERY PLAN': string }>(`EXPLAIN ${sql}`, [NOW]);
+      expect(rows.map((r) => r['QUERY PLAN']).join('\n')).toContain(
+        'harvest_items_sent_unlinked_idx',
+      );
+    }
+  } finally {
+    client.release();
+  }
+});

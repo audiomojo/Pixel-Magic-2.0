@@ -224,14 +224,22 @@ describe('checkKnown', () => {
     expect((await checkKnown(pgh.pool, photo)).state).toBe('SEND');
   });
 
-  test('an identical KNOWN item gives KNOWN, ahead of a SENT one', async () => {
+  test('a KNOWN ledger item is not a candidate (KNOWN needs a contents row)', async () => {
     const { add } = await setup();
     const data = bytes(100 * KIB, 3);
-    await add(data, { state: 'SENT' });
-    await add(data, { state: 'KNOWN' });
-    expect(await checkKnown(pgh.pool, await add(data))).toEqual({
-      state: 'KNOWN',
-      sha256: sha(data),
+    await add(data, { state: 'KNOWN', sha: sha(data) });
+    expect((await checkKnown(pgh.pool, await add(data))).state).toBe('SEND');
+  });
+
+  test('a small candidate with a stored sha but no head is compared without a read', async () => {
+    const { add } = await setup();
+    const data = bytes(1000, 3);
+    const winner = await add(data, { state: 'SENT', sha: sha(data) });
+    await pgh.pool.query('UPDATE harvest_sources SET last_mount_path = NULL');
+    const item = await add(data);
+    expect(await checkKnown(pgh.pool, item)).toMatchObject({
+      state: 'DUP',
+      duplicateOf: winner.id,
     });
   });
 

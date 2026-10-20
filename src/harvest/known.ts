@@ -29,7 +29,7 @@ export interface KnownOptions {
 
 interface Candidate {
   id: string;
-  state: 'SENT' | 'PLANNED' | 'KNOWN';
+  state: 'SENT' | 'PLANNED';
   kind: 'photo' | 'maybe';
   sha256: string | null;
   head_hash: string | null;
@@ -136,25 +136,20 @@ export async function checkKnown(
       `SELECT i.id::text AS id, i.state, i.kind, i.sha256, i.head_hash, i.rel_path,
               s.last_mount_path AS mount
        FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
-       WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED','KNOWN')`,
+       WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED')`,
       [item.sizeBytes.toString(), item.id],
     );
     const mine = order(item.kind, item.id);
     const candidates = rows
       .filter((c) => c.state !== 'PLANNED' || cmp(order(c.kind, c.id), mine) < 0)
-      .sort((a, b) => {
-        const known = Number(b.state === 'KNOWN') - Number(a.state === 'KNOWN');
-        return known !== 0 ? known : cmp(order(a.kind, a.id), order(b.kind, b.id));
-      });
+      .sort((a, b) => cmp(order(a.kind, a.id), order(b.kind, b.id)));
 
     for (const c of candidates) {
       if (
         await sameBytes(pool, c, item.sizeBytes, { cur, ensureHead, ensureSha, theirs: fullHash })
       ) {
         const s = cur.sha!;
-        return c.state === 'KNOWN'
-          ? { state: 'KNOWN', sha256: s }
-          : { state: 'DUP', sha256: s, duplicateOf: c.id };
+        return { state: 'DUP', sha256: s, duplicateOf: c.id };
       }
     }
   } catch (e) {
@@ -189,6 +184,7 @@ async function sameBytes(
   const path = c.mount === null ? null : join(c.mount, c.rel_path);
   if (me.cur.sha !== null && theirSha !== null) return me.cur.sha === theirSha;
 
+  if (small) theirHead ??= theirSha;
   const myHead = await me.ensureHead();
   if (theirHead === null) {
     if (path === null) return false;
