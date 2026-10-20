@@ -38,6 +38,8 @@ export default defineConfig({
       exclude: [
         'src/fscheck.ts',
         'src/harvest/system.ts',
+        'src/harvest/host.ts',
+        'src/harvest/hostLogEnv.ts',
         'src/worker.ts',
         'src/decodeWorker.ts',
         'tools/corpus/{buildManifest,seed,verify,synth}.ts',
