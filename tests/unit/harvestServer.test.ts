@@ -670,6 +670,17 @@ describe('tree', () => {
     ).toBe(400);
   });
 
+  test('macOS refusing a listing is a 403 that says how to grant access', async () => {
+    for (const code of ['EPERM', 'EACCES']) {
+      const e = await setup({
+        deps: { listDir: () => Promise.reject(Object.assign(new Error(code), { code })) },
+      });
+      const r = await e.get(`/api/sources/${e.sourceId}/tree?path=`);
+      expect(r.status).toBe(403);
+      expect(JSON.stringify(r.json)).toContain('Removable Volumes');
+    }
+  });
+
   test('a read failure other than a missing folder is a 500', async () => {
     const e = await setup({
       deps: { listDir: () => Promise.reject(Object.assign(new Error('EIO'), { code: 'EIO' })) },

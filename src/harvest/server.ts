@@ -49,6 +49,12 @@ export interface HarvestServerDeps {
 const BODY_LIMIT = 1024 * 1024;
 const ACTIVE_STATES = "('scanning', 'sending', 'paused')";
 
+/** What the page shows when macOS refuses a listing (README: granting drive access). */
+export const PERMISSION_HINT =
+  'macOS does not let the harvester read this drive (permission denied). In System Settings → ' +
+  'Privacy & Security → Files & Folders, turn on Removable Volumes (or Network Volumes) for ' +
+  'pixel-magic-harvester, then run make harvest-stop and make harvest-start.';
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -488,6 +494,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === 'ENOENT' || code === 'ENOTDIR')
         throw new HttpError(404, `no such folder: ${path}`);
+      if (code === 'EPERM' || code === 'EACCES') throw new HttpError(403, PERMISSION_HINT);
       throw e;
     }
     const names = entries
