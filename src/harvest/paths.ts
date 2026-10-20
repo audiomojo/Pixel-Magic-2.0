@@ -47,6 +47,8 @@ export interface FsOps {
   unlink(path: string): Promise<void>;
   lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
   realpath(path: string): Promise<string>;
+  /** mtime as exact nanoseconds. */
+  mtimeNs(path: string): Promise<bigint>;
 }
 
 export const realFsOps: FsOps = {
@@ -58,6 +60,7 @@ export const realFsOps: FsOps = {
   unlink: (p) => fsp.unlink(p),
   lstat: (p) => fsp.lstat(p),
   realpath: (p) => fsp.realpath(p),
+  mtimeNs: async (p) => (await fsp.lstat(p, { bigint: true })).mtimeNs,
 };
 
 /** The only way harvest code writes to disk: each mutation is confined to the allowed roots. */
@@ -118,10 +121,16 @@ export class GuardedFs {
     await this.ops.chmod(await this.check(path), mode);
   }
 
-  /** Sets atime and mtime to `mtimeNs` (the double-precision seconds Node takes: ~µs). */
-  async utimesNs(path: string, mtimeNs: bigint): Promise<void> {
+  /**
+   * Sets atime and mtime to about `mtimeNs`. Node's utimes takes double seconds, so the result
+   * can differ by < 1 µs: returns the mtime actually on disk (read back), which is what an exact
+   * `mtime_ns` join against the pipeline's `files` row needs.
+   */
+  async utimesNs(path: string, mtimeNs: bigint): Promise<bigint> {
+    const real = await this.check(path);
     const s = Number(mtimeNs) / 1e9;
-    await this.ops.utimes(await this.check(path), s, s);
+    await this.ops.utimes(real, s, s);
+    return this.ops.mtimeNs(real);
   }
 
   async rename(from: string, to: string): Promise<void> {
