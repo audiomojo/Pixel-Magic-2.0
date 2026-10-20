@@ -26,11 +26,11 @@ export async function createRun(
       [dryRun],
     );
     const runId = run.rows[0]!.id;
-    for (const folderId of ids) {
+    for (const [position, folderId] of ids.entries()) {
       await c.query(
-        `INSERT INTO harvest_run_folders (run_id, folder_id, state) VALUES ($1, $2, 'queued')
-         ON CONFLICT DO NOTHING`,
-        [runId, folderId],
+        `INSERT INTO harvest_run_folders (run_id, folder_id, position, state)
+         VALUES ($1, $2, $3, 'queued') ON CONFLICT DO NOTHING`,
+        [runId, folderId, position],
       );
     }
     return runId;
@@ -45,8 +45,7 @@ export interface RunFolder {
 }
 
 /**
- * The run's folders in creation order. `harvest_run_folders` has no position column, so folder
- * id stands in for insertion order (equal for folders first seen by this run).
+ * The run's folders in selection order.
  */
 export async function runFolders(pool: pg.Pool, runId: string): Promise<RunFolder[]> {
   const { rows } = await pool.query<{
@@ -57,7 +56,7 @@ export async function runFolders(pool: pg.Pool, runId: string): Promise<RunFolde
   }>(
     `SELECT rf.folder_id::text AS folder_id, f.source_id::text AS source_id, f.rel_path, rf.state
      FROM harvest_run_folders rf JOIN harvest_folders f ON f.id = rf.folder_id
-     WHERE rf.run_id = $1 ORDER BY rf.folder_id`,
+     WHERE rf.run_id = $1 ORDER BY rf.position`,
     [runId],
   );
   return rows.map((r) => ({

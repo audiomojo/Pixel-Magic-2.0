@@ -274,33 +274,50 @@ export function makeScanFolder(deps: HarvestDeps) {
     if (mount === null) return result('SOURCE_GONE');
     const rootAbs = folderComps.length ? join(mount, ...folderComps) : mount;
 
-    // DirContext from the source root down to the folder, so the folder's own rules are right.
+    // The mount root's device id at the start: a replacement directory left at the mount point
+    // after an unplug has another one, so "exists" alone does not mean "still mounted".
+    const mountDev = await lstat(mount, { bigint: true }).then(
+      (m) => m.dev,
+      () => null,
+    );
+    if (mountDev === null) return result('SOURCE_GONE');
+    const mountAlive = (): Promise<boolean> =>
+      lstat(mount, { bigint: true }).then(
+        (m) => m.dev === mountDev,
+        () => false,
+      );
+
+    /** Ends the folder without walking (pruned ancestor, missing folder): state done. */
+    const finishNow = async (): Promise<ScanFolderResult> => {
+      await pool.query(
+        `UPDATE harvest_run_folders
+         SET state = 'done', scan_cursor = $3, errors = $4, junk = $5::jsonb
+         WHERE run_id = $1 AND folder_id = $2`,
+        [runId, folderId, folder.rel_path, total.errors, JSON.stringify(total.junk)],
+      );
+      return result('DONE');
+    };
+
+    // DirContext from the source root down to the folder's parent; visit derives the folder's
+    // own. An error here is counted once (not again when a retry resumes).
     let ctx: DirContext = ROOT_CONTEXT;
-    let pruned = false;
     let dir = mount;
-    for (const name of folderComps) {
-      if (!keepDir(ctx, name)) {
-        pruned = true;
-        break;
-      }
+    for (const [i, name] of folderComps.entries()) {
+      if (!keepDir(ctx, name)) return finishNow();
+      if (i === folderComps.length - 1) break;
       dir = join(dir, name);
       let own: Entry[];
       try {
         own = await listDir(dir);
       } catch (e) {
-        if (isGone(e)) return result('SOURCE_GONE');
-        total.errors++;
-        log.warn(`harvest scan: cannot read ${dir}: ${errText(e)}`);
-        own = [];
+        if (isGone(e) && !(await mountAlive())) return result('SOURCE_GONE');
+        if (cursor === null) total.errors++;
+        log.warn(
+          `harvest scan: ${isGone(e) ? 'folder not found' : 'cannot read'} ${dir}: ${errText(e)}`,
+        );
+        return finishNow(); // nothing below an unreadable ancestor is reachable
       }
       ctx = childContext(ctx, name, own);
-    }
-    if (pruned) {
-      await pool.query(
-        `UPDATE harvest_run_folders SET state = 'done', scan_cursor = $3 WHERE run_id = $1 AND folder_id = $2`,
-        [runId, folderId, folder.rel_path],
-      );
-      return result('DONE');
     }
 
     let current: string | null = cursor === null ? null : cursor.join('/');
@@ -313,20 +330,20 @@ export function makeScanFolder(deps: HarvestDeps) {
 
     /** Lists, classifies and upserts one directory; returns its sorted, kept subdirectories. */
     const visit = async (fr: Frame): Promise<Entry[] | 'gone'> => {
+      // Already committed by a previous attempt: the cursor or an ancestor of it.
+      const before = cursor !== null && isPrefix(fr.comps, cursor);
       let entries: Entry[];
       try {
         entries = await listDir(fr.abs);
       } catch (e) {
-        const rel = joinRel(fr.comps);
-        if (isGone(e)) {
-          const rootOk = await lstat(rootAbs).then(
-            () => true,
-            (err: unknown) => !isGone(err),
-          );
-          if (!rootOk) return 'gone';
-        }
+        if (isGone(e) && !(await mountAlive())) return 'gone';
+        if (before) return [];
         total.errors++;
-        log.warn(`harvest scan: cannot read directory ${rel}: ${errText(e)}`);
+        const what =
+          isGone(e) && fr.comps.length === folderComps.length
+            ? 'folder not found'
+            : 'cannot read directory';
+        log.warn(`harvest scan: ${what} ${joinRel(fr.comps)}: ${errText(e)}`);
         await commit(fr, []);
         return [];
       }
@@ -334,8 +351,6 @@ export function makeScanFolder(deps: HarvestDeps) {
       fr.ctx = dirCtx;
       const subdirs = entries.filter((e) => e.isDir && keepDir(dirCtx, e.name)).sort(byName);
 
-      // Skip what a previous attempt already committed (it is the cursor or an ancestor of it).
-      const before = cursor !== null && isPrefix(fr.comps, cursor);
       if (!before) {
         const delta: Counters = { dirs: 1, photos: 0, maybes: 0, junk: {}, errors: 0 };
         const cands: Candidate[] = [];
@@ -343,8 +358,9 @@ export function makeScanFolder(deps: HarvestDeps) {
         for (let i = 0; i < files.length; i += STAT_CONCURRENCY) {
           const chunk = files.slice(i, i + STAT_CONCURRENCY);
           const outs = await Promise.all(chunk.map((e) => judge(fr, dirCtx, e)));
+          if (outs.some((o) => o && 'gone' in o)) return 'gone'; // nothing of this directory is committed
           for (const o of outs) {
-            if (!o) continue;
+            if (!o || 'gone' in o) continue;
             if ('error' in o) {
               delta.errors++;
               log.warn(`harvest scan: ${o.error}`);
@@ -377,7 +393,9 @@ export function makeScanFolder(deps: HarvestDeps) {
       fr: Frame,
       dirCtx: DirContext,
       e: Entry,
-    ): Promise<{ error: string } | { verdict: Verdict; cand: Candidate | null } | null> => {
+    ): Promise<
+      { error: string } | { gone: true } | { verdict: Verdict; cand: Candidate | null } | null
+    > => {
       // Names that are not candidates are dropped before the stat: a drive holds far more of them.
       const probe = await classify({ name: e.name, size: Infinity }, dirCtx, 0, () =>
         Promise.resolve(null),
@@ -391,7 +409,7 @@ export function makeScanFolder(deps: HarvestDeps) {
           { name: e.name, size: Number(s.size) },
           dirCtx,
           settings.minSize,
-          () => readMake(abs as string),
+          () => (deps.readMake ?? readMake)(abs as string),
         );
         if (verdict.kind !== 'photo' && verdict.kind !== 'maybe') return { verdict, cand: null };
         const nfc = rel.normalize('NFC');
@@ -407,6 +425,7 @@ export function makeScanFolder(deps: HarvestDeps) {
           },
         };
       } catch (err) {
+        if (isGone(err) && !(await mountAlive())) return { gone: true };
         return { error: `cannot read ${rel}: ${errText(err)}` };
       }
     };
@@ -445,7 +464,11 @@ export function makeScanFolder(deps: HarvestDeps) {
     };
 
     try {
-      const stack: Frame[] = [{ comps: folderComps, abs: rootAbs, raw: null, ctx }];
+      const stack: Frame[] = [
+        folderComps.length
+          ? { comps: folderComps, abs: rootAbs, raw: null, parentCtx: ctx }
+          : { comps: folderComps, abs: rootAbs, raw: null, ctx },
+      ];
       while (stack.length) {
         signal.throwIfAborted();
         const fr = stack.pop()!;

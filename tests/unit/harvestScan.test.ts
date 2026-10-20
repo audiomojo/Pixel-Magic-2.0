@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { createHarvestActivities, type HarvestDeps } from '../../src/harvest/activities.js';
 import { loadHarvestSettings } from '../../src/harvest/config.js';
+import { readMake } from '../../src/harvest/exifMake.js';
 import { createRun, runFolders } from '../../src/harvest/runs.js';
 import { byName, rawRelPath, upsertBatch, type ScanFolderResult } from '../../src/harvest/scan.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
@@ -327,6 +328,34 @@ describe('scanFolder', () => {
     }
   });
 
+  test('resuming with an unreadable directory at the cursor keeps the counts', async () => {
+    if (isRoot) return;
+    const env = await setup({ 'a/1.cr2': 500, 'locked/2.cr2': 500, 'z/3.cr2': 500 });
+    const locked = join(env.root, 'locked');
+    await chmod(locked, 0o000);
+    try {
+      const whole = await env.scan();
+      expect(whole.res).toMatchObject({ errors: 1, dirs: 3, photos: 2 });
+      let n = 0;
+      const { runId, folderId } = await env.newRun();
+      const crashing = createHarvestActivities({
+        ...env.deps,
+        checkpoint: () => {
+          if (++n === 3) throw new Error('crash');
+        },
+      }).scanFolder;
+      await expect(runActivity(crashing, [runId, folderId])).rejects.toThrow('crash');
+      expect((await counters(runId)).scan_cursor).toBe('locked');
+      const res = await runActivity(createHarvestActivities(env.deps).scanFolder, [
+        runId,
+        folderId,
+      ]);
+      expect(res).toEqual(whole.res);
+    } finally {
+      await chmod(locked, 0o755);
+    }
+  });
+
   test('a file whose EXIF cannot be read is counted as an error and not recorded', async () => {
     if (isRoot) return;
     const env = await setup({ 'd/p.jpg': jpegWithMake('Canon', 300), 'd/q.cr2': 500 });
@@ -347,7 +376,7 @@ describe('scanFolder', () => {
     await chmod(locked, 0o000);
     try {
       const { res } = await env.scan('locked/sub');
-      expect(res).toMatchObject({ outcome: 'DONE', photos: 0, errors: 3 });
+      expect(res).toMatchObject({ outcome: 'DONE', photos: 0, errors: 1 });
     } finally {
       await chmod(locked, 0o755);
     }
@@ -407,12 +436,49 @@ describe('scanFolder', () => {
     expect((await counters(runId)).state).toBe('scanning');
   });
 
-  test('SOURCE_GONE when the folder root gives ENOENT', async () => {
+  test('a missing folder on a live drive is an error, not SOURCE_GONE', async () => {
     const env = await setup({ 'a/x.cr2': 500 });
-    expect((await env.scan('missing')).res.outcome).toBe('SOURCE_GONE');
-    expect((await env.scan('a/missing')).res.outcome).toBe('SOURCE_GONE');
-    await rm(join(env.root, 'a'), { recursive: true });
+    for (const rel of ['missing', 'a/missing', 'nope/sub']) {
+      const { runId, res } = await env.scan(rel);
+      expect(res).toMatchObject({ outcome: 'DONE', dirs: 0, errors: 1 });
+      expect(await counters(runId)).toMatchObject({ state: 'done', errors: 1 });
+    }
+  });
+
+  test('SOURCE_GONE when the mount root itself is gone', async () => {
+    const env = await setup({ 'a/x.cr2': 500 });
+    await rm(env.root, { recursive: true });
     expect((await env.scan('a')).res.outcome).toBe('SOURCE_GONE');
+    expect((await env.scan('')).res.outcome).toBe('SOURCE_GONE');
+  });
+
+  test('an unplug part-way through a directory commits nothing of it; a resume records it all', async () => {
+    const spec: TreeSpec = { 'a/1.cr2': 500 };
+    for (let i = 0; i < 40; i++) spec[`docs/p${i}.jpg`] = jpegWithMake('Canon', 300);
+    const env = await setup(spec);
+    const backup = join(await tmpDir(), 'Drive');
+    const { runId, folderId } = await env.newRun();
+    let unplugged = false;
+    const act = createHarvestActivities({
+      ...env.deps,
+      readMake: async (p) => {
+        if (!unplugged) {
+          unplugged = true;
+          await rename(env.root, backup);
+        }
+        return readMake(p);
+      },
+    }).scanFolder;
+    const gone = await runActivity(act, [runId, folderId]);
+    expect(gone.outcome).toBe('SOURCE_GONE');
+    expect(gone.errors).toBe(0);
+    expect((await items()).map((r) => r.rel_path)).toEqual(['a/1.cr2']);
+    expect((await counters(runId)).scan_cursor).toBe('a');
+
+    await rename(backup, env.root);
+    const done = await runActivity(createHarvestActivities(env.deps).scanFolder, [runId, folderId]);
+    expect(done).toMatchObject({ outcome: 'DONE', photos: 41, errors: 0 });
+    expect(await items()).toHaveLength(41);
   });
 
   test('SOURCE_GONE when the drive disappears mid-walk, and the scan resumes later', async () => {
@@ -598,6 +664,23 @@ describe('raw path encoding', () => {
 });
 
 describe('runs', () => {
+  test('runFolders returns selection order even when ids are reversed', async () => {
+    const sources = await registerSources(pgh.pool, [
+      { identity: 'local:P', labelBase: 'P', kind: 'local', mountPath: '/Volumes/P' },
+    ]);
+    const sid = sources[0]!.id;
+    await createRun(pgh.pool, [{ sourceId: sid, relPath: 'low' }], false);
+    const run = await createRun(
+      pgh.pool,
+      [
+        { sourceId: sid, relPath: 'new' },
+        { sourceId: sid, relPath: 'low' },
+      ],
+      false,
+    );
+    expect((await runFolders(pgh.pool, run)).map((f) => f.relPath)).toEqual(['new', 'low']);
+  });
+
   test('createRun upserts folders and runFolders lists them', async () => {
     const sources = await registerSources(pgh.pool, [
       { identity: 'local:R', labelBase: 'R', kind: 'local', mountPath: '/Volumes/R' },

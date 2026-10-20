@@ -21,6 +21,8 @@ export interface HarvestDeps {
   checkpoint?: (name: string) => void | Promise<void>;
   /** Passed to resolveMount; tests point `volumes` at a temp directory. */
   detectOpts?: DetectOptions;
+  /** EXIF Make reader override (tests inject faults). */
+  readMake?: (path: string) => Promise<string | null>;
   /** Scan heartbeat period (default 5 s); tests shorten it. */
   scanHeartbeatMs?: number;
 }

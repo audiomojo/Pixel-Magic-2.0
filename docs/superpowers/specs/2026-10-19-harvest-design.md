@@ -96,7 +96,7 @@ harvest_runs (id bigserial PK, workflow_id text UNIQUE, dry_run boolean,
   state text CHECK (state IN ('queued','scanning','sending','paused','done','cancelled','failed')),
   paused_reason text, paused_since timestamptz, created_at, started_at, finished_at, error text)
 
-harvest_run_folders (run_id FK, folder_id FK, state text /* queued|scanning|sending|waiting_source|done */,
+harvest_run_folders (run_id FK, folder_id FK, position int /* selection order */, state text /* queued|scanning|sending|waiting_source|done */,
   dirs bigint, photos bigint, maybes bigint, junk jsonb /* reason → count */, errors bigint,
   sent bigint, known bigint, dups bigint, bytes_sent bigint, scan_cursor text,
   PRIMARY KEY (run_id, folder_id))

@@ -41,6 +41,7 @@ CREATE TABLE harvest_runs (
 CREATE TABLE harvest_run_folders (
   run_id     bigint NOT NULL REFERENCES harvest_runs(id) ON DELETE CASCADE,
   folder_id  bigint NOT NULL REFERENCES harvest_folders(id) ON DELETE CASCADE,
+  position   int NOT NULL,                -- selection order within the run
   state      text NOT NULL DEFAULT 'queued',
   dirs       bigint NOT NULL DEFAULT 0,
   photos     bigint NOT NULL DEFAULT 0,
