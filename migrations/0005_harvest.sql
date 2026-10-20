@@ -27,6 +27,7 @@ CREATE TABLE harvest_runs (
   id           bigserial PRIMARY KEY,
   workflow_id  text UNIQUE,
   dry_run      boolean NOT NULL DEFAULT false,
+  send_only    boolean NOT NULL DEFAULT false,   -- review approvals: send PLANNED items, no scan
   state        text NOT NULL,
   paused_reason text,
   paused_since timestamptz,

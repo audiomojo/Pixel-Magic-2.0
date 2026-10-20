@@ -287,13 +287,10 @@ describe('copy protocol', () => {
       /^(promises|open|openSync|writeFile|writeFileSync|appendFile|rename|renameSync|chmod|lchmod|utimes|lutimes|futimes|unlink|unlinkSync|rm|rmSync|rmdir|mkdir|mkdirSync|mkdtemp|copyFile|copyFileSync|cp|link|symlink|truncate|ftruncate|createWriteStream|chown|lchown)$/;
     // system.ts runs `mount` and `diskutil` (read-only probes): the one child_process user.
     const CHILD_PROCESS_ALLOWED = new Set(['system.ts']);
-    // logRotate.ts renames and removes the harvester's own log files under DATA_DIR/logs (never a
-    // source, never the drop zone): the one allow-listed writer outside GuardedFs.
-    const FS_WRITE_ALLOWED = new Set(['paths.ts', 'logRotate.ts']);
     const dir = 'src/harvest';
     const offenders: string[] = [];
     const files = (await readdir(dir, { recursive: true })).filter(
-      (f) => /\.(ts|js)$/.test(f) && !FS_WRITE_ALLOWED.has(f),
+      (f) => /\.(ts|js)$/.test(f) && f !== 'paths.ts',
     );
     expect(files.length).toBeGreaterThan(5);
     for (const f of files) {

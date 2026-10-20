@@ -2,7 +2,13 @@ import { WorkflowExecutionAlreadyStartedError, type Client } from '@temporalio/c
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createHarvestActivities, type RunControl } from '../../src/harvest/activities.js';
 import { temporalRunControl } from '../../src/harvest/control.js';
-import { createRun, loadRun, setRunState, startNextQueued } from '../../src/harvest/runs.js';
+import {
+  createRun,
+  finishRunRows,
+  loadRun,
+  setRunState,
+  startNextQueued,
+} from '../../src/harvest/runs.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
 let pgh: PgHandle;
@@ -82,6 +88,29 @@ describe('loadRun', () => {
       folders: [{ relPath: 'a', state: 'queued' }],
     });
     await expect(loadRun(pgh.pool, '999999')).rejects.toThrow(/not found/);
+  });
+});
+
+describe('send-only runs', () => {
+  test('loadRun reports sendOnly; finishing one leaves folder history untouched', async () => {
+    const { rows } = await pgh.pool.query<{ id: string }>(
+      `INSERT INTO harvest_sources (identity, label, kind) VALUES ('i', 'D', 'local') RETURNING id::text AS id`,
+    );
+    const folder = [{ sourceId: rows[0]!.id, relPath: 'a' }];
+    const so = await createRun(pgh.pool, folder, { sendOnly: true });
+    const normal = await createRun(pgh.pool, folder, { dryRun: false });
+    expect(await loadRun(pgh.pool, so)).toMatchObject({ sendOnly: true, dryRun: false });
+    expect(await loadRun(pgh.pool, normal)).toMatchObject({ sendOnly: false });
+    await finishRunRows(pgh.pool, so, 'done');
+    const h = async (): Promise<{ last_harvested_at: Date | null; last_run_id: string | null }> =>
+      (
+        await pgh.pool.query<{ last_harvested_at: Date | null; last_run_id: string | null }>(
+          'SELECT last_harvested_at, last_run_id FROM harvest_folders',
+        )
+      ).rows[0]!;
+    expect(await h()).toEqual({ last_harvested_at: null, last_run_id: null });
+    await finishRunRows(pgh.pool, normal, 'done');
+    expect((await h()).last_harvested_at).not.toBeNull();
   });
 });
 

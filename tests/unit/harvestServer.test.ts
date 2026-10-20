@@ -49,6 +49,7 @@ interface Env {
   staticDir: string;
   dataDir: string;
   mounted: { value: boolean };
+  mountCalls: { value: number };
   temporal: { value: boolean };
   req(method: string, path: string, o?: ReqOpts): Promise<Res>;
   get(path: string): Promise<Res>;
@@ -80,17 +81,23 @@ async function setup(
     deps?: Partial<HarvestServerDeps>;
     control?: Partial<RunControl>;
     thumbCacheMb?: number;
+    statfs?: SystemProbe['statfs'];
   } = {},
 ): Promise<Env> {
   const root = await makeSourceTree(o.spec ?? TREE);
   const volumes = `${dirname(root)}/`;
   const mounted = { value: true };
+  const mountCalls = { value: 0 };
   const temporal = { value: true };
   const sys: SystemProbe = {
-    mountOutput: () =>
-      Promise.resolve(mounted.value ? `/dev/disk9s1 on ${root} (exfat, local, nodev)\n` : ''),
+    mountOutput: () => {
+      mountCalls.value++;
+      return Promise.resolve(
+        mounted.value ? `/dev/disk9s1 on ${root} (exfat, local, nodev)\n` : '',
+      );
+    },
     diskutilInfo: () => Promise.resolve({ VolumeUUID: 'U-1', VolumeName: 'Drive' }),
-    statfs: () => Promise.resolve({ blocks: 1000n, bavail: 600n, bsize: 4096n }),
+    statfs: o.statfs ?? (() => Promise.resolve({ blocks: 1000n, bavail: 600n, bsize: 4096n })),
   };
   const dataDir = await tmpDir();
   const layout = new DataLayout(dataDir);
@@ -180,6 +187,7 @@ async function setup(
     staticDir,
     dataDir,
     mounted,
+    mountCalls,
     temporal,
     req,
     get: (p) => req('GET', p),
@@ -353,6 +361,25 @@ describe('state, sources', () => {
   });
 });
 
+describe('drive sizes', () => {
+  test('a hung statfs cannot block /api/state; sizes are cached with the sources TTL', async () => {
+    let calls = 0;
+    const e = await setup({
+      statfs: () => {
+        calls++;
+        return new Promise(() => {});
+      },
+      deps: { statfsTimeoutMs: 50, sourcesTtlMs: 60_000 },
+    });
+    const t0 = Date.now();
+    const s = (await e.get('/api/state')).json.sources[0];
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(s).toMatchObject({ mounted: true, usedBytes: null, totalBytes: null });
+    await e.get('/api/state');
+    expect(calls).toBe(1);
+  });
+});
+
 describe('runs', () => {
   test('POST /api/runs creates a queued run and starts it when idle', async () => {
     const e = await setup();
@@ -453,6 +480,8 @@ describe('runs', () => {
     expect(await e.runState(q)).toBe('cancelled');
     expect(e.calls).toEqual([`cancel ${q}`]); // in case it was just offered to Temporal
     expect((await e.post(`/api/runs/${q}/pause`, {})).status).toBe(409);
+    const q2 = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: '' }], false);
+    expect((await e.post(`/api/runs/${q2}/resume`, {})).status).toBe(409); // not started yet
     expect((await e.post(`/api/runs/${q}/cancel`, {})).status).toBe(409);
     expect((await e.post('/api/runs/999/pause', {})).status).toBe(404);
     expect((await e.post('/api/runs/abc/pause', {})).status).toBe(404);
@@ -567,6 +596,45 @@ describe('tree', () => {
     expect((await e2.get(`/api/sources/${e2.sourceId}/tree`)).status).toBe(200);
   });
 
+  test('symlinked and pruned components are refused, in the tree and in POST /api/runs', async () => {
+    const e = await setup({
+      spec: {
+        ...TREE,
+        'Photos/inner': { symlink: '../DCIM' },
+        '.Trashes/501/x': 'dir',
+      },
+    });
+    const t = (p: string) => e.get(`/api/sources/${e.sourceId}/tree?path=${encodeURIComponent(p)}`);
+    for (const p of [
+      'link',
+      'link/x',
+      'Photos/inner',
+      'Photos/inner/100APPLE',
+      'node_modules',
+      'node_modules/pkg',
+    ])
+      expect((await t(p)).status, p).toBe(404);
+    expect((await t('Photos')).status).toBe(200);
+    for (const p of ['link', 'Photos/inner/100APPLE', 'node_modules/pkg', '.Trashes/501']) {
+      const r = await e.post('/api/runs', { folders: [{ sourceId: e.sourceId, relPath: p }] });
+      expect(r.status, p).toBe(400);
+    }
+    expect((await pgh.pool.query('SELECT 1 FROM harvest_runs')).rowCount).toBe(0);
+    // a missing folder is fine for a run (the scan reports it); an unmounted source is checked by name
+    expect(
+      (await e.post('/api/runs', { folders: [{ sourceId: e.sourceId, relPath: 'Nope' }] })).status,
+    ).toBe(200);
+    e.mounted.value = false;
+    expect(
+      (await e.post('/api/runs', { folders: [{ sourceId: e.sourceId, relPath: 'Photos' }] }))
+        .status,
+    ).toBe(200);
+    expect(
+      (await e.post('/api/runs', { folders: [{ sourceId: e.sourceId, relPath: 'node_modules' }] }))
+        .status,
+    ).toBe(400);
+  });
+
   test('a read failure other than a missing folder is a 500', async () => {
     const e = await setup({
       deps: { listDir: () => Promise.reject(Object.assign(new Error('EIO'), { code: 'EIO' })) },
@@ -624,6 +692,10 @@ describe('review', () => {
     const r = await e.post('/api/review', { itemIds: [a, b, c], action: 'send' });
     expect(r.json.changed).toBe(3);
     expect(e.calls).toEqual([`start ${r.json.runId}`]);
+    const so = await pgh.pool.query('SELECT send_only FROM harvest_runs WHERE id = $1', [
+      r.json.runId,
+    ]);
+    expect(so.rows[0].send_only).toBe(true);
     const { rows } = await pgh.pool.query(
       `SELECT f.rel_path, r.dry_run FROM harvest_run_folders rf
        JOIN harvest_folders f ON f.id = rf.folder_id JOIN harvest_runs r ON r.id = rf.run_id
@@ -634,6 +706,53 @@ describe('review', () => {
       { rel_path: '', dry_run: false },
       { rel_path: 'Pics', dry_run: false },
     ]);
+  });
+
+  test('approving at a source root queues a send-only run for that folder only', async () => {
+    const e = await setup();
+    const a = await item(e, 'top.png', 'REVIEW');
+    const r = await e.post('/api/review', { itemIds: [a], action: 'send' });
+    const { rows } = await pgh.pool.query(
+      `SELECT f.rel_path, r.send_only FROM harvest_run_folders rf
+       JOIN harvest_folders f ON f.id = rf.folder_id JOIN harvest_runs r ON r.id = rf.run_id
+       WHERE rf.run_id = $1`,
+      [r.json.runId],
+    );
+    expect(rows).toEqual([{ rel_path: '', send_only: true }]);
+    expect(await itemState(a)).toBe('PLANNED');
+    await pgh.pool.query('SELECT 1');
+    expect(
+      (
+        await pgh.pool.query(
+          'SELECT count(*)::int AS n FROM harvest_folders WHERE last_harvested_at IS NOT NULL',
+        )
+      ).rows[0].n,
+    ).toBe(0);
+  });
+
+  test('with a dry run active, approvals queue a send-only run instead of signalling', async () => {
+    const e = await setup();
+    const dry = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: '' }], true);
+    await setRunState(pgh.pool, dry, 'scanning');
+    const a = await item(e, 'Pics/a.png', 'REVIEW');
+    const r = await e.post('/api/review', { itemIds: [a], action: 'send' });
+    expect(r.json.runId).not.toBe(dry);
+    expect(e.calls).toEqual([]); // the dry run stays active, so the new run is only queued
+    expect(await e.runState(r.json.runId)).toBe('queued');
+    expect(await itemState(a)).toBe('PLANNED');
+  });
+
+  test('an active run that does not cover the approved folders is not signalled', async () => {
+    const e = await setup();
+    const act = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: 'Other' }], false);
+    await setRunState(pgh.pool, act, 'sending');
+    const a = await item(e, 'Pics/a.png', 'REVIEW');
+    const b = await item(e, 'Other/deep/b.png', 'REVIEW');
+    const r = await e.post('/api/review', { itemIds: [b], action: 'send' });
+    expect(r.json.runId).toBe(act); // covered by the Other folder
+    const r2 = await e.post('/api/review', { itemIds: [a], action: 'send' });
+    expect(r2.json.runId).not.toBe(act);
+    expect(e.calls).toEqual([`signal ${act} itemsApproved`]);
   });
 
   test('review by { sourceId, path } acts on that folder; nothing in REVIEW is a no-op', async () => {
@@ -744,8 +863,14 @@ describe('thumb', () => {
     const again = await e.get(`/api/thumb/${id}`);
     expect(again.body.equals(r.body)).toBe(true);
     expect(cached).toContain(id);
+    // a cached thumbnail needs no drive detection at all, even with the drive gone
+    const detections = e.mountCalls.value;
     e.mounted.value = false;
-    const ph = await e.get(`/api/thumb/${id}`);
+    expect((await e.get(`/api/thumb/${id}`)).body.equals(r.body)).toBe(true);
+    expect(e.mountCalls.value).toBe(detections);
+    // an uncached item on an unmounted source gets the placeholder
+    const other = await item(e, 'Pics/a.png', 'REVIEW', { size: 101 });
+    const ph = await e.get(`/api/thumb/${other}`);
     expect(ph.status).toBe(200);
     expect(ph.headers['content-type']).toBe('image/jpeg');
     expect(ph.headers['cache-control']).toBe('no-store');

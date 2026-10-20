@@ -30,7 +30,22 @@ const LOG_MAX_BYTES = 20 * 1024 * 1024;
 const LOG_KEEP = 5;
 
 let stopping = false;
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+let wake!: () => void;
+const stopped = new Promise<void>((r) => {
+  wake = r;
+});
+/** Sleeps `ms`, or until a stop signal arrives. */
+const sleep = (ms: number) => Promise.race([new Promise<void>((r) => setTimeout(r, ms)), stopped]);
+
+/** SIGTERM/SIGINT before the worker runs (stack down, still connecting): abort startup. */
+class StopRequested extends Error {}
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    // Once the worker runs, Runtime's own handler shuts it down and run() returns.
+    stopping = true;
+    wake();
+  });
+}
 
 /**
  * Retries `connect` with backoff (1 s doubling to 30 s) until it works or the process is
@@ -42,13 +57,15 @@ async function connectWithRetry<T>(what: string, connect: () => Promise<T>): Pro
   for (;;) {
     try {
       const c = await connect();
+      if (stopping) throw new StopRequested();
       if (failed) logger.info(`${what} is back`);
       return c;
     } catch (err) {
-      if (stopping) throw err;
+      if (stopping) throw new StopRequested();
       if (!failed) logger.warn({ err }, `${what} unavailable, retrying with backoff`);
       failed = true;
       await sleep(delay);
+      if (stopping) throw new StopRequested();
       delay = Math.min(delay * 2, 30_000);
     }
   }
@@ -175,12 +192,16 @@ async function main(): Promise<void> {
       { dataDir: settings.dataDir, port: settings.uiPort, queue: HARVEST_TASK_QUEUE },
       'harvester started',
     );
+    if (stopping) throw new StopRequested();
     const running = worker.run();
     startNextQueued(pool, control).catch((err: unknown) =>
       logger.warn({ err }, 'harvest: startNextQueued at startup failed'),
     );
     // SIGTERM/SIGINT make the worker shut down (Runtime's default signals), so run() returns.
     await running;
+  } catch (err) {
+    if (!(err instanceof StopRequested)) throw err;
+    logger.info('stop requested during startup');
   } finally {
     stopping = true;
     for (const t of timers) clearInterval(t);

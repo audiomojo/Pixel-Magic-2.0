@@ -3,14 +3,17 @@ import { withTx } from '../db.js';
 import type { RunControl } from './activities.js';
 
 /**
- * Creates a queued run over the given folders: upserts `harvest_folders`, then the run and its
+ * Creates a queued run over the given folders (`sendOnly`: only PLANNED items under them are
+ * sent, nothing is scanned; used for review approvals): upserts `harvest_folders`, then the run and its
  * `harvest_run_folders` rows (all `queued`). Returns the run id.
  */
 export async function createRun(
   pool: pg.Pool,
   folders: { sourceId: string; relPath: string }[],
-  dryRun: boolean,
+  options: boolean | { dryRun?: boolean; sendOnly?: boolean },
 ): Promise<string> {
+  const { dryRun = false, sendOnly = false } =
+    typeof options === 'boolean' ? { dryRun: options } : options;
   return withTx(pool, async (c) => {
     const ids: string[] = [];
     for (const f of folders) {
@@ -23,8 +26,9 @@ export async function createRun(
       ids.push(rows[0]!.id);
     }
     const run = await c.query<{ id: string }>(
-      `INSERT INTO harvest_runs (dry_run, state) VALUES ($1, 'queued') RETURNING id::text AS id`,
-      [dryRun],
+      `INSERT INTO harvest_runs (dry_run, send_only, state) VALUES ($1, $2, 'queued')
+       RETURNING id::text AS id`,
+      [dryRun, sendOnly],
     );
     const runId = run.rows[0]!.id;
     for (const [position, folderId] of ids.entries()) {
@@ -108,7 +112,7 @@ export async function setRunState(
 
 /**
  * Ends a run (one transaction): its state, `finished_at` and error; for `done` (not a dry run)
- * also each folder's history — `last_harvested_at`, `last_run_id` and `last_counts` from the
+ * also (unless a dry or send-only run) each folder's history — `last_harvested_at`, `last_run_id` and `last_counts` from the
  * run's counters. Returns false if the run had already finished (a retry changes nothing).
  */
 export async function finishRunRows(
@@ -118,17 +122,17 @@ export async function finishRunRows(
   error: string | null = null,
 ): Promise<boolean> {
   return withTx(pool, async (c) => {
-    const run = await c.query<{ dry_run: boolean }>(
+    const run = await c.query<{ dry_run: boolean; send_only: boolean }>(
       `UPDATE harvest_runs
        SET state = $2, finished_at = clock_timestamp(), error = $3,
            paused_reason = NULL, paused_since = NULL
        WHERE id = $1 AND state NOT IN ('done', 'cancelled', 'failed')
-       RETURNING dry_run`,
+       RETURNING dry_run, send_only`,
       [runId, outcome, error],
     );
     const row = run.rows[0];
     if (!row) return false;
-    if (outcome === 'done' && !row.dry_run) {
+    if (outcome === 'done' && !row.dry_run && !row.send_only) {
       await c.query(
         `UPDATE harvest_folders f
          SET last_harvested_at = clock_timestamp(), last_run_id = rf.run_id,
@@ -149,13 +153,17 @@ export async function finishRunRows(
 export async function loadRun(
   pool: pg.Pool,
   runId: string,
-): Promise<{ dryRun: boolean; folders: RunFolder[] }> {
-  const { rows } = await pool.query<{ dry_run: boolean }>(
-    'SELECT dry_run FROM harvest_runs WHERE id = $1',
+): Promise<{ dryRun: boolean; sendOnly: boolean; folders: RunFolder[] }> {
+  const { rows } = await pool.query<{ dry_run: boolean; send_only: boolean }>(
+    'SELECT dry_run, send_only FROM harvest_runs WHERE id = $1',
     [runId],
   );
   if (!rows[0]) throw new Error(`harvest run ${runId} not found`);
-  return { dryRun: rows[0].dry_run, folders: await runFolders(pool, runId) };
+  return {
+    dryRun: rows[0].dry_run,
+    sendOnly: rows[0].send_only,
+    folders: await runFolders(pool, runId),
+  };
 }
 
 /**

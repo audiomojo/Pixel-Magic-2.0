@@ -127,24 +127,29 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
   async function body(): Promise<'done'> {
     if (phase === 'scan') {
       const run = await loadRun(runId);
-      await show('scanning');
-      for (const folder of run.folders) {
-        if (folder.state === 'done') continue;
-        for (;;) {
-          await userPause('scanning');
-          const res = await scanFolder(runId, folder.folderId);
-          if (res.outcome === 'DONE') {
-            await show('scanning');
-            break;
+      if (run.sendOnly) {
+        // Review approvals: the items are already PLANNED; nothing is scanned.
+        phase = 'send';
+      } else {
+        await show('scanning');
+        for (const folder of run.folders) {
+          if (folder.state === 'done') continue;
+          for (;;) {
+            await userPause('scanning');
+            const res = await scanFolder(runId, folder.folderId);
+            if (res.outcome === 'DONE') {
+              await show('scanning');
+              break;
+            }
+            await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
           }
-          await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
         }
+        if (run.dryRun) {
+          phase = 'done';
+          return 'done';
+        }
+        phase = 'send';
       }
-      if (run.dryRun) {
-        phase = 'done';
-        return 'done';
-      }
-      phase = 'send';
     }
 
     let batches = input.batches ?? 0;

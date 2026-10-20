@@ -35,6 +35,7 @@ interface Fakes {
   scan: (runId: string, folderId: string) => Promise<ScanFolderResult> | ScanFolderResult;
   send: () => Promise<SendBatchResult> | SendBatchResult;
   dryRun: boolean;
+  sendOnly: boolean;
   folders: { folderId: string; state: string }[];
 }
 function fakes(o: Partial<Fakes> = {}): Fakes {
@@ -43,6 +44,7 @@ function fakes(o: Partial<Fakes> = {}): Fakes {
     scan: () => SCAN_DONE,
     send: () => batch('DONE'),
     dryRun: false,
+    sendOnly: false,
     folders: [
       { folderId: 'f1', state: 'queued' },
       { folderId: 'f2', state: 'queued' },
@@ -61,6 +63,7 @@ const activities = {
     cur.calls.push(`loadRun ${runId}`);
     return Promise.resolve({
       dryRun: cur.dryRun,
+      sendOnly: cur.sendOnly,
       folders: cur.folders.map((f) => ({ sourceId: 's', relPath: '', ...f })),
     });
   },
@@ -159,6 +162,18 @@ test('scans every folder then sends until DONE then finishes', async () => {
     'state sending',
     'sendBatch',
     'sendBatch',
+    'sendBatch',
+    'finishRun done',
+    'startNextQueued',
+  ]);
+});
+
+test('a send-only run never scans and sends until DONE', async () => {
+  const f = fakes({ sendOnly: true });
+  expect(await run(f)).toBe('done');
+  expect(f.calls).toEqual([
+    'loadRun 7',
+    'state sending',
     'sendBatch',
     'finishRun done',
     'startNextQueued',
