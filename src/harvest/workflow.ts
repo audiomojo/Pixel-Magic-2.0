@@ -1,6 +1,8 @@
 // Workflow code: deterministic, bundled for the workflow sandbox. Only `@temporalio/workflow` and
 // type-only imports (plus pure constants) belong here.
 import {
+  ActivityCancellationType,
+  ApplicationFailure,
   CancellationScope,
   condition,
   ContinueAsNew,
@@ -8,6 +10,7 @@ import {
   defineQuery,
   defineSignal,
   isCancellation,
+  TemporalFailure,
   proxyActivities,
   setHandler,
   workflowInfo,
@@ -15,7 +18,7 @@ import {
   type RetryPolicy,
 } from '@temporalio/workflow';
 import type { createHarvestActivities } from './activities.js';
-import { STALLED_REASON } from './throttle.js';
+import { STALLED_REASON } from './constants.js';
 
 export const pauseSignal = defineSignal('pause');
 export const resumeSignal = defineSignal('resume');
@@ -36,12 +39,16 @@ export const HARVEST_ACTIVITY_OPTIONS = {
     taskQueue: 'harvest',
     startToCloseTimeout: '24h',
     heartbeatTimeout: '2m',
+    // The run must not be finished (and the next started) while the activity is still working.
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
     retry: TRANSIENT_RETRY,
   },
   sendBatch: {
     taskQueue: 'harvest',
     startToCloseTimeout: '2h',
     heartbeatTimeout: '2m',
+    // The run must not be finished (and the next started) while the activity is still working.
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
     retry: TRANSIENT_RETRY,
   },
   other: { taskQueue: 'harvest', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
@@ -99,16 +106,22 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     if (paused) {
       await show('paused', 'paused by you');
       await condition(() => !paused);
+      await show(work);
     }
-    await show(work);
   }
   /** Shows the pause, then waits for the timer or (promptly) a resume signal. */
-  async function waitPaused(reason: string, timeout?: string): Promise<void> {
+  async function waitPaused(
+    work: 'scanning' | 'sending',
+    reason: string,
+    timeout?: string,
+  ): Promise<void> {
     await show('paused', reason);
     const seen = resumes;
     const woke = () => resumes !== seen;
-    if (timeout === undefined) await condition(woke);
-    else await condition(woke, timeout);
+    if (timeout === undefined) {
+      await condition(woke);
+      await show(work);
+    } else await condition(() => woke() || paused, timeout);
   }
 
   async function body(): Promise<'done'> {
@@ -120,8 +133,11 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
         for (;;) {
           await userPause('scanning');
           const res = await scanFolder(runId, folder.folderId);
-          if (res.outcome === 'DONE') break;
-          await waitPaused(res.reason ?? 'source unplugged', SOURCE_RECHECK);
+          if (res.outcome === 'DONE') {
+            await show('scanning');
+            break;
+          }
+          await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
         }
       }
       if (run.dryRun) {
@@ -132,6 +148,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     }
 
     let batches = input.batches ?? 0;
+    await show('sending');
     for (;;) {
       await userPause('sending');
       if (batches >= BATCHES_PER_RUN || workflowInfo().historyLength > MAX_HISTORY) {
@@ -142,8 +159,10 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
       batches++;
       switch (res.outcome) {
         case 'MORE':
+          await show('sending');
           break;
         case 'DONE':
+          await show('sending');
           if (approved) {
             approved = false;
             break;
@@ -152,19 +171,22 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
           return 'done';
         case 'GATED':
           await waitPaused(
+            'sending',
             res.reason ?? 'waiting for the pipeline',
             res.reason === STALLED_REASON ? STALL_RECHECK : GATE_RECHECK,
           );
           break;
         case 'SOURCE_GONE':
-          await waitPaused(res.reason ?? 'source unplugged', SOURCE_RECHECK);
+          await waitPaused('sending', res.reason ?? 'source unplugged', SOURCE_RECHECK);
           break;
         case 'DISK_FULL':
-          await waitPaused(res.reason ?? 'disk full');
+          await waitPaused('sending', res.reason ?? 'disk full');
           break;
         case 'PAUSED_ERRORS':
-          await waitPaused(res.reason ?? 'too many errors');
+          await waitPaused('sending', res.reason ?? 'too many errors');
           break;
+        default:
+          throw new Error(`unexpected sendBatch outcome: ${String(res.outcome)}`);
       }
     }
   }
@@ -185,6 +207,9 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
       }
       await startNextQueued();
     });
-    throw err;
+    // A Temporal failure (cancellation, activity failure) already fails the workflow; any other
+    // error is a bug, which would otherwise retry the workflow task forever.
+    if (cancelled || err instanceof TemporalFailure) throw err;
+    throw ApplicationFailure.nonRetryable(err instanceof Error ? err.message : String(err));
   }
 }

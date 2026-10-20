@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { ApplicationFailure } from '@temporalio/activity';
+import { ApplicationFailure, Context } from '@temporalio/activity';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { bundleWorkflowCode, DefaultLogger, Runtime, Worker } from '@temporalio/worker';
 import {
@@ -193,8 +193,8 @@ test('GATED sleeps 30 s and retries', async () => {
   expect(i).toBeGreaterThan(0);
   expect(f.calls.slice(i, i + 3)).toEqual([
     'state paused: disk 81 %',
-    'state sending',
     'sendBatch',
+    'state sending',
   ]);
 });
 
@@ -266,8 +266,8 @@ test('SOURCE_GONE during scan pauses and retries the same folder', async () => {
   expect(f.calls.slice(i, i + 4)).toEqual([
     'scanFolder f1',
     'state paused: Drive unplugged',
-    'state scanning',
     'scanFolder f1',
+    'state scanning',
   ]);
 });
 
@@ -348,4 +348,71 @@ test('starting with phase send skips the scan', async () => {
   await run(f, { runId: '9', phase: 'send', batches: 0 });
   expect(f.calls.some((c) => c.startsWith('scanFolder'))).toBe(false);
   expect(count(f, 'sendBatch')).toBe(1);
+});
+
+test('repeated GATED with one reason writes one paused row and no sending until progress', async () => {
+  let n = 0;
+  const f = fakes({ send: () => (n++ < 3 ? batch('GATED', 'disk 81 %') : batch('MORE')) });
+  const after = f.send;
+  f.send = () => (n >= 5 ? batch('DONE') : after());
+  await run(f);
+  const i = f.calls.indexOf('state paused: disk 81 %');
+  expect(f.calls.filter((c) => c.startsWith('state paused'))).toHaveLength(1);
+  expect(f.calls.slice(i, i + 5)).toEqual([
+    'state paused: disk 81 %',
+    'sendBatch',
+    'sendBatch',
+    'sendBatch',
+    'state sending',
+  ]);
+});
+
+test('a pause during a gate sleep is honoured before the next batch', async () => {
+  let n = 0;
+  const f = fakes({ send: () => (n++ === 0 ? batch('GATED', 'disk 81 %') : batch('DONE')) });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('state paused: disk 81 %'));
+  await h.signal('pause');
+  await until(f, (c) => c.includes('state paused: paused by you'));
+  await new Promise((r) => setTimeout(r, 300));
+  expect(count(f, 'sendBatch')).toBe(1);
+  await h.signal('resume');
+  expect(await h.result()).toBe('done');
+});
+
+test('cancel waits for the in-flight sendBatch before finishRun(cancelled)', async () => {
+  const f = fakes({
+    send: async () => {
+      const ctx = Context.current();
+      const beat = setInterval(() => ctx.heartbeat(), 50);
+      try {
+        await ctx.cancelled;
+      } catch {
+        // cancelled: clean up slowly
+      } finally {
+        clearInterval(beat);
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      f.calls.push('sendBatch returned');
+      return batch('DONE');
+    },
+  });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('sendBatch'));
+  await h.cancel();
+  await expect(h.result()).rejects.toBeInstanceOf(WorkflowFailedError);
+  expect(f.calls.slice(-3)).toEqual([
+    'sendBatch returned',
+    'finishRun cancelled',
+    'startNextQueued',
+  ]);
+});
+
+test('a non-Temporal error finishes the run failed and fails the workflow', async () => {
+  const f = fakes({ send: () => batch('WEIRD' as SendBatchResult['outcome']) });
+  await expect(run(f)).rejects.toBeInstanceOf(WorkflowFailedError);
+  expect(f.calls.slice(-2)).toEqual([
+    'finishRun failed: unexpected sendBatch outcome: WEIRD',
+    'startNextQueued',
+  ]);
 });

@@ -1,10 +1,11 @@
 import type { HarvestDeps } from './activities.js';
+import { STALLED_REASON } from './constants.js';
 
 export type Gate = { open: true } | { open: false; reason: string; stalled: boolean };
 
 const STALL_AFTER_MS = 10 * 60_000;
 const SENT_WINDOW_MS = 60 * 60_000;
-export const STALLED_REASON = 'stalled: the vault is filling the disk';
+export { STALLED_REASON };
 
 function formatBytes(n: number): string {
   if (n < 1000) return `${n} B`;
