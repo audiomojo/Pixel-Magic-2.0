@@ -293,7 +293,7 @@ describe('copy protocol', () => {
     const MUT =
       /^(promises|open|openSync|writeFile|writeFileSync|appendFile|rename|renameSync|chmod|lchmod|utimes|lutimes|futimes|unlink|unlinkSync|rm|rmSync|rmdir|mkdir|mkdirSync|mkdtemp|copyFile|copyFileSync|cp|link|symlink|truncate|ftruncate|createWriteStream|chown|lchown)$/;
     // system.ts runs `mount` and `diskutil` (read-only probes); cli.ts runs `/bin/launchctl`
-    // (it never receives a source path).
+    // and the harvester's Node copy with --version (it never receives a source path).
     const CHILD_PROCESS_ALLOWED = new Set(['system.ts', 'cli.ts']);
     const dir = 'src/harvest';
     const offenders: string[] = [];

@@ -74,14 +74,27 @@ Files whose bytes are already in the vault are not copied.
     make harvest-start       # load it again
     make harvester           # run in the foreground; needs `make harvest-stop` first
 
-**Grant the harvester access to your drives** (once, and again after a Node upgrade): macOS
-only lets a process read external drives and network shares when it has permission. In
-**System Settings → Privacy & Security → Full Disk Access**, press **+** and add the `node`
-binary the harvester runs (or allow it under **Files and Folders → Removable Volumes** and
-**Network Volumes**). Its path is the "node" line of `make harvest-status`, or `which node` for
-a foreground `make harvester`; in the file picker press ⌘⇧G and paste the path. Without it a
-run pauses with "cannot read <drive>/<folder>: permission denied" and marks nothing as
-harvested: grant the access, then press **Resume**.
+**Grant the harvester access to your drives** (least privilege). macOS grants drive access
+per program, so the agent does not run your usual `node`: `make harvest-install` copies it to
+`~/Library/Application Support/PixelMagic/harvester/pixel-magic-harvester`, which nothing else
+runs. Give that copy **only** Removable Volumes and Network Volumes access, **not Full Disk
+Access** (which would also open your home folder and other apps' data):
+
+1. After installing, open the page, pick each drive and open a folder. macOS asks whether
+   "pixel-magic-harvester" may access files on a removable volume (or a network volume):
+   press **Allow**.
+2. Check **System Settings → Privacy & Security → Files & Folders →
+   pixel-magic-harvester**: **Removable Volumes** and **Network Volumes** should be on.
+3. If no prompt appears and the page shows "cannot read <drive>/<folder>: permission
+   denied", turn them on there (if pixel-magic-harvester is not listed yet, run
+   `make harvest-stop` and `make harvest-start`, then open a folder again), then press
+   **Resume**. A run without access pauses and marks nothing as harvested.
+
+The `node` line of `make harvest-status` names the binary to grant. A reinstall with the same
+Node keeps the copy (and its grant); after a Node upgrade `make harvest-status` says the
+runtime is out of date: run `make harvest-install`, then grant access again (step 1).
+`make harvest-uninstall` removes the copy. A foreground `make harvester` runs your usual
+`node` from Terminal, which uses Terminal's own access.
 
 The page is at <http://127.0.0.1:3020> (this Mac only). Pick a drive, tick folders (or the
 whole drive) and press **Start harvest**, or **Dry run** to see what would be sent first. A
@@ -118,7 +131,8 @@ changing one.
 
 Logs: `DATA_DIR/logs/harvester.log` (rotated by size) and, for crashes only,
 `DATA_DIR/logs/harvester.launchd.log`. **After a Node upgrade (or moving the repo) run
-`make harvest-install` again**: the agent records the absolute Node path it was installed with.
+`make harvest-install` again**: the agent runs its own copy of Node and the repo path it was
+installed with.
 Design: `docs/superpowers/specs/2026-10-19-harvest-design.md`.
 
 ## Upgrading

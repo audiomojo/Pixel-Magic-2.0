@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,9 @@ const deps = () => ({
   launchctl: runner,
   agentsDir: join(dir, 'LaunchAgents'),
   uid: 501,
-  node: '/opt/node/bin/node',
+  node: join(dir, 'opt', 'bin', 'node'),
+  runtimeDir: join(dir, 'run&time'),
+  checkRuntime: () => Promise.resolve('v0'),
   repo: '/repo',
   logDir: join(dir, 'logs'),
   sleep: () => Promise.resolve(),
@@ -34,6 +36,8 @@ function capture(): () => { out: string; err: string } {
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'harvest-cli-'));
+  await mkdir(join(dir, 'opt', 'bin'), { recursive: true });
+  await writeFile(join(dir, 'opt', 'bin', 'node'), 'node-v1');
   calls = [];
   result = [];
 });
@@ -50,9 +54,27 @@ test('install writes the plist, then boots out and bootstraps', async () => {
     ['bootstrap', 'gui/501', plist()],
   ]);
   const text = await readFile(plist(), 'utf8');
-  expect(text).toContain('/opt/node/bin/node');
+  expect(text).toContain(join(dir, 'run&amp;time', 'pixel-magic-harvester'));
+  expect(text).not.toContain(join(dir, 'opt', 'bin', 'node'));
+  expect(await readFile(join(dir, 'run&time', 'pixel-magic-harvester'), 'utf8')).toBe('node-v1');
   expect(text).toContain(join(dir, 'logs', 'harvester.launchd.log'));
   expect(got().out).toContain('installed');
+  expect(got().out).toContain('(new or updated: grant it drive access');
+});
+
+test('a reinstall keeps an unchanged runtime and says so', async () => {
+  const got = capture();
+  await run(['install'], deps());
+  await run(['install'], deps());
+  expect(got().out).toContain('pixel-magic-harvester (unchanged)');
+});
+
+test('install fails, without loading the agent, when the runtime copy does not start', async () => {
+  const got = capture();
+  const d = { ...deps(), checkRuntime: () => Promise.reject(new Error('cannot start')) };
+  expect(await run(['install'], d)).toBe(1);
+  expect(calls.filter((c) => c[0] === 'bootstrap')).toHaveLength(0);
+  expect(got().err).toContain('cannot start');
 });
 
 test('install is idempotent: a second run replaces the plist and succeeds', async () => {
@@ -149,6 +171,7 @@ test('uninstall boots out and removes the plist; twice is fine', async () => {
   expect(await run(['uninstall'], deps())).toBe(0);
   expect(calls).toEqual([['bootout', 'gui/501/com.pixelmagic.harvester']]);
   await expect(stat(plist())).rejects.toThrow();
+  await expect(stat(join(dir, 'run&time', 'pixel-magic-harvester'))).rejects.toThrow();
   result = [{ code: 3, stderr: 'No such process' }];
   expect(await run(['uninstall'], deps())).toBe(0);
 });
@@ -193,6 +216,7 @@ test('defaults: ~/Library/LaunchAgents, this uid and node, the repo and DATA_DIR
   expect(d.agentsDir).toMatch(/Library\/LaunchAgents$/);
   expect(d.uid).toBe(process.getuid!());
   expect(d.node).toBe(process.execPath);
+  expect(d.runtimeDir).toMatch(/Application Support\/PixelMagic\/harvester$/);
   expect(d.logDir).toMatch(/logs$/);
   expect(typeof d.launchctl).toBe('function');
   expect(d.repo).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
@@ -214,16 +238,25 @@ test('status on an empty database', async () => {
   expect(got().out).toContain('heartbeat: never');
 });
 
-test('status names the node binary to grant Full Disk Access (installed, else this one)', async () => {
+test('status names the runtime to grant drive access (installed, else this node)', async () => {
   await pgh.truncate();
   let got = capture();
   expect(await run(['status'], { ...deps(), pool: pgh.pool })).toBe(0);
-  expect(got().out).toContain('node: /opt/node/bin/node (not installed)');
+  expect(got().out).toContain(`node: ${join(dir, 'opt', 'bin', 'node')} (not installed)`);
   vi.restoreAllMocks();
-  expect(await run(['install'], { ...deps(), node: '/usr/local/bin/node&x' })).toBe(0);
+  capture();
+  expect(await run(['install'], deps())).toBe(0);
+  vi.restoreAllMocks();
   got = capture();
   expect(await run(['status'], { ...deps(), pool: pgh.pool })).toBe(0);
-  expect(got().out).toContain('node: /usr/local/bin/node&x (grant it Full Disk Access)');
+  const rt = join(dir, 'run&time', 'pixel-magic-harvester');
+  expect(got().out).toContain(`node: ${rt} (grant it Removable Volumes and Network Volumes access`);
+  expect(got().out).not.toContain('out of date');
+  await writeFile(join(dir, 'opt', 'bin', 'node'), 'node-v2');
+  vi.restoreAllMocks();
+  got = capture();
+  await run(['status'], { ...deps(), pool: pgh.pool });
+  expect(got().out).toContain('runtime: out of date with this Node; run make harvest-install');
 });
 
 test('status shows the active run, counts, gate and heartbeat', async () => {

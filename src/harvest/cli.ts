@@ -1,6 +1,6 @@
 // Harvester operations: `install` / `uninstall` the launchd agent, `status` summary (spec §13).
-// The plist is the one write outside DATA_DIR, so it goes through a GuardedFs confined to the
-// LaunchAgents directory. `launchctl` is called through an injectable runner.
+// The plist and the harvester's own Node copy (runtime.ts) are the writes outside DATA_DIR, each
+// through a GuardedFs confined to its directory. `launchctl` is called through an injectable runner.
 import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -12,6 +12,14 @@ import { createPool } from '../db.js';
 import { loadHarvestSettings } from './config.js';
 import { LABEL, renderPlist } from './launchd.js';
 import { GuardedFs } from './paths.js';
+import {
+  defaultRuntimeDir,
+  installRuntime,
+  removeRuntime,
+  runtimeMatches,
+  RUNTIME_NAME,
+  type RuntimeCheck,
+} from './runtime.js';
 
 export const LAUNCHCTL = '/bin/launchctl';
 
@@ -22,8 +30,12 @@ export interface CliDeps {
   /** Where the plist goes; default `~/Library/LaunchAgents`. */
   agentsDir?: string;
   uid?: number;
-  /** Absolute Node binary recorded in the plist; default `process.execPath`. */
+  /** The Node binary the harvester's copy is made from; default `process.execPath`. */
   node?: string;
+  /** Where the harvester's Node copy goes; default `~/Library/Application Support/PixelMagic/harvester`. */
+  runtimeDir?: string;
+  /** Checks the copy starts; tests inject a fake. */
+  checkRuntime?: RuntimeCheck;
   repo?: string;
   logDir?: string;
   /** Delay between bootstrap retries; tests inject a no-op. */
@@ -44,6 +56,20 @@ export const makeLaunchctl =
       });
     });
 
+/** Runs `<path> --version` (the harvester's Node copy, never a source path). */
+export const runVersion: RuntimeCheck = (path) =>
+  new Promise((done, fail) => {
+    const bad = (why: string) => fail(new Error(`${path} does not start: ${why}`));
+    try {
+      execFile(path, ['--version'], { timeout: 30_000 }, (err, stdout, stderr) => {
+        if (err) bad(stderr.trim() || err.message);
+        else done(stdout.trim());
+      });
+    } catch (e) {
+      bad(e instanceof Error ? e.message : String(e)); // spawn errors such as ENOEXEC throw
+    }
+  });
+
 const out = (line: string) => process.stdout.write(line + '\n');
 const fail = (line: string) => process.stderr.write(line + '\n');
 
@@ -61,6 +87,8 @@ export function withDefaults(d: CliDeps): Required<Omit<CliDeps, 'pool'>> {
     agentsDir: d.agentsDir ?? join(homedir(), 'Library', 'LaunchAgents'),
     uid: d.uid ?? process.getuid!(),
     node: d.node ?? process.execPath,
+    runtimeDir: d.runtimeDir ?? defaultRuntimeDir(),
+    checkRuntime: d.checkRuntime ?? runVersion,
     repo: d.repo ?? REPO_ROOT,
     logDir: d.logDir ?? join(loadHarvestSettings().dataDir, 'logs'),
     sleep: d.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
@@ -90,11 +118,15 @@ async function bootstrap(
 
 async function install(deps: CliDeps): Promise<number> {
   const d = withDefaults(deps);
-  const { launchctl, agentsDir: dir, uid, node, repo, logDir } = d;
+  const { launchctl, agentsDir: dir, uid, repo, logDir } = d;
   const target = join(dir, `${LABEL}.plist`);
   const domain = `gui/${String(uid)}`;
 
   await new GuardedFs([logDir]).mkdirp(logDir);
+  // Unload first, so the old process is gone before its runtime is replaced.
+  await launchctl(['bootout', `${domain}/${LABEL}`]);
+  const runtime = await installRuntime(d.node, d.runtimeDir, d.checkRuntime);
+  const node = runtime.path;
   const agents = new GuardedFs([dir]);
   await agents.mkdirp(dir);
   // Reinstall: replace the old plist (the guarded open never overwrites).
@@ -108,24 +140,27 @@ async function install(deps: CliDeps): Promise<number> {
     await fh.close();
   }
 
-  // Idempotent: unload whatever is loaded (failure = nothing was), then load the new plist.
-  await launchctl(['bootout', `${domain}/${LABEL}`]);
+  // Idempotent: the bootout above unloaded whatever was loaded (failure = nothing was).
   const err = await bootstrap(d, target);
   if (err !== null) {
     fail(`launchctl bootstrap failed: ${err}`);
     return 1;
   }
   out(`installed ${target}; the harvester starts now and at every login`);
+  out(
+    `runtime: ${node}${runtime.changed ? ' (new or updated: grant it drive access, see README)' : ' (unchanged)'}`,
+  );
   return 0;
 }
 
 async function uninstall(deps: CliDeps): Promise<number> {
-  const { launchctl, agentsDir: dir, uid } = withDefaults(deps);
+  const { launchctl, agentsDir: dir, uid, runtimeDir } = withDefaults(deps);
   const r = await launchctl(['bootout', `gui/${String(uid)}/${LABEL}`]);
   if (r.code !== 0 && !notLoaded(r)) {
     fail(`launchctl bootout failed: ${r.stderr.trim()}`);
     return 1;
   }
+  await removeRuntime(runtimeDir);
   await new GuardedFs([dir])
     .unlink(join(dir, `${LABEL}.plist`))
     .catch((e: NodeJS.ErrnoException) => {
@@ -165,8 +200,8 @@ async function start(deps: CliDeps): Promise<number> {
 }
 
 /**
- * The node binary the agent runs (the first ProgramArguments entry of the installed plist), or
- * this process's when none is installed: the one to grant Full Disk Access (README).
+ * The binary the agent runs (the first ProgramArguments entry of the installed plist), or this
+ * process's when none is installed: the one to grant drive access (README).
  */
 async function agentNode(d: CliDeps): Promise<{ node: string; installed: boolean }> {
   const agentsDir = d.agentsDir ?? join(homedir(), 'Library', 'LaunchAgents');
@@ -202,7 +237,19 @@ async function status(pool: Pick<pg.Pool, 'query'>, d: CliDeps): Promise<number>
   const age = hb.rows[0]?.age;
   out(age == null ? 'heartbeat: never' : `heartbeat: ${age} s ago`);
   const a = await agentNode(d);
-  out(`node: ${a.node} (${a.installed ? 'grant it Full Disk Access' : 'not installed'})`);
+  if (!a.installed) {
+    out(`node: ${a.node} (not installed)`);
+    return 0;
+  }
+  out(
+    `node: ${a.node} (grant it Removable Volumes and Network Volumes access, not Full Disk Access)`,
+  );
+  const dir = d.runtimeDir ?? defaultRuntimeDir();
+  if (
+    a.node === join(dir, RUNTIME_NAME) &&
+    !(await runtimeMatches(d.node ?? process.execPath, dir))
+  )
+    out('runtime: out of date with this Node; run make harvest-install (then grant access again)');
   return 0;
 }
 
