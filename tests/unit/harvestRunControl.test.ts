@@ -127,6 +127,16 @@ describe('startNextQueued', () => {
   });
 });
 
+describe('setFolderState', () => {
+  test('the activity sets one run folder state (waiting_source while unplugged)', async () => {
+    const id = await queuedRun();
+    const [f] = (await loadRun(pgh.pool, id)).folders;
+    const acts = createHarvestActivities({ pool: pgh.pool } as never);
+    await acts.setFolderState(id, f!.folderId, 'waiting_source');
+    expect((await loadRun(pgh.pool, id)).folders[0]!.state).toBe('waiting_source');
+  });
+});
+
 describe('loadRun', () => {
   test('returns the dry-run flag and folders', async () => {
     const id = await queuedRun(true);
