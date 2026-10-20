@@ -277,12 +277,42 @@ describe('checkKnown', () => {
     expect((await checkKnown(pgh.pool, await add(data))).state).toBe('SEND');
   });
 
+  test('a full hash reports progress through onChunk', async () => {
+    const { add, addContent } = await setup();
+    const data = bytes(3 * 1024 * KIB, 9);
+    await addContent(bytes(3 * 1024 * KIB, 8)); // same size, other bytes: hashed, not known
+    const item = await add(data);
+    let chunks = 0;
+    const out = await checkKnown(pgh.pool, item, { onChunk: () => chunks++ });
+    expect(out.state).toBe('SEND');
+    expect(chunks).toBeGreaterThanOrEqual(3);
+  });
+
+  test('a candidate whose on-disk name differs from rel_path is read through rel_path_raw', async () => {
+    const { add } = await setup();
+    const data = bytes(200 * KIB, 4);
+    const winner = await add(data, { state: 'SENT' });
+    // The stored rel_path no longer opens the file; its raw bytes do.
+    await pgh.pool.query(
+      `UPDATE harvest_items SET rel_path_raw = convert_to(rel_path, 'UTF8'), rel_path = 'nope/x.jpg'
+       WHERE id = $1`,
+      [winner.id],
+    );
+    const item = await add(data);
+    expect(await checkKnown(pgh.pool, item)).toMatchObject({
+      state: 'DUP',
+      duplicateOf: winner.id,
+    });
+  });
+
   test('stored hashes are reused: no second read', async () => {
     const { add } = await setup();
     const data = bytes(200 * KIB, 3);
     await add(data, { state: 'SENT' });
     const item = await add(data);
-    const spy = vi.fn((p: string) => import('../../src/fsops.js').then((m) => m.sha256File(p)));
+    const spy = vi.fn((p: string | Buffer) =>
+      import('../../src/fsops.js').then((m) => m.sha256File(p)),
+    );
     const first = await checkKnown(pgh.pool, item, { sha256File: spy });
     expect(first.state).toBe('DUP');
     expect(spy).toHaveBeenCalledTimes(2);

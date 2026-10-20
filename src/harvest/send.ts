@@ -8,9 +8,11 @@ import {
   GuardedFs,
   partPath,
   pathKey,
-  realFsOps,
+  readFsOps,
   sameMtime,
-  type FsOps,
+  sourcePath,
+  type ReadFsOps,
+  type SourcePath,
 } from './paths.js';
 import { finishRunRows, runFolders } from './runs.js';
 import { resolveMount } from './sources.js';
@@ -49,7 +51,8 @@ interface Item {
   id: string;
   source_id: string;
   rel_path: string;
-  raw: boolean;
+  /** The on-disk bytes of rel_path when they differ from its NFC string (see scan listDir). */
+  raw: Buffer | null;
   size_bytes: string;
   mtime_ns: string;
   kind: 'photo' | 'maybe';
@@ -90,7 +93,7 @@ async function nextItems(pool: pg.Pool, runId: string, limit: number): Promise<I
        ORDER BY i.id, length(rf.key) DESC
      )
      SELECT m.id::text AS id, m.source_id::text AS source_id, m.rel_path,
-            m.rel_path_raw IS NOT NULL AS raw, m.size_bytes::text AS size_bytes,
+            m.rel_path_raw AS raw, m.size_bytes::text AS size_bytes,
             m.mtime_ns::text AS mtime_ns, m.kind, m.sha256, m.head_hash, m.dropzone_path,
             m.dropzone_mtime_ns::text AS dropzone_mtime_ns, s.label,
             m.run_folder_id::text AS folder_id
@@ -143,13 +146,14 @@ async function settle(
 
 export function makeSendBatch(deps: HarvestDeps) {
   const { pool, settings, layout } = deps;
-  const ops: FsOps = deps.fsOps ?? realFsOps;
+  // Outside GuardedFs the send path only reads (stat, read-only open of the sources).
+  const ops: ReadFsOps = deps.fsOps ?? readFsOps;
   const known = deps.knownCheck ?? checkKnown;
 
   async function sendBatch(runId: string): Promise<SendBatchResult> {
     const ctx = Context.current();
     const signal = ctx.cancellationSignal;
-    const gfs = new GuardedFs([join(layout.dropzone, 'harvest')], ops);
+    const gfs = new GuardedFs([join(layout.dropzone, 'harvest')], deps.fsOps);
     const dz = layout.dropzone;
     const res: SendBatchResult = { outcome: 'DONE', sent: 0, known: 0, dups: 0, failed: 0 };
     const counts = () => ({ sent: res.sent, known: res.known, dups: res.dups, failed: res.failed });
@@ -168,7 +172,7 @@ export function makeSendBatch(deps: HarvestDeps) {
         // Missing is fine; a failed cleanup leaves an orphan .part the next attempt removes.
       }
     };
-    const statOrNull = (p: string) =>
+    const statOrNull = (p: SourcePath) =>
       ops.stat(p).catch((e: unknown) => {
         if (code(e) === 'ENOENT') return null;
         throw e;
@@ -196,10 +200,6 @@ export function makeSendBatch(deps: HarvestDeps) {
         (s) => s.dev === m.dev,
         () => false,
       );
-    const dzDev = await ops.stat(dz).then(
-      (s) => s.dev,
-      () => null,
-    );
 
     const vanish = async (it: Item, why: string): Promise<'vanished'> => {
       const r = await pool.query(
@@ -278,27 +278,47 @@ export function makeSendBatch(deps: HarvestDeps) {
       }
     };
 
-    /** Steps 2 and 4: mkdir -p (retried when the parent vanishes) and the copy into `.part`. */
-    const copyToPart = async (src: string, part: string, clone: boolean, rel: string) => {
-      let lastBeat = Date.now();
+    /** A heartbeat at most every second (or 8 MiB) during long reads, then a cancel check. */
+    const beater = (detail: Record<string, unknown>) => {
+      let lastBeat = 0;
       let lastBytes = 0;
-      const onChunk = (written: number) => {
+      return (bytes = 0) => {
         if (
-          written - lastBytes >= COPY_HEARTBEAT_BYTES ||
+          bytes - lastBytes >= COPY_HEARTBEAT_BYTES ||
           Date.now() - lastBeat >= COPY_HEARTBEAT_MS
         ) {
-          ctx.heartbeat({ ...counts(), file: rel, copying: written });
+          ctx.heartbeat({ ...counts(), ...detail, ...(bytes ? { copying: bytes } : {}) });
           lastBeat = Date.now();
-          lastBytes = written;
+          lastBytes = bytes;
         }
+      };
+    };
+
+    /**
+     * Steps 2, 4 and 6: mkdir -p (retried when the parent vanishes), the byte copy into `.part`,
+     * then mode and mtime on the open handle and fsync. Returns the part's on-disk mtime.
+     */
+    const copyToPart = async (
+      src: SourcePath,
+      part: string,
+      st: { mode: bigint; mtimeNs: bigint },
+      rel: string,
+    ): Promise<bigint> => {
+      const beat = beater({ file: rel });
+      const onChunk = (written: number) => {
+        beat(written);
         signal.throwIfAborted();
       };
       for (let i = 0; ; i++) {
         await gfs.mkdirp(dirname(part));
         if (i === 0) await checkpoint('send_dest_reserved');
         try {
-          await gfs.copyInto(src, part, { clone, onChunk });
-          return;
+          // BSD flags are never copied: only the permission bits, with owner read/write.
+          return await gfs.copyInto(src, part, {
+            mode: (Number(st.mode) & 0o777) | 0o600,
+            mtimeNs: st.mtimeNs,
+            onChunk,
+          });
         } catch (e) {
           if (code(e) === 'ENOENT' && i < MKDIR_RETRIES && !(await gfs.exists(dirname(part)))) {
             continue;
@@ -319,18 +339,11 @@ export function makeSendBatch(deps: HarvestDeps) {
         }
         await removeIfExists(part);
       }
-      if (it.raw) {
-        const r = await pool.query(
-          `UPDATE harvest_items SET state = 'FAILED', last_error = $2
-           WHERE id = $1 AND state = 'PLANNED'`,
-          [it.id, 'the file name is not valid UTF-8; it cannot be copied'],
-        );
-        if (r.rowCount) await promoteDuplicates(pool, it.id);
-        return 'failed';
-      }
       const mount = await mountOf(it.source_id);
       if (mount === null) return { stop: 'SOURCE_GONE', reason: `${it.label} unplugged` };
-      const src = join(mount.path, it.rel_path);
+      // Read through the on-disk bytes when they differ from the NFC rel_path; the drop-zone
+      // name is always the NFC rel_path.
+      const src = sourcePath(mount.path, it.rel_path, it.raw);
       const size = BigInt(it.size_bytes);
 
       // Throttle gate, before every file.
@@ -338,15 +351,20 @@ export function makeSendBatch(deps: HarvestDeps) {
       if (!gate.open) return { stop: 'GATED', reason: gate.reason };
 
       // Known content (read errors on the source are handled inside: the item is sent).
-      const k = await known(pool, {
-        id: it.id,
-        sourceId: it.source_id,
-        absPath: src,
-        sizeBytes: size,
-        kind: it.kind,
-        sha256: it.sha256,
-        headHash: it.head_hash,
-      });
+      const k = await known(
+        pool,
+        {
+          id: it.id,
+          sourceId: it.source_id,
+          absPath: src,
+          sizeBytes: size,
+          kind: it.kind,
+          sha256: it.sha256,
+          headHash: it.head_hash,
+        },
+        { onChunk: beater({ hashing: it.rel_path }) },
+      );
+      signal.throwIfAborted();
       if (k.state === 'KNOWN') {
         const ok = await settle(pool, runId, it, 'known', `state = 'KNOWN', sha256 = $4`, [
           k.sha256,
@@ -374,7 +392,6 @@ export function makeSendBatch(deps: HarvestDeps) {
         if (!st.isFile() || st.size !== size || !sameMtime(st.mtimeNs, BigInt(it.mtime_ns))) {
           return vanish(it, 'changed on the source since the scan');
         }
-        const clone = dzDev !== null && st.dev === dzDev;
 
         for (let round = 0; ; round++) {
           const dzPath = await chooseDest(it);
@@ -382,7 +399,7 @@ export function makeSendBatch(deps: HarvestDeps) {
           const finalAbs = join(dz, dzPath);
           const part = partPath(finalAbs, it.id);
           try {
-            await copyToPart(src, part, clone, it.rel_path);
+            const dzMtime = (await copyToPart(src, part, st, it.rel_path)).toString();
             await checkpoint('send_part_written');
             // 5. Complete, and the source unchanged while we read it.
             const now = await ops.stat(src);
@@ -394,17 +411,20 @@ export function makeSendBatch(deps: HarvestDeps) {
             if (ps.size !== st.size) {
               throw new Error(`short copy: ${ps.size} of ${st.size} bytes`);
             }
-            // 6. Mode and mtime (BSD flags are never copied). The on-disk mtime is stored
-            // before publishing so a crash after the publish can recognise the file.
-            await gfs.chmod(part, (Number(st.mode) & 0o777) | 0o600);
-            const dzMtime = (await gfs.utimesNs(part, st.mtimeNs)).toString();
-            await pool.query(
+            // The on-disk mtime (step 6 ran on the handle) is stored before publishing so a crash
+            // after the publish can recognise the file. No longer PLANNED: never publish.
+            const kept = await pool.query(
               `UPDATE harvest_items SET dropzone_mtime_ns = $2 WHERE id = $1 AND state = 'PLANNED'`,
               [it.id, dzMtime],
             );
-            // 7. Publish without ever replacing: a taken name goes back to step 1.
+            if (!kept.rowCount) {
+              await removeIfExists(part);
+              return 'skipped';
+            }
+            // 7. Publish without ever replacing: a taken name goes back to step 1. Once linked
+            // it is published, even if the .part could not be unlinked (it is ignored).
             try {
-              await gfs.publishNoReplace(part, finalAbs);
+              if (!(await gfs.publishNoReplace(part, finalAbs))) await removeIfExists(part);
             } catch (e) {
               if (code(e) === 'EEXIST' && round < PUBLISH_RETRIES) {
                 await removeIfExists(part);

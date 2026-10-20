@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, rename, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
@@ -566,6 +566,20 @@ describe('scanFolder', () => {
     const { res } = await env.scan();
     expect(res.photos).toBe(1100);
     expect(await items()).toHaveLength(1100);
+  });
+
+  test('an NFD name keeps its on-disk bytes in rel_path_raw (file and directory)', async () => {
+    const nfd = 'Cafe\u0301';
+    const env = await setup({ [`${nfd}/x.cr2`]: 500, [`p/${nfd}.cr2`]: 500, 'p/plain.cr2': 500 });
+    // APFS returns names as created: readdir gives the NFD form back.
+    expect((await readdir(join(env.root, 'p'))).includes(`${nfd}.cr2`)).toBe(true);
+    await env.scan();
+    const rows = await items();
+    const byRel = new Map(rows.map((r) => [r.rel_path, r]));
+    const nfc = nfd.normalize('NFC');
+    expect(byRel.get(`${nfc}/x.cr2`)!.rel_path_raw).toEqual(Buffer.from(`${nfd}/x.cr2`));
+    expect(byRel.get(`p/${nfc}.cr2`)!.rel_path_raw).toEqual(Buffer.from(`p/${nfd}.cr2`));
+    expect(byRel.get('p/plain.cr2')!.rel_path_raw).toBeNull();
   });
 
   test('rel_path is NFC and path_key is lower-cased', async () => {

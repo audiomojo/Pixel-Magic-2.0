@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
 import type pg from 'pg';
 import { sha256File } from '../fsops.js';
-import { openReadOnly } from './paths.js';
+import { openReadOnly, sourcePath, type SourcePath } from './paths.js';
 
 /** The head hash covers the first 64 KiB; a file no larger has the whole file as its head. */
 export const HEAD_BYTES = 64 * 1024;
@@ -15,7 +14,8 @@ export type KnownOutcome =
 export interface KnownItem {
   id: string;
   sourceId: string;
-  absPath: string;
+  /** The source file (a Buffer when its on-disk name bytes differ from the NFC rel_path). */
+  absPath: SourcePath;
   sizeBytes: bigint;
   kind: 'photo' | 'maybe';
   sha256: string | null;
@@ -24,7 +24,9 @@ export interface KnownItem {
 
 /** Test seam: the full-hash reader. */
 export interface KnownOptions {
-  sha256File?: (path: string) => Promise<string>;
+  sha256File?: (path: SourcePath, onChunk?: () => void) => Promise<string>;
+  /** Called after each 1 MiB read of a full hash (sendBatch heartbeats from it). */
+  onChunk?: () => void;
 }
 
 interface Candidate {
@@ -34,6 +36,7 @@ interface Candidate {
   sha256: string | null;
   head_hash: string | null;
   rel_path: string;
+  rel_path_raw: Buffer | null;
   mount: string | null;
 }
 
@@ -46,7 +49,7 @@ const cmp = (a: [number, bigint], b: [number, bigint]) =>
   a[0] !== b[0] ? a[0] - b[0] : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0;
 
 /** sha256 of the first 64 KiB (opened read-only). */
-async function headOf(path: string, size: bigint): Promise<string> {
+async function headOf(path: SourcePath, size: bigint): Promise<string> {
   const fh = await openReadOnly(path);
   try {
     const want = Number(size < BigInt(HEAD_BYTES) ? size : BigInt(HEAD_BYTES));
@@ -86,7 +89,8 @@ export async function checkKnown(
   item: KnownItem,
   opts: KnownOptions = {},
 ): Promise<KnownOutcome> {
-  const fullHash = opts.sha256File ?? sha256File;
+  const hashFile = opts.sha256File ?? sha256File;
+  const fullHash = (p: SourcePath) => hashFile(p, opts.onChunk);
   const small = item.sizeBytes <= BigInt(HEAD_BYTES);
   const cur: { sha: string | null; head: string | null } = {
     sha: item.sha256,
@@ -133,7 +137,7 @@ export async function checkKnown(
     // 2. Another ledger item with this size. DUP rows are left out: each is subsumed by its
     // target, which has the same bytes and is itself a candidate when it qualifies.
     const { rows } = await pool.query<Candidate>(
-      `SELECT i.id::text AS id, i.state, i.kind, i.sha256, i.head_hash, i.rel_path,
+      `SELECT i.id::text AS id, i.state, i.kind, i.sha256, i.head_hash, i.rel_path, i.rel_path_raw,
               s.last_mount_path AS mount
        FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
        WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED')`,
@@ -175,13 +179,13 @@ async function sameBytes(
     cur: { sha: string | null; head: string | null };
     ensureHead: () => Promise<string>;
     ensureSha: () => Promise<string>;
-    theirs: (path: string) => Promise<string>;
+    theirs: (path: SourcePath) => Promise<string>;
   },
 ): Promise<boolean> {
   const small = size <= BigInt(HEAD_BYTES);
   let theirSha = c.sha256;
   let theirHead = c.head_hash;
-  const path = c.mount === null ? null : join(c.mount, c.rel_path);
+  const path = c.mount === null ? null : sourcePath(c.mount, c.rel_path, c.rel_path_raw);
   if (me.cur.sha !== null && theirSha !== null) return me.cur.sha === theirSha;
 
   if (small) theirHead ??= theirSha;

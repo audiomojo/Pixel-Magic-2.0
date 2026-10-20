@@ -64,7 +64,7 @@ export function vaultRel(sha256: string, ext: string): string {
 
 const CHUNK = 1 << 20;
 
-export async function sha256File(path: string, onChunk?: () => void): Promise<string> {
+export async function sha256File(path: string | Buffer, onChunk?: () => void): Promise<string> {
   const h = createHash('sha256');
   for await (const chunk of createReadStream(path, { highWaterMark: CHUNK })) {
     h.update(chunk as Buffer);

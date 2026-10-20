@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { constants } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import {
   lstat,
@@ -48,16 +47,7 @@ afterEach(async () => {
   for (const u of unlocks.splice(0)) await u();
 });
 
-const MUTATING = new Set([
-  'mkdir',
-  'open',
-  'chmod',
-  'utimes',
-  'rename',
-  'unlink',
-  'copyFile',
-  'link',
-]);
+const MUTATING = new Set(['mkdir', 'open', 'chmod', 'utimes', 'rename', 'unlink', 'link']);
 interface Call {
   op: string;
   paths: string[];
@@ -70,18 +60,14 @@ function recording(base: FsOps = realFsOps): { ops: FsOps; calls: Call[] } {
   const ops: FsOps = {
     mkdir: (p, o) => (calls.push({ op: 'mkdir', paths: [p] }), base.mkdir(p, o)),
     open: (p, f, m) => (calls.push({ op: 'open', paths: [p], arg: f }), base.open(p, f, m)),
-    openRead: (p) => (calls.push({ op: 'openRead', paths: [p] }), base.openRead(p)),
+    openRead: (p) => (calls.push({ op: 'openRead', paths: [String(p)] }), base.openRead(p)),
     chmod: (p, m) => (calls.push({ op: 'chmod', paths: [p] }), base.chmod(p, m)),
     utimes: (p, a, m) => (calls.push({ op: 'utimes', paths: [p] }), base.utimes(p, a, m)),
     rename: (a, b) => (calls.push({ op: 'rename', paths: [a, b] }), base.rename(a, b)),
     unlink: (p) => (calls.push({ op: 'unlink', paths: [p] }), base.unlink(p)),
     link: (a, b) => (calls.push({ op: 'link', paths: [a, b] }), base.link(a, b)),
-    copyFile: (a, b, m) => (
-      calls.push({ op: 'copyFile', paths: [b], arg: { src: a, mode: m } }),
-      base.copyFile(a, b, m)
-    ),
     lstat: (p) => (calls.push({ op: 'lstat', paths: [p] }), base.lstat(p)),
-    stat: (p) => (calls.push({ op: 'stat', paths: [p] }), base.stat(p)),
+    stat: (p) => (calls.push({ op: 'stat', paths: [String(p)] }), base.stat(p)),
     realpath: (p) => base.realpath(p),
     mtimeNs: (p) => base.mtimeNs(p),
   };
@@ -274,35 +260,33 @@ describe('copy protocol', () => {
       'c.nef': randomBytes(900),
     });
     const before = await snapshotTree(e.root);
-    // Byte copy path (clone refused) and clone path (real copyFile without the force flag).
-    const noClone = recording({ ...realFsOps, copyFile: () => Promise.reject(errno('ENOTSUP')) });
-    const res = await e.send({ fsOps: noClone.ops });
-    expect(res.sent).toBe(3);
-    const cloned = recording({
-      ...realFsOps,
-      copyFile: (s, d) => fsp.copyFile(s, d, constants.COPYFILE_EXCL),
-    });
-    await pgh.pool.query(`UPDATE harvest_items SET state = 'PLANNED', dropzone_path = NULL`);
-    await fsp.rm(join(e.dz, 'harvest'), { recursive: true });
-    expect((await e.send({ fsOps: cloned.ops })).sent).toBe(3);
+    const rec = recording();
+    expect((await e.send({ fsOps: rec.ops })).sent).toBe(3);
     expect(await snapshotTree(e.root)).toEqual(before);
-    for (const calls of [noClone.calls, cloned.calls]) {
-      const bad = calls.filter(
-        (c) => MUTATING.has(c.op) && c.paths.some((p) => p.startsWith(e.root)),
-      );
-      expect(bad).toEqual([]);
-      for (const c of calls.filter((c) => c.op === 'open')) expect(c.arg).toBe('wx');
-    }
-    expect(noClone.calls.filter((c) => c.op === 'openRead').map((c) => c.paths[0])).toEqual([
+    const bad = rec.calls.filter(
+      (c) => MUTATING.has(c.op) && c.paths.some((p) => p.startsWith(e.root)),
+    );
+    expect(bad).toEqual([]);
+    for (const c of rec.calls.filter((c) => c.op === 'open')) expect(c.arg).toBe('wx');
+    // Source files are opened only read-only, once each (the other openReads are drop-zone
+    // directories opened for fsync).
+    const srcOpens = rec.calls
+      .filter((c) => c.op === 'openRead' && c.paths[0]!.startsWith(e.root))
+      .map((c) => c.paths[0]);
+    expect(srcOpens).toEqual([
       join(e.root, 'DCIM/a.cr2'),
       join(e.root, 'DCIM/sub/b.cr2'),
       join(e.root, 'c.nef'),
     ]);
+    for (const c of rec.calls.filter((c) => c.op === 'openRead' && !c.paths[0]!.startsWith(e.root)))
+      expect(c.paths[0]!.startsWith(join(await fsp.realpath(e.dz), 'harvest'))).toBe(true);
   });
 
   test('no file in src/harvest except paths.ts imports a mutating fs function', async () => {
     const MUT =
-      /\b(open|openSync|writeFile|writeFileSync|appendFile|rename|renameSync|chmod|lchmod|utimes|lutimes|futimes|unlink|unlinkSync|rm|rmSync|rmdir|mkdir|mkdirSync|mkdtemp|copyFile|copyFileSync|cp|link|symlink|truncate|ftruncate|createWriteStream|chown|lchown)\b/;
+      /^(promises|open|openSync|writeFile|writeFileSync|appendFile|rename|renameSync|chmod|lchmod|utimes|lutimes|futimes|unlink|unlinkSync|rm|rmSync|rmdir|mkdir|mkdirSync|mkdtemp|copyFile|copyFileSync|cp|link|symlink|truncate|ftruncate|createWriteStream|chown|lchown)$/;
+    // system.ts runs `mount` and `diskutil` (read-only probes): the one child_process user.
+    const CHILD_PROCESS_ALLOWED = new Set(['system.ts']);
     const dir = 'src/harvest';
     const offenders: string[] = [];
     const files = (await readdir(dir, { recursive: true })).filter(
@@ -321,16 +305,33 @@ describe('copy protocol', () => {
           continue;
         }
         const named = /\{([^}]*)\}/.exec(clause)?.[1] ?? '';
-        for (const n of named.split(',').map((s) => s.trim().split(/\s+as\s+/)[0]!)) {
-          if (n && !n.startsWith('type ') && MUT.test(n)) offenders.push(`${f}: ${n}`);
+        for (const n of named.split(',').map((s) => s.trim().replace(/^type\s+/, ''))) {
+          const name = n.split(/\s+as\s+/)[0]!;
+          if (name && MUT.test(name)) offenders.push(`${f}: ${name}`);
         }
-        if (!clause.trim().startsWith('{') && !clause.startsWith('type ') && !ns) {
+        if (!clause.trim().startsWith('{') && !clause.startsWith('type ')) {
           offenders.push(`${f}: default import ${clause}`);
         }
       }
       if (/import\(\s*['"](?:node:)?fs/.test(src)) offenders.push(`${f}: dynamic fs import`);
+      if (/from\s+['"]fs-extra['"]|import\(\s*['"]fs-extra/.test(src))
+        offenders.push(`${f}: fs-extra`);
+      if (
+        /from\s+['"](?:node:)?child_process['"]|import\(\s*['"](?:node:)?child_process/.test(src) &&
+        !CHILD_PROCESS_ALLOWED.has(f)
+      ) {
+        offenders.push(`${f}: child_process`);
+      }
+      if (/\brealFsOps\b/.test(src)) offenders.push(`${f}: realFsOps`);
     }
     expect(offenders).toEqual([]);
+  });
+
+  test('the static check catches what it should', () => {
+    // Guard against a regex that silently matches nothing.
+    const MUT = /^(promises|open|copyFile)$/;
+    expect(['promises', 'open', 'copyFile'].every((n) => MUT.test(n))).toBe(true);
+    expect(MUT.test('openRead')).toBe(false);
   });
 
   test('case-colliding names get a suffix and never overwrite', async () => {
@@ -427,9 +428,7 @@ describe('crash recovery', () => {
     const rec = recording();
     const res = await e.send({ fsOps: rec.ops });
     expect(res).toMatchObject({ outcome: 'DONE', sent: 1 });
-    expect(
-      rec.calls.filter((c) => ['open', 'copyFile', 'openRead', 'link'].includes(c.op)),
-    ).toEqual([]);
+    expect(rec.calls.filter((c) => ['open', 'openRead', 'link'].includes(c.op))).toEqual([]);
     expect((await item('DCIM/a.cr2')).state).toBe('SENT');
     expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/a.cr2']);
     expect(await counters(e.runId)).toMatchObject({ sent: 1, bytes_sent: 3000 });
@@ -449,7 +448,7 @@ describe('crash recovery', () => {
     );
     const rec = recording();
     expect(await e.send({ fsOps: rec.ops })).toMatchObject({ sent: 1 });
-    expect(rec.calls.filter((c) => ['open', 'copyFile', 'openRead'].includes(c.op))).toEqual([]);
+    expect(rec.calls.filter((c) => ['open', 'openRead'].includes(c.op))).toEqual([]);
     expect((await item('DCIM/a.cr2')).state).toBe('SENT');
     expect(await listDz(e.dz)).toEqual([]);
     const { linkFiles } = createHarvestActivities(e.deps);
@@ -462,7 +461,7 @@ describe('crash recovery', () => {
     const e = await setup({ 'DCIM/a.cr2': bytes });
     await expect(e.send({ checkpoint: crashAt('send_part_written') })).rejects.toThrow('crash');
     expect((await listDz(e.dz)).filter((p) => p.endsWith('.part'))).toHaveLength(1);
-    const rec = recording({ ...realFsOps, copyFile: () => Promise.reject(errno('ENOTSUP')) });
+    const rec = recording();
     expect(await e.send({ fsOps: rec.ops })).toMatchObject({ sent: 1 });
     expect(rec.calls.filter((c) => c.op === 'open')).toHaveLength(1);
     expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/a.cr2']);
@@ -483,11 +482,12 @@ describe('crash recovery', () => {
           ? Promise.reject(new Error('crash in unlink'))
           : realFsOps.unlink(p),
     };
-    // The unlink error is an item error (the item stays PLANNED, attempts 1, part kept).
-    expect(await e.send({ fsOps: ops })).toMatchObject({ sent: 0 });
-    expect((await listDz(e.dz)).filter((p) => p.endsWith('.part'))).toHaveLength(1);
-    expect(await e.send()).toMatchObject({ sent: 1 });
-    expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/a.cr2']);
+    // Linked = published: SENT, even though the (ignored) .part could not be removed.
+    expect(await e.send({ fsOps: ops })).toMatchObject({ sent: 1, failed: 0 });
+    expect(await item('DCIM/a.cr2')).toMatchObject({ state: 'SENT', attempts: 0 });
+    const left = await listDz(e.dz);
+    expect(left.filter((p) => p.endsWith('.part'))).toHaveLength(1);
+    expect(left.filter((p) => !p.endsWith('.part'))).toEqual(['harvest/Drive/DCIM/a.cr2']);
   });
 
   test('parent removed between mkdir and open is retried', async () => {
@@ -513,7 +513,6 @@ describe('crash recovery', () => {
     let opens = 0;
     const ops: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       open: async (p, f, m) => {
         opens++;
         await rmdir(dirname(p));
@@ -552,9 +551,8 @@ describe('source changes', () => {
     // b becomes DUP of a (a still PLANNED, earlier) while a fails once.
     const failA: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       openRead: (p) =>
-        p.endsWith('a.cr2') ? Promise.reject(errno('EACCES')) : realFsOps.openRead(p),
+        String(p).endsWith('a.cr2') ? Promise.reject(errno('EACCES')) : realFsOps.openRead(p),
     };
     expect(await e.send({ fsOps: failA })).toMatchObject({ dups: 1, sent: 1 });
     expect((await item('DCIM/b.cr2')).state).toBe('DUP');
@@ -572,13 +570,52 @@ describe('source changes', () => {
     expect((await item('DCIM/b.cr2')).state).toBe('SENT');
   });
 
-  test('a name that is not valid UTF-8 is FAILED without a copy', async () => {
-    const e = await setup({ 'DCIM/a.cr2': randomBytes(500) });
-    await pgh.pool.query(
-      `UPDATE harvest_items SET rel_path_raw = '\\x44434d2f61ff2e637232'::bytea`,
+  test('an NFD-named file is read through its on-disk bytes and sent under the NFC name', async () => {
+    const nfd = 'Cafe\u0301.cr2';
+    const nfc = nfd.normalize('NFC');
+    const bytes = randomBytes(2100);
+    const e = await setup({ [`DCIM/${nfd}`]: bytes });
+    const row = await item(`DCIM/${nfc}`);
+    expect(row).toBeDefined();
+    // A normalization-sensitive filesystem (exFAT/SMB/NTFS): the NFC spelling does not exist.
+    const nfcBytes = Buffer.from(nfc);
+    // Only source paths are strict; drop-zone names are NFC and real.
+    const strict = (p: string | Buffer) =>
+      Buffer.from(p).includes(Buffer.from(e.root)) && Buffer.from(p).includes(nfcBytes)
+        ? Promise.reject(errno('ENOENT'))
+        : null;
+    const ops: FsOps = {
+      ...realFsOps,
+      stat: (p) => strict(p) ?? realFsOps.stat(p),
+      openRead: (p) => strict(p) ?? realFsOps.openRead(p),
+    };
+    // The fake really rejects the NFC spelling.
+    await expect(ops.stat(join(e.root, 'DCIM', nfc))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await e.send({ fsOps: ops })).toMatchObject({ sent: 1, failed: 0 });
+    const sent = await item(`DCIM/${nfc}`);
+    expect(sent).toMatchObject({ state: 'SENT', dropzone_path: `harvest/Drive/DCIM/${nfc}` });
+    expect(await readFile(join(e.dz, sent.dropzone_path!))).toEqual(bytes);
+  });
+
+  test('rel_path_raw, when set, is the path read from the source', async () => {
+    const real = randomBytes(700);
+    const e = await setup(
+      { 'DCIM/a.cr2': randomBytes(700), 'DCIM/other.cr2': real },
+      { lock: false },
     );
-    expect(await e.send()).toMatchObject({ failed: 1, sent: 0 });
-    expect((await item('DCIM/a.cr2')).state).toBe('FAILED');
+    // Point a's raw bytes at another file of the same size and mtime: its bytes are what is sent.
+    const st = await lstat(join(e.root, 'DCIM/a.cr2'));
+    await utimes(join(e.root, 'DCIM/other.cr2'), st.atime, st.mtime);
+    await pgh.pool.query(
+      `UPDATE harvest_items SET rel_path_raw = convert_to('DCIM/other.cr2', 'UTF8'),
+              mtime_ns = (SELECT mtime_ns FROM harvest_items WHERE rel_path = 'DCIM/other.cr2')
+       WHERE rel_path = 'DCIM/a.cr2'`,
+    );
+    await pgh.pool.query(
+      `UPDATE harvest_items SET state = 'REJECTED' WHERE rel_path = 'DCIM/other.cr2'`,
+    );
+    expect(await e.send()).toMatchObject({ sent: 1 });
+    expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/a.cr2'))).toEqual(real);
   });
 
   test('unplugged before the batch: SOURCE_GONE, items stay PLANNED', async () => {
@@ -599,7 +636,6 @@ describe('source changes', () => {
     let gone = false;
     const ops: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       open: async (p, f, m) => {
         const fh = await realFsOps.open(p, f, m);
         gone = true;
@@ -607,7 +643,8 @@ describe('source changes', () => {
       },
       // An errno outside the usual "gone" set: liveness, not the code, decides.
       openRead: (p) => (gone ? Promise.reject(errno('EBADF')) : realFsOps.openRead(p)),
-      stat: (p) => (gone && p === e.root ? Promise.reject(errno('ENOENT')) : realFsOps.stat(p)),
+      stat: (p) =>
+        gone && String(p) === e.root ? Promise.reject(errno('ENOENT')) : realFsOps.stat(p),
     };
     // a: the part is opened, then the drive goes; b's read fails with EIO on a dead mount.
     const res = await e.send({ fsOps: ops });
@@ -619,25 +656,10 @@ describe('source changes', () => {
 });
 
 describe('errors and pauses', () => {
-  test('ENOSPC pauses the run (clone path and byte copy)', async () => {
+  test('ENOSPC pauses the run', async () => {
     const e = await setup({ 'DCIM/a.cr2': randomBytes(4000) });
-    const half: FsOps = {
-      ...realFsOps,
-      copyFile: async (_s, d) => {
-        await writeFile(d, randomBytes(100), { flag: 'wx' });
-        throw errno('ENOSPC');
-      },
-    };
-    expect(await e.send({ fsOps: half })).toMatchObject({
-      outcome: 'DISK_FULL',
-      reason: 'disk full',
-    });
-    expect(await listDz(e.dz)).toEqual([]);
-    expect(await item('DCIM/a.cr2')).toMatchObject({ state: 'PLANNED', attempts: 0 });
-
     const stream: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       open: async (p, f, m) => {
         const fh = await realFsOps.open(p, f, m);
         return new Proxy(fh, {
@@ -653,16 +675,22 @@ describe('errors and pauses', () => {
         });
       },
     };
-    expect(await e.send({ fsOps: stream })).toMatchObject({ outcome: 'DISK_FULL' });
+    expect(await e.send({ fsOps: stream })).toMatchObject({
+      outcome: 'DISK_FULL',
+      reason: 'disk full',
+    });
     expect(await listDz(e.dz)).toEqual([]);
     expect(await item('DCIM/a.cr2')).toMatchObject({ state: 'PLANNED', attempts: 0 });
   });
 
   test('a short copy is an item error and leaves no part', async () => {
     const e = await setup({ 'DCIM/a.cr2': randomBytes(4000) });
+    const tiny = join(await tmpDir(), 'tiny');
+    await writeFile(tiny, randomBytes(10));
     const short: FsOps = {
       ...realFsOps,
-      copyFile: (_s, d) => writeFile(d, randomBytes(10), { flag: 'wx' }),
+      openRead: (p) =>
+        String(p).endsWith('a.cr2') ? realFsOps.openRead(tiny) : realFsOps.openRead(p),
     };
     expect(await e.send({ fsOps: short })).toMatchObject({ outcome: 'MORE', sent: 0 });
     const row = await item('DCIM/a.cr2');
@@ -671,13 +699,25 @@ describe('errors and pauses', () => {
     expect(await listDz(e.dz)).toEqual([]);
   });
 
+  test('an item that stopped being PLANNED during the copy is never published', async () => {
+    const e = await setup({ 'DCIM/a.cr2': randomBytes(4000) });
+    const res = await e.send({
+      checkpoint: async (n) => {
+        if (n === 'send_part_written')
+          await pgh.pool.query(`UPDATE harvest_items SET state = 'REJECTED'`);
+      },
+    });
+    expect(res).toMatchObject({ sent: 0, failed: 0 });
+    expect(await listDz(e.dz)).toEqual([]);
+    expect((await item('DCIM/a.cr2')).state).toBe('REJECTED');
+  });
+
   test('25 consecutive errors pause the run', async () => {
     const spec: TreeSpec = {};
     for (let i = 0; i < 26; i++) spec[`DCIM/f${String(i).padStart(2, '0')}.cr2`] = 200 + i;
     const e = await setup(spec);
     const ops: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       openRead: () => Promise.reject(errno('EACCES')),
     };
     const res = await e.send({ fsOps: ops });
@@ -694,9 +734,10 @@ describe('errors and pauses', () => {
     const e = await setup(spec);
     const ops: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       openRead: (p) =>
-        p.endsWith('f15.cr2') ? realFsOps.openRead(p) : Promise.reject(errno('EACCES')),
+        !String(p).startsWith(e.root) || String(p).endsWith('f15.cr2')
+          ? realFsOps.openRead(p)
+          : Promise.reject(errno('EACCES')),
     };
     expect(await e.send({ fsOps: ops })).toMatchObject({ outcome: 'MORE', sent: 1 });
   });
@@ -709,9 +750,8 @@ describe('errors and pauses', () => {
     );
     const failA: FsOps = {
       ...realFsOps,
-      copyFile: () => Promise.reject(errno('ENOTSUP')),
       openRead: (p) =>
-        p.endsWith('a.cr2') ? Promise.reject(errno('EACCES')) : realFsOps.openRead(p),
+        String(p).endsWith('a.cr2') ? Promise.reject(errno('EACCES')) : realFsOps.openRead(p),
     };
     expect(await e.send({ fsOps: failA })).toMatchObject({ outcome: 'MORE', dups: 1, failed: 0 });
     expect(await e.send({ fsOps: failA })).toMatchObject({ outcome: 'MORE', failed: 1 });
@@ -811,52 +851,34 @@ describe('known content', () => {
   });
 });
 
-describe('cancellation and clone', () => {
+describe('cancellation and heartbeats', () => {
   test('cancellation deletes the part', async () => {
     const e = await setup({ 'DCIM/big.cr2': 64 * 1024 * 1024 });
     const env = new MockActivityEnvironment();
     env.on('heartbeat', (d: unknown) => {
       if ((d as { copying?: number }).copying) env.cancel();
     });
-    const { sendBatch } = createHarvestActivities({
-      ...e.deps,
-      fsOps: { ...realFsOps, copyFile: () => Promise.reject(errno('ENOTSUP')) },
-    });
+    const { sendBatch } = createHarvestActivities(e.deps);
     await expect(env.run(sendBatch, e.runId)).rejects.toBeInstanceOf(CancelledFailure);
     expect(await listDz(e.dz)).toEqual([]);
     expect(await item('DCIM/big.cr2')).toMatchObject({ state: 'PLANNED', attempts: 0 });
   });
 
-  test('same APFS volume uses clone, falling back to a byte copy when cloning throws', async () => {
-    const bytes = randomBytes(3000);
-    const e = await setup({ 'DCIM/a.cr2': bytes, 'DCIM/b.cr2': randomBytes(1000) });
-    // Real ops: macOS rejects FICLONE_FORCE (ENOSYS) → the byte copy is used.
-    const rec = recording();
-    expect((await e.send({ fsOps: rec.ops })).sent).toBe(2);
-    const clones = rec.calls.filter((c) => c.op === 'copyFile');
-    expect(clones).toHaveLength(2);
-    for (const c of clones) {
-      const mode = (c.arg as { mode: number }).mode;
-      expect(mode & constants.COPYFILE_FICLONE_FORCE).toBe(constants.COPYFILE_FICLONE_FORCE);
-      expect(mode & constants.COPYFILE_EXCL).toBe(constants.COPYFILE_EXCL);
-    }
-    expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/a.cr2'))).toEqual(bytes);
-
-    // Another device: no clone attempt at all.
-    await pgh.pool.query(`UPDATE harvest_items SET state = 'PLANNED', dropzone_path = NULL`);
-    await fsp.rm(join(e.dz, 'harvest'), { recursive: true });
-    const other = recording({
-      ...realFsOps,
-      stat: async (p) => {
-        const s = await realFsOps.stat(p);
-        if (p !== e.dz) return s;
-        const fake = Object.create(Object.getPrototypeOf(s) as object) as typeof s;
-        return Object.assign(fake, s, { dev: s.dev + 1n });
-      },
+  test('full-file hashing heartbeats', async () => {
+    const e = await setup({ 'DCIM/big.cr2': randomBytes(3 * 1024 * 1024) });
+    // A vault content of the same size forces a full hash (different bytes: still sent).
+    await pgh.pool.query(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state)
+       VALUES ($1, 'cr2', 'still', $2, 'INGESTED')`,
+      ['0'.repeat(64), 3 * 1024 * 1024],
+    );
+    const beats: { hashing?: string }[] = [];
+    const { sendBatch } = createHarvestActivities(e.deps);
+    const res = await runActivity(sendBatch, [e.runId], {
+      onHeartbeat: (d) => beats.push(d as { hashing?: string }),
     });
-    expect((await e.send({ fsOps: other.ops })).sent).toBe(2);
-    expect(other.calls.filter((c) => c.op === 'copyFile')).toEqual([]);
-    expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/a.cr2'))).toEqual(bytes);
+    expect(res.sent).toBe(1);
+    expect(beats.some((b) => b.hashing === 'DCIM/big.cr2')).toBe(true);
   });
 });
 

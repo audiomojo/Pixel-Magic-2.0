@@ -19,6 +19,7 @@ import {
   pathKey,
   realFsOps,
   sameMtime,
+  sourcePath,
   type FsOps,
 } from '../../src/harvest/paths.js';
 
@@ -124,7 +125,6 @@ test('a non-existent allowed root is still usable once created; all calls go thr
     realpath: async (p) => (calls.push('realpath'), (await import('node:fs/promises')).realpath(p)),
     openRead: (p) => (calls.push('openRead'), realFsOps.openRead(p)),
     link: (a, b) => (calls.push('link'), realFsOps.link(a, b)),
-    copyFile: (a, b, m) => (calls.push('copyFile'), realFsOps.copyFile(a, b, m)),
     stat: (p) => (calls.push('stat'), realFsOps.stat(p)),
   };
   const g2 = new GuardedFs([root], ops);
@@ -162,50 +162,70 @@ describe('copyInto and publishNoReplace', () => {
   const src = join(outside, 'src.bin');
   const bytes = Buffer.from('0123456789'.repeat(300_000)); // 3 MB: several 1 MiB chunks
   writeFileSync(src, bytes);
-  const enotsup = () => Promise.reject(Object.assign(new Error('no clone'), { code: 'ENOTSUP' }));
+  const MT = 1_700_000_000_123_456_789n;
 
-  test('a byte copy reads the source read-only and never replaces; refuses outside', async () => {
+  test('a byte copy reads read-only, sets mode and mtime on the handle, never replaces', async () => {
     const seen: number[] = [];
+    const calls: string[] = [];
+    const ops: FsOps = {
+      ...realFsOps,
+      openRead: (p) => (calls.push(`openRead ${String(p)}`), realFsOps.openRead(p)),
+      open: async (p, f, m) => {
+        const fh = await realFsOps.open(p, f, m);
+        for (const k of ['chmod', 'utimes', 'sync', 'close'] as const) {
+          const orig = (fh[k] as (...a: unknown[]) => Promise<void>).bind(fh);
+          (fh as unknown as Record<string, unknown>)[k] = (...a: unknown[]) => (
+            calls.push(`fh.${k}`),
+            orig(...a)
+          );
+        }
+        return fh;
+      },
+      chmod: () => Promise.reject(new Error('path chmod not used')),
+      utimes: () => Promise.reject(new Error('path utimes not used')),
+    };
     const dest = join(root, 'c1.part');
-    await g.copyInto(src, dest, { clone: false, onChunk: (n) => seen.push(n) });
+    const got = await new GuardedFs([root], ops).copyInto(src, dest, {
+      mode: 0o640,
+      mtimeNs: MT,
+      onChunk: (n) => seen.push(n),
+    });
     expect(readFileSync(dest)).toEqual(bytes);
     expect(seen).toEqual([1048576, 2097152, 3000000]);
-    await expect(g.copyInto(src, dest, { clone: false })).rejects.toMatchObject({ code: 'EEXIST' });
-    await expect(g.copyInto(src, join(outside, 'x'), { clone: true })).rejects.toBeInstanceOf(
-      OutsideAllowedRootError,
-    );
+    const st = lstatSync(dest, { bigint: true });
+    expect(got).toBe(st.mtimeNs);
+    expect(got > MT ? got - MT : MT - got).toBeLessThan(1000n);
+    expect(Number(st.mode) & 0o777).toBe(0o640);
+    expect(calls).toEqual([`openRead ${src}`, 'fh.chmod', 'fh.utimes', 'fh.sync', 'fh.close']);
+    await expect(g.copyInto(src, dest, { mode: 0o600, mtimeNs: MT })).rejects.toMatchObject({
+      code: 'EEXIST',
+    });
+    await expect(
+      g.copyInto(src, join(outside, 'x'), { mode: 0o600, mtimeNs: MT }),
+    ).rejects.toBeInstanceOf(OutsideAllowedRootError);
+    expect(existsSync(join(outside, 'x'))).toBe(false);
   });
 
-  test('a refused clone falls back, removing what it left; real outcomes do not', async () => {
-    const left: FsOps = {
-      ...realFsOps,
-      copyFile: async (_s, d) => {
-        writeFileSync(d, 'junk');
-        return enotsup();
-      },
-    };
+  test('copyInto reads a source given as raw bytes', async () => {
     const dest = join(root, 'c2.part');
-    await new GuardedFs([root], left).copyInto(src, dest, { clone: true });
+    await g.copyInto(Buffer.from(src), dest, { mode: 0o600, mtimeNs: MT });
     expect(readFileSync(dest)).toEqual(bytes);
-    const full: FsOps = {
-      ...realFsOps,
-      copyFile: () => Promise.reject(Object.assign(new Error('full'), { code: 'ENOSPC' })),
-    };
-    await expect(
-      new GuardedFs([root], full).copyInto(src, join(root, 'c3.part'), { clone: true }),
-    ).rejects.toMatchObject({ code: 'ENOSPC' });
-    const stuck: FsOps = {
-      ...realFsOps,
-      copyFile: enotsup,
-      unlink: () => Promise.reject(Object.assign(new Error('busy'), { code: 'EBUSY' })),
-    };
-    await expect(
-      new GuardedFs([root], stuck).copyInto(src, join(root, 'c4.part'), { clone: true }),
-    ).rejects.toMatchObject({ code: 'EBUSY' });
-    expect(existsSync(join(root, 'c4.part'))).toBe(false);
   });
 
-  test('publishNoReplace links then unlinks; an existing name is left untouched', async () => {
+  test('sourcePath joins the mount and the raw bytes exactly', () => {
+    const raw = Buffer.concat([
+      Buffer.from('d/bad'),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from('.cr2'),
+    ]);
+    expect(sourcePath('/Volumes/X', 'd/bad\uFFFD\uFFFD.cr2', raw)).toEqual(
+      Buffer.concat([Buffer.from('/Volumes/X/'), raw]),
+    );
+    expect(sourcePath('/Volumes/X/', 'a', Buffer.from('a'))).toEqual(Buffer.from('/Volumes/X/a'));
+    expect(sourcePath('/Volumes/X', 'd/a.cr2', null)).toBe('/Volumes/X/d/a.cr2');
+  });
+
+  test('publishNoReplace links, fsyncs the directory, unlinks; never replaces', async () => {
     const part = join(root, '.p.h1.part');
     writeFileSync(part, 'new');
     writeFileSync(join(root, 'taken'), 'old');
@@ -214,11 +234,30 @@ describe('copyInto and publishNoReplace', () => {
     });
     expect(readFileSync(join(root, 'taken'), 'utf8')).toBe('old');
     expect(readFileSync(part, 'utf8')).toBe('new');
-    await g.publishNoReplace(part, join(root, 'free'));
+    const synced: string[] = [];
+    const ops: FsOps = {
+      ...realFsOps,
+      openRead: async (p) => {
+        const fh = await realFsOps.openRead(p);
+        const sync = fh.sync.bind(fh);
+        fh.sync = () => (synced.push(String(p)), sync());
+        return fh;
+      },
+    };
+    expect(await new GuardedFs([root], ops).publishNoReplace(part, join(root, 'free'))).toBe(true);
+    expect(synced).toEqual([root]);
     expect(readFileSync(join(root, 'free'), 'utf8')).toBe('new');
     expect(existsSync(part)).toBe(false);
     await expect(g.publishNoReplace(join(root, 'free'), join(outside, 'f'))).rejects.toBeInstanceOf(
       OutsideAllowedRootError,
     );
+  });
+
+  test('publishNoReplace: a failed unlink after the link still means published', async () => {
+    const part = join(root, '.q2.h2.part');
+    writeFileSync(part, 'q');
+    const ops: FsOps = { ...realFsOps, unlink: () => Promise.reject(new Error('busy')) };
+    expect(await new GuardedFs([root], ops).publishNoReplace(part, join(root, 'q2'))).toBe(false);
+    expect(readFileSync(join(root, 'q2'), 'utf8')).toBe('q');
   });
 });

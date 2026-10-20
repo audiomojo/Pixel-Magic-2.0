@@ -1,6 +1,6 @@
 /** Bounded, read-only EXIF Make reader for JPEG, TIFF/DNG and HEIC (spec §6.4). */
 
-import { openReadOnly } from './paths.js';
+import { openReadOnly, type SourcePath } from './paths.js';
 
 export const EXIF_READ_LIMIT = 256 * 1024;
 const HEIC_EXIF_LIMIT = 64 * 1024;
@@ -261,7 +261,7 @@ export async function parseMake(
 }
 
 /** Opens `path` read-only, reads ≤ 256 KiB and parses the Make. Filesystem errors throw. */
-export async function readMake(path: string): Promise<string | null> {
+export async function readMake(path: SourcePath): Promise<string | null> {
   const fh = await openReadOnly(path);
   try {
     const size = (await fh.stat()).size;

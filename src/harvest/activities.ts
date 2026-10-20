@@ -1,8 +1,8 @@
 import type pg from 'pg';
 import type { DataLayout } from '../fsops.js';
 import type { HarvestSettings } from './config.js';
-import type { KnownItem, KnownOutcome } from './known.js';
-import type { FsOps } from './paths.js';
+import type { KnownItem, KnownOptions, KnownOutcome } from './known.js';
+import type { FsOps, SourcePath } from './paths.js';
 import { setRunState, type RunState } from './runs.js';
 import { makeScanFolder } from './scan.js';
 import { linkFiles, makeFinishRun, makeSendBatch } from './send.js';
@@ -26,13 +26,13 @@ export interface HarvestDeps {
   /** Passed to resolveMount; tests point `volumes` at a temp directory. */
   detectOpts?: DetectOptions;
   /** EXIF Make reader override (tests inject faults). */
-  readMake?: (path: string) => Promise<string | null>;
+  readMake?: (path: SourcePath) => Promise<string | null>;
   /** Scan heartbeat period (default 5 s); tests shorten it. */
   scanHeartbeatMs?: number;
   /** Filesystem seam for the send path (tests record calls or inject faults). */
   fsOps?: FsOps;
   /** Known-content check override (tests interleave state changes). */
-  knownCheck?: (pool: pg.Pool, item: KnownItem) => Promise<KnownOutcome>;
+  knownCheck?: (pool: pg.Pool, item: KnownItem, opts?: KnownOptions) => Promise<KnownOutcome>;
 }
 
 export function createHarvestActivities(deps: HarvestDeps) {

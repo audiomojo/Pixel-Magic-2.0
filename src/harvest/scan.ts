@@ -38,21 +38,31 @@ type FsPath = string | Buffer;
 
 interface Entry {
   name: string;
-  /** The name's original bytes when they are not valid UTF-8, else null. */
+  /** The name's on-disk bytes when they are not valid UTF-8 or not NFC, else null. */
   raw: Buffer | null;
   isDir: boolean;
   isFile: boolean;
 }
 
-/** Entries of one directory. A name that is not valid UTF-8 keeps its bytes (`raw`). */
+/** The name's on-disk bytes when the NFC string would not reopen it exactly, else null. */
+const rawOf = (name: string): Buffer | null =>
+  name.normalize('NFC') === name ? null : Buffer.from(name, 'utf8');
+
+/**
+ * Entries of one directory. A name that is not valid UTF-8, or not NFC (macOS writes NFD
+ * accents onto exFAT/SMB/NTFS, which may not match the NFC spelling), keeps its bytes (`raw`):
+ * the stored rel_path is NFC, and the source is reopened through those bytes.
+ */
 export async function listDir(abs: FsPath): Promise<Entry[]> {
   const ents = await readdir(abs, { withFileTypes: true });
-  if (!ents.some((e) => e.name.includes('�'))) return ents.map((e) => toEntry(e.name, null, e));
+  if (!ents.some((e) => e.name.includes('�'))) {
+    return ents.map((e) => toEntry(e.name, rawOf(e.name), e));
+  }
   const bufs = await readdir(abs, { withFileTypes: true, encoding: 'buffer' });
   return bufs.map((e) => {
     const buf = e.name as unknown as Buffer;
     const name = buf.toString('utf8');
-    return toEntry(name, Buffer.from(name, 'utf8').equals(buf) ? null : buf, e);
+    return toEntry(name, Buffer.from(name, 'utf8').equals(buf) ? rawOf(name) : buf, e);
   });
 }
 
@@ -79,7 +89,7 @@ function childPath(parent: FsPath, e: Entry): FsPath {
   return Buffer.concat([Buffer.from(parent), Buffer.from('/'), e.raw ?? Buffer.from(e.name)]);
 }
 
-/** The original bytes of a source-relative path, or null when every component is valid UTF-8. */
+/** The on-disk bytes of a source-relative path, or null when every component is NFC UTF-8. */
 export function rawRelPath(
   parentRel: string,
   parentRaw: Buffer | null,
@@ -409,7 +419,7 @@ export function makeScanFolder(deps: HarvestDeps) {
           { name: e.name, size: Number(s.size) },
           dirCtx,
           settings.minSize,
-          () => (deps.readMake ?? readMake)(abs as string),
+          () => (deps.readMake ?? readMake)(abs),
         );
         if (verdict.kind !== 'photo' && verdict.kind !== 'maybe') return { verdict, cand: null };
         const nfc = rel.normalize('NFC');
