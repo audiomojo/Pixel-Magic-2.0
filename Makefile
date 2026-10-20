@@ -1,5 +1,6 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
 	corpus-manifest corpus-verify \
+	harvest-install harvest-uninstall harvester harvest-status \
 	test-smoke test-standard update-golden golden-smoke chaos
 
 CORPUS := test-automation/sample-images
@@ -79,3 +80,19 @@ update-golden:
 	$(call e2e,TIER=smoke UPDATE_GOLDEN=1 npm run test:e2e)
 
 golden-smoke: update-golden
+
+# Harvest (spec docs/superpowers/specs/2026-10-19-harvest-design.md): the native harvester on the Mac.
+# Install the launchd agent (starts at login; run again after a Node upgrade or a repo move).
+harvest-install: build
+	node dist/harvest/cli.js install
+
+harvest-uninstall:
+	node dist/harvest/cli.js uninstall
+
+# Run the harvester in the foreground (stop the launchd agent first: both would use the port).
+harvester: build
+	node --env-file-if-exists=.env dist/harvest/host.js
+
+# Active run, item counts, gate and the host heartbeat.
+harvest-status:
+	node --env-file-if-exists=.env dist/harvest/cli.js status

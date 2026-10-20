@@ -684,6 +684,275 @@
         "textMode": "value_and_name"
       },
       "description": "Distinct files stored in the vault (one per content, duplicates removed) and their total size."
+    },
+    {
+      "id": 20,
+      "title": "Harvest",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "targets": []
+    },
+    {
+      "id": 21,
+      "title": "Harvest sent",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 5,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE state = 'SENT' AND sent_at >= date_trunc('day', now()))::bigint AS today, count(*) FILTER (WHERE state = 'SENT')::bigint AS total FROM harvest_items"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "description": "Photos the harvester copied into the drop zone: today (database clock, UTC day) and in total."
+    },
+    {
+      "id": 22,
+      "title": "Already in vault",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 5,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE state = 'KNOWN')::bigint AS value FROM harvest_items"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "description": "Harvested files whose bytes were already in the vault, so they were not copied (total)."
+    },
+    {
+      "id": 23,
+      "title": "Harvest run",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 26,
+        "w": 5,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT coalesce((SELECT state || coalesce(' (' || paused_reason || ')', '') FROM harvest_runs WHERE state IN ('scanning','sending','paused') ORDER BY id LIMIT 1), 'idle') AS value"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "description": "The active harvest run's state, plus the reason when it is paused (disk, backlog, stalled, source unplugged). idle: no run is active."
+    },
+    {
+      "id": 24,
+      "title": "Harvester heartbeat",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM harvest_runs WHERE state IN ('scanning','sending','paused')) THEN coalesce(extract(epoch FROM now() - h.heartbeat_at), 999999)::bigint ELSE 0 END AS value FROM (SELECT 1) one LEFT JOIN harvest_host_state h ON h.id = 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a",
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "description": "Seconds since the harvester process last checked in while a run is active (0 when no run is active). Red above 5 minutes: the harvester is not running; see make harvest-status."
+    },
+    {
+      "id": 25,
+      "title": "Possible photos awaiting review",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "pixelmagic"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 26,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "pixelmagic"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE state = 'REVIEW')::bigint AS value FROM harvest_items"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "description": "Possible photos (unusual extensions or folders) waiting for your decision on the harvest page."
+    },
+    {
+      "id": 26,
+      "title": "Harvest page",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 2
+      },
+      "targets": [],
+      "options": {
+        "mode": "markdown",
+        "content": "Harvest page: [http://127.0.0.1:3020](http://127.0.0.1:3020) (choose drives and folders, review possible photos). Run `make harvest-status` for a terminal summary."
+      }
     }
   ]
 }

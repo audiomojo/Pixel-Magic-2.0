@@ -18,6 +18,11 @@ const REQUIRED = [
   'Failed',
   'Recent errors',
   'Last staging build',
+  'Harvest sent',
+  'Already in vault',
+  'Harvest run',
+  'Harvester heartbeat',
+  'Possible photos awaiting review',
 ];
 
 interface Target {
@@ -27,6 +32,7 @@ interface Target {
 }
 interface Panel {
   title: string;
+  type: string;
   targets: Target[];
 }
 interface Dashboard {
@@ -209,6 +215,80 @@ test('Vault counts every stored content and its bytes', async () => {
   await seedPipelineRows(); // 5 contents of 100 bytes
   const r = await row('Vault');
   expect([r.files, r.bytes].map(Number)).toEqual([5, 500]);
+});
+
+async function harvestItem(state: string, n: number, sentAt: string | null = null) {
+  const { pool } = pgh;
+  const src = await pool.query<{ id: string }>(
+    `INSERT INTO harvest_sources (identity, label, kind) VALUES ('i', 'Exp', 'local')
+     ON CONFLICT (identity) DO UPDATE SET kind = 'local' RETURNING id`,
+  );
+  await pool.query(
+    `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state, sent_at)
+     VALUES ($1, $2, $2, 1, $3, 'photo', $4, $5)`,
+    [src.rows[0]!.id, `f${String(n)}`, n, state, sentAt],
+  );
+}
+
+test('Harvest tiles read 0 / idle on a database without harvest rows', async () => {
+  expect(
+    [(await row('Harvest sent')).today, (await row('Harvest sent')).total].map(Number),
+  ).toEqual([0, 0]);
+  expect(Number((await row('Already in vault')).value)).toBe(0);
+  expect((await row('Harvest run')).value).toBe('idle');
+  expect(Number((await row('Harvester heartbeat')).value)).toBe(0);
+  expect(Number((await row('Possible photos awaiting review')).value)).toBe(0);
+});
+
+test('Harvest tiles count items by state and report the active run', async () => {
+  await harvestItem('SENT', 1, new Date().toISOString());
+  await harvestItem('SENT', 2, new Date().toISOString());
+  await harvestItem('SENT', 3, '2020-01-01T00:00:00Z'); // sent long ago: total only
+  await harvestItem('KNOWN', 4);
+  await harvestItem('KNOWN', 5);
+  await harvestItem('REVIEW', 6);
+  await harvestItem('PLANNED', 7);
+  const sent = await row('Harvest sent');
+  expect([sent.today, sent.total].map(Number)).toEqual([2, 3]);
+  expect(Number((await row('Already in vault')).value)).toBe(2);
+  expect(Number((await row('Possible photos awaiting review')).value)).toBe(1);
+
+  const { pool } = pgh;
+  await pool.query(`INSERT INTO harvest_runs (state) VALUES ('done')`);
+  expect((await row('Harvest run')).value).toBe('idle'); // a finished run is not active
+  await pool.query(
+    `INSERT INTO harvest_runs (state, paused_reason) VALUES ('paused', 'disk 81.0 %')`,
+  );
+  expect((await row('Harvest run')).value).toBe('paused (disk 81.0 %)');
+  await pool.query(`UPDATE harvest_runs SET state = 'sending', paused_reason = NULL WHERE id = 2`);
+  expect((await row('Harvest run')).value).toBe('sending');
+});
+
+test('Harvester heartbeat: seconds old while a run is active, 0 when idle, red above 300', async () => {
+  const { pool } = pgh;
+  const hb = async () => Number((await row('Harvester heartbeat')).value);
+  await pool.query(`UPDATE harvest_host_state SET heartbeat_at = now() - interval '10 minutes'`);
+  expect(await hb()).toBe(0); // no active run: a stale heartbeat is not an alarm
+  await pool.query(`INSERT INTO harvest_runs (state) VALUES ('scanning')`);
+  expect(await hb()).toBeGreaterThan(590);
+  await pool.query(`UPDATE harvest_host_state SET heartbeat_at = now()`);
+  expect(await hb()).toBeLessThan(5);
+  await pool.query(`UPDATE harvest_host_state SET heartbeat_at = NULL`);
+  expect(await hb()).toBeGreaterThan(300); // never beat while a run is active: red
+  const panel = loadDashboard().panels.find(
+    (p) => p.title === 'Harvester heartbeat',
+  ) as unknown as {
+    fieldConfig: { defaults: { thresholds: { steps: { color: string; value: number | null }[] } } };
+  };
+  expect(panel.fieldConfig.defaults.thresholds.steps).toEqual([
+    { color: 'green', value: null },
+    { color: 'red', value: 300 },
+  ]);
+});
+
+test('the Harvest page link panel points at the local page', () => {
+  const text = JSON.stringify(loadDashboard().panels.filter((p) => p.type === 'text'));
+  expect(text).toContain('http://127.0.0.1:3020');
 });
 
 test('dashboard has required panels and 5s refresh', () => {

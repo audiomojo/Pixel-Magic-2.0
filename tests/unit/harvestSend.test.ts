@@ -285,8 +285,9 @@ describe('copy protocol', () => {
   test('no file in src/harvest except paths.ts imports a mutating fs function', async () => {
     const MUT =
       /^(promises|open|openSync|writeFile|writeFileSync|appendFile|rename|renameSync|chmod|lchmod|utimes|lutimes|futimes|unlink|unlinkSync|rm|rmSync|rmdir|mkdir|mkdirSync|mkdtemp|copyFile|copyFileSync|cp|link|symlink|truncate|ftruncate|createWriteStream|chown|lchown)$/;
-    // system.ts runs `mount` and `diskutil` (read-only probes): the one child_process user.
-    const CHILD_PROCESS_ALLOWED = new Set(['system.ts']);
+    // system.ts runs `mount` and `diskutil` (read-only probes); cli.ts runs `/bin/launchctl`
+    // (it never receives a source path).
+    const CHILD_PROCESS_ALLOWED = new Set(['system.ts', 'cli.ts']);
     const dir = 'src/harvest';
     const offenders: string[] = [];
     const files = (await readdir(dir, { recursive: true })).filter(

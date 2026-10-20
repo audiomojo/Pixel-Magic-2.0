@@ -52,6 +52,7 @@ Success means:
 | `worker` | TypeScript on Node 24 LTS + Temporal TypeScript SDK. Serves the workflow queue `main` plus `io`, `cpu` and `cluster`. Bind-mounts `DATA_DIR` at `/data`. |
 | `worker-extra` | The same image with `WORKER_QUEUES=main,io,cpu` (no `cluster`), so its in-memory index never flips between replicas. Scale with `docker compose up --scale worker-extra=N`. |
 | `grafana` | Dashboard over a Postgres datasource at `127.0.0.1:3000`. |
+| harvester (native, not a container) | A Node 24 process on the Mac under launchd (`make harvest-install`), outside compose because only the host sees `/Volumes`. Runs the Temporal worker for queue `harvest`, the local page at `127.0.0.1:3020` and the host heartbeat. Copies photos from drives into `DATA_DIR/dropzone/harvest/`; see the harvest spec (`2026-10-19-harvest-design.md`). |
 
 ### 4.2 Task queues
 
@@ -60,6 +61,7 @@ Success means:
 | `io` | `scan_and_start`, `ingest_file`, `reclaim_copy`, `sweep_copies`, `record_hash`, `mark_failed`, `maybe_build_staging` | `IO_CONCURRENCY` = 8 |
 | `cpu` | `decode_content` | `CPU_CONCURRENCY` = number of CPU cores |
 | `cluster` | `cluster_content` | **1**, plus a Postgres advisory lock held for the whole activity, so only one runs system-wide even with several workers |
+| `harvest` | `HarvestWorkflow` and its activities (detect, scan, send, link), served only by the native harvester, never by the worker containers (one active run at a time). |
 | `ai` (future) | `score_content` | Native macOS worker |
 
 ### 4.3 Workflows

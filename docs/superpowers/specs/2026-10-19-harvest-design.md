@@ -93,6 +93,7 @@ harvest_folders (id bigserial PK, source_id FK, rel_path text NOT NULL /* '' = w
   UNIQUE (source_id, rel_path))
 
 harvest_runs (id bigserial PK, workflow_id text UNIQUE, dry_run boolean,
+  send_only boolean NOT NULL DEFAULT false /* review approvals: send PLANNED items, no scan */,
   state text CHECK (state IN ('queued','scanning','sending','paused','done','cancelled','failed')),
   paused_reason text, paused_since timestamptz, created_at, started_at, finished_at, error text)
 
@@ -105,11 +106,17 @@ harvest_items (id bigserial PK, source_id FK, rel_path text NOT NULL, rel_path_r
   path_key text NOT NULL /* NFC + casefold */, size_bytes bigint, mtime_ns bigint,
   kind text CHECK (kind IN ('photo','maybe')),
   state text CHECK (state IN ('PLANNED','SENT','KNOWN','DUP','REVIEW','REJECTED','FAILED','VANISHED')),
-  sha256 char(64), head_hash char(64), dropzone_path text, file_id bigint,
+  sha256 char(64), head_hash char(64), dropzone_path text,
+  dropzone_mtime_ns bigint /* the copy's on-disk mtime (utimes is not ns-exact) */, file_id bigint,
   duplicate_of bigint REFERENCES harvest_items, attempts int DEFAULT 0, last_error text,
   first_seen_run bigint, last_seen_run bigint, sent_at timestamptz,
   UNIQUE (source_id, path_key, size_bytes, mtime_ns))
--- indexes: (state, source_id), (size_bytes), (sha256), (dropzone_path) WHERE file_id IS NULL
+-- indexes: (state, source_id), (size_bytes), (sha256), (dropzone_path) WHERE file_id IS NULL,
+--   (lower(dropzone_path)) WHERE file_id IS NULL      -- name choice: is this name held by an unlinked item?
+--   (sent_at) WHERE state = 'SENT' AND file_id IS NULL -- the throttle gate's recent-unlinked count
+
+harvest_host_state (id int PK CHECK (id = 1), heartbeat_at timestamptz, version text)
+  -- one row, the host heartbeat (every 30 s) that the Grafana tile reads
 
 CREATE INDEX contents_size_idx ON contents (size_bytes);   -- the one pipeline-table change
 ```
@@ -241,12 +248,12 @@ Checked before every file.
 4. Open the source read-only (`O_RDONLY`). Write the bytes to `.<name>.h<item id>.part` beside the destination, which the pipeline ignores (`.part`).
 5. Check the written size equals the source size, and the source's size and mtime are unchanged. Otherwise remove our `.part` and retry later.
 6. `chmod` the `.part` to `(source mode & 0o777) | 0o600` and set its mtime (ns) to the source's. BSD flags are never copied.
-7. Check the destination still does not exist, then `rename` `.part` → destination. If it now exists, go back to step 1 for a new suffix.
+7. Publish without replacing: `link` `.part` → destination, then `unlink` the `.part`. If the destination exists (`EEXIST`), go back to step 1 for a new suffix.
 8. `UPDATE … SET state = 'SENT', sent_at = now()`.
 
 - **After a crash between 7 and 8**, the retry finds its stored destination either still in the drop zone with the same size and mtime, or already claimed (a `files` row with that `rel_path`, size and mtime), and marks it SENT. An orphaned `.<name>.h<id>.part` of its own is deleted.
 - **Errors:** `ENOSPC` → remove the `.part`, pause the run (`disk full`). Any other error → `attempts + 1`, `last_error`; at the cap → `FAILED`. 25 consecutive errors in one batch → pause the run with the last error as the reason.
-- **Fast path:** a source on the same APFS volume as `DATA_DIR` is cloned (`copyFile` with `COPYFILE_FICLONE`), falling back to a byte copy.
+- ~~**Fast path:** a source on the same APFS volume as `DATA_DIR` is cloned.~~ Struck (T7-a): see the changelog.
 
 ## 8. The page and its API
 
@@ -345,3 +352,29 @@ Parsed with the existing config rules (empty = unset, bounds enforced).
 ## 14. Out of scope
 
 Videos and Live Photo movies; cloud sources; deleting or changing anything on a source (never); archives (zip, tgz); changes to ingest, clustering or staging; harvesting arbitrary Mac folders; widening the pipeline's still kinds (DCR, SRW).
+
+## 15. Changelog
+
+Decisions made during implementation that changed or refined this spec, in plain language.
+
+- **R-a (gate):** while the gate is shut, `sendBatch` returns `GATED` with the reason and the workflow sleeps 30 s before calling it again. This replaces "the activity heartbeats every 30 s" (§7.5): the page behaves the same, and a user pause no longer has to cancel a running activity.
+- **R-b (host heartbeat):** a one-row table `harvest_host_state(id = 1, heartbeat_at, version)` holds the host heartbeat the Grafana tile reads.
+- **P1 → T7-a (no clone fast path):** the §7.6 "Fast path" bullet is struck. Node 24 on macOS cannot clone files, and same-volume sources are out of scope (§14). Every copy is a byte copy.
+- **P3 (gate signature):** `checkGate(deps, runId, fileSize, now?)`; the 10-minute stall is measured from that run's own `paused_since` and `paused_reason`.
+- **P4 (page files):** no copy step. The host serves the page from `src/harvest/ui`, found relative to the compiled host file, so the harvester always runs from the repository.
+- **T3-a (`dropzone_mtime_ns`):** `utimes` is only microsecond-exact, so the copy's real on-disk mtime is stored in `harvest_items.dropzone_mtime_ns`. Linking to `files` and crash recognition compare against it, not the source's mtime.
+- **T3-b (no-replace publish):** `.part` → final uses `link` (on `EEXIST`, the next suffix) then `unlink`, never `rename`, which would silently overwrite.
+- **T4-a (diskutil failure):** if `diskutil` fails for a local volume, no `local-name:` identity is minted. The existing row with the same last mount path keeps its identity; otherwise the volume is skipped this round with a warning, so history never forks into "Expansion (2)".
+- **T4-b (hung mounts):** filesystem calls on a mount root during detection time out after 5 s, and that mount is skipped this round (stale SMB shares hang forever).
+- **T5-a (`position`):** `harvest_run_folders.position` stores the selection order, because folder ids of previously harvested folders are older than new ones.
+- **T5-c (`SOURCE_GONE`):** only when the mount itself is gone (no mount, the root cannot be read, or its device id changed). A selected folder missing on a live drive counts as one error ("folder not found") and the folder is done, so a renamed folder never waits forever.
+- **T6-a (stall):** the stall test also requires no unlinked SENT harvest items in the last hour, since our own files in flight mean waiting can still help. "Stalled" can show up to an hour later.
+- **T6-b (known check):** KNOWN ledger items are not candidates in §7.4 step 2. §10.4 (KNOWN only when `contents` holds the sha256 and size) wins, and step 1 already covers them.
+- **T6-c (DUP race):** the DUP write is one conditional statement (the target must still be SENT or PLANNED, else the item is sent). A PLANNED item whose source changed or vanished at send time becomes VANISHED and promotes its duplicates. `paused_since` stays put while the reason stays in the same class (disk, backlog, stalled).
+- **T7-b / T7-d (raw source paths):** a name that is not valid UTF-8, or whose on-disk bytes differ from its NFC spelling (NFD names on exFAT, SMB, NTFS), is stored in `rel_path_raw` and read through that raw path. The drop-zone name uses the NFC `rel_path`.
+- **T7-e (copy hardening):** an `unlink` failure after the link still counts as published (a leftover `.part` is cleaned later); the `.part` is fsynced after its metadata and the parent directory after the link, before SENT; `chmod` and `utimes` go through the open write handle; a zero-row `dropzone_mtime_ns` update aborts and removes the part; known-content hashing heartbeats while it reads.
+- **T9-b (send-only runs):** review approvals create a run with `send_only = true`. It skips the scan, its folders are the approved items' parent directories, it sends only PLANNED items, and it writes no folder history. If the active run is a dry run, approvals queue a send-only run instead of signalling it. One approval never triggers a drive scan.
+- **T9-c (log rotation):** the harvester's log rotation writes through a `GuardedFs` confined to `DATA_DIR/logs`, with no allow-list exception.
+- **T9-d (approval routing):** an approval signals the active run only if it is not a dry run and its folders cover every approved item; otherwise a send-only run is queued. The mount cache can be up to 10 s stale.
+- **T10-a (unidentified drives):** a volume whose probe failed and that matches no row is returned separately as `unidentified` (no row, not selectable). `/api/state` and the page show it greyed as "couldn't identify this drive — Refresh drives". System tools (`/usr/sbin/diskutil`, `/usr/bin/plutil`, `/sbin/mount`) are called by absolute path because launchd's PATH is minimal.
+- **Operations (Task 11):** the agent runs `process.execPath` as recorded at install time, so `make harvest-install` must be re-run after a Node upgrade. Its stdout and stderr go to `DATA_DIR/logs/harvester.launchd.log` (crash output only). The plist is the one write outside `DATA_DIR`, made through a `GuardedFs` on `~/Library/LaunchAgents`.

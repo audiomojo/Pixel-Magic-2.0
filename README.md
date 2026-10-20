@@ -56,6 +56,51 @@ OOM killer ends decodes, which retry and can end FAILED `decode_killed`.
 Container logs use Docker's `local` driver, rotated at 5 × 20 MB per container, so a
 months-long run never fills the Docker VM's disk (which Postgres shares).
 
+## Harvest (external drives and NAS)
+
+Harvest copies real photos from your external drives and network shares into the drop zone
+(`DATA_DIR/dropzone/harvest/<drive>/…`), where the pipeline de-duplicates them as usual. It runs
+natively on the Mac (only the Mac sees `/Volumes`) as a launchd agent that starts at login.
+
+It **never** modifies a source (files are opened read-only, nothing is written, moved or
+deleted there), **never** overwrites a drop-zone file (a name clash gets ` (2)`), and **never**
+starts by itself: there is no schedule, and a run begins only when you press Start on the page.
+Files whose bytes are already in the vault are not copied.
+
+    make harvest-install     # build, write ~/Library/LaunchAgents/com.pixelmagic.harvester.plist, load it
+    make harvest-uninstall   # unload and remove it
+    make harvest-status      # active run, item counts, gate, host heartbeat
+    make harvester           # run in the foreground instead (stop the agent first)
+
+The page is at <http://127.0.0.1:3020> (this Mac only). Pick a drive, tick folders (or the
+whole drive) and press **Start harvest**, or **Dry run** to see what would be sent first. A
+folder you harvested before shows its date; a rescan sends only what is new. Files with unusual
+extensions or in project-like folders are "possible photos": they wait on the **Review** view
+for you to send or skip them (the Grafana "Harvest" row counts them). Pause, resume and cancel
+are on the page; a run waits by itself when the disk or the pipeline backlog is over its limit,
+or when a drive is unplugged, and resumes when that clears.
+
+The dev/compose stack (Postgres and Temporal) must be up and migrated (`make up`) before the
+harvester can work; it retries until they answer.
+
+| Variable                    | Default | Meaning                                                   |
+| --------------------------- | ------- | --------------------------------------------------------- |
+| `HARVEST_UI_PORT`           | 3020    | Page port (127.0.0.1 only).                               |
+| `HARVEST_MAX_DISK_PCT`      | 80      | Pause sending when `DATA_DIR`'s disk would pass this.     |
+| `HARVEST_MAX_PENDING_FILES` | 20000   | Pause when the drop-zone backlog reaches this many files. |
+| `HARVEST_MAX_PENDING_BYTES` | unset   | Optional byte limit on the backlog.                       |
+| `HARVEST_MIN_SIZE`          | 20480   | Smaller files are skipped as too small (bytes).           |
+| `HARVEST_MAX_ATTEMPTS`      | 5       | Copy attempts per file before it is marked FAILED.        |
+| `HARVEST_THUMB_CACHE_MB`    | 1024    | Thumbnail cache cap.                                      |
+
+They are read from `.env` (see `.env.example`); restart the agent (`make harvest-install`) after
+changing one.
+
+Logs: `DATA_DIR/logs/harvester.log` (rotated by size) and, for crashes only,
+`DATA_DIR/logs/harvester.launchd.log`. **After a Node upgrade (or moving the repo) run
+`make harvest-install` again**: the agent records the absolute Node path it was installed with.
+Design: `docs/superpowers/specs/2026-10-19-harvest-design.md`.
+
 ## Upgrading
 
 Up to `MAX_IN_FLIGHT` (5,000) FileWorkflows are always in flight, and a workflow-code change
