@@ -68,6 +68,8 @@ const MAX_HISTORY = 10_000;
 const GATE_RECHECK = '30s';
 const STALL_RECHECK = '5m';
 const SOURCE_RECHECK = '60s';
+/** Shown at once when a pause arrives during a scan step (it takes effect after the step). */
+export const PAUSE_REQUESTED = 'pause requested — after the current folder step';
 
 export interface HarvestInput {
   runId: string;
@@ -133,6 +135,26 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     } else await condition(() => woke() || paused, timeout);
   }
 
+  /**
+   * One scanFolder call. A pause during it is shown at once ("pause requested …") and honoured
+   * after it. The activity is always awaited to its end, also on cancellation
+   * (WAIT_CANCELLATION_COMPLETED): the run must not finish while it still works.
+   */
+  async function scanStep(folderId: string) {
+    let settled = false;
+    const step = scanFolder(runId, folderId).finally(() => {
+      settled = true;
+    });
+    try {
+      await condition(() => settled || paused);
+      if (!settled) await show('paused', PAUSE_REQUESTED);
+    } catch (e) {
+      await step.catch(() => undefined);
+      throw e;
+    }
+    return await step;
+  }
+
   async function body(): Promise<'done'> {
     if (phase === 'scan') {
       const run = await loadRun(runId);
@@ -154,9 +176,9 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
                 ...carry,
               });
             }
-            const res = await scanFolder(runId, folder.folderId);
+            const res = await scanStep(folder.folderId);
             if (res.outcome === 'DONE') {
-              await show('scanning');
+              if (!paused) await show('scanning');
               break;
             }
             if (res.outcome === 'UNREADABLE') {

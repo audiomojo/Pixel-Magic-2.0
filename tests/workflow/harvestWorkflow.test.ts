@@ -535,3 +535,69 @@ test('UNREADABLE during the scan pauses with the reason until resume, then resca
   expect(count(f, 'scanFolder f1')).toBe(2);
   expect(f.calls.slice(-2)).toEqual(['finishRun done', 'startNextQueued']);
 });
+
+test('a pause during a long scan shows at once, then takes effect after the folder step', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let n = 0;
+  const f = fakes({
+    scan: async () => {
+      if (n++ === 0) await gate;
+      return SCAN_DONE;
+    },
+  });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('scanFolder f1'));
+  await h.signal('pause');
+  await until(f, (c) =>
+    c.includes('state paused: pause requested — after the current folder step'),
+  );
+  expect(count(f, 'scanFolder f2')).toBe(0); // the scan step is still running
+  release();
+  await until(f, (c) => c.includes('state paused: paused by you'));
+  await new Promise((r) => setTimeout(r, 300));
+  expect(count(f, 'scanFolder f2')).toBe(0);
+  await h.signal('resume');
+  expect(await h.result()).toBe('done');
+  expect(count(f, 'scanFolder f2')).toBe(1);
+});
+
+test.each([true, false])(
+  'a cancel during a scan step (paused: %s) still waits for the activity',
+  async (pause) => {
+    // Heartbeats start once the cancel is issued: the first one is sent at once and carries it.
+    let issued!: () => void;
+    const cancelIssued = new Promise<void>((r) => (issued = r));
+    const f = fakes({
+      scan: async () => {
+        const ctx = Context.current();
+        await cancelIssued;
+        const beat = setInterval(() => ctx.heartbeat(), 50);
+        try {
+          await ctx.cancelled;
+        } catch {
+          // cancelled: clean up slowly
+        } finally {
+          clearInterval(beat);
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        f.calls.push('scanFolder returned');
+        return SCAN_DONE;
+      },
+    });
+    const h = await begin(f);
+    await until(f, (c) => c.includes('scanFolder f1'));
+    if (pause) {
+      await h.signal('pause');
+      await until(f, (c) => c.some((x) => x.startsWith('state paused: pause requested')));
+    }
+    await h.cancel();
+    issued();
+    await expect(h.result()).rejects.toBeInstanceOf(WorkflowFailedError);
+    expect(f.calls.slice(-3)).toEqual([
+      'scanFolder returned',
+      'finishRun cancelled',
+      'startNextQueued',
+    ]);
+  },
+);
