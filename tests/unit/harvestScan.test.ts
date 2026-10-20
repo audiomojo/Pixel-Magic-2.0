@@ -675,6 +675,81 @@ describe('raw path encoding', () => {
       rows.every((r) => r.last === '8' && r.first === '7' && r.mtime === '1700000000123456789'),
     ).toBe(true);
   });
+  test('a respelled name (NFC <-> NFD, same key) refreshes rel_path and rel_path_raw', async () => {
+    const sources = await registerSources(pgh.pool, [
+      { identity: 'local:N', labelBase: 'N', kind: 'local', mountPath: '/Volumes/N' },
+    ]);
+    const nfc = 'd/caf\u00e9.cr2';
+    const nfd = 'd/cafe\u0301.cr2';
+    const cand = (raw: Buffer | null, mtimeNs = 1_700_000_000_000_000_000n) => ({
+      rel: nfc,
+      raw,
+      key: nfc.toLowerCase(),
+      size: 500n,
+      mtimeNs,
+      kind: 'photo' as const,
+    });
+    const raw = async () =>
+      (await pgh.pool.query<{ r: Buffer | null }>('SELECT rel_path_raw AS r FROM harvest_items'))
+        .rows;
+    const c = await pgh.pool.connect();
+    try {
+      await upsertBatch(c, sources[0]!.id, '7', 5, [cand(null)]);
+      expect(await raw()).toEqual([{ r: null }]);
+      // Respelled on disk as NFD: the stored bytes must follow, or the source cannot be reopened.
+      await upsertBatch(c, sources[0]!.id, '8', 5, [cand(Buffer.from(nfd))]);
+      expect(await raw()).toEqual([{ r: Buffer.from(nfd) }]);
+      // Back to NFC, with an exFAT DST shift on the way (the same row by sameMtime).
+      await upsertBatch(c, sources[0]!.id, '9', 5, [
+        cand(null, 1_700_000_000_000_000_000n + 3_600_000_000_000n),
+      ]);
+      expect(await raw()).toEqual([{ r: null }]);
+      // A case respell keeps the key and refreshes rel_path.
+      await upsertBatch(c, sources[0]!.id, '10', 5, [{ ...cand(null), rel: 'd/CAF\u00c9.cr2' }]);
+    } finally {
+      c.release();
+    }
+    const rows = await items();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.rel_path).toBe('d/CAF\u00c9.cr2');
+  });
+
+  test('the insert conflict path also refreshes the spelling', async () => {
+    const sources = await registerSources(pgh.pool, [
+      { identity: 'local:Q', labelBase: 'Q', kind: 'local', mountPath: '/Volumes/Q' },
+    ]);
+    const sid = sources[0]!.id;
+    const key = 'd/caf\u00e9.cr2';
+    const cand = (raw: Buffer | null) => ({
+      rel: key,
+      raw,
+      key,
+      size: 500n,
+      mtimeNs: 5n,
+      kind: 'photo' as const,
+    });
+    // Two scans race: the second one's lookup cannot see the first one's uncommitted row, so
+    // its insert ends in ON CONFLICT once the first commits.
+    const c1 = await pgh.pool.connect();
+    const c2 = await pgh.pool.connect();
+    try {
+      await c1.query('BEGIN');
+      await upsertBatch(c1, sid, '7', 5, [cand(null)]);
+      await c2.query('BEGIN');
+      const second = upsertBatch(c2, sid, '8', 5, [cand(Buffer.from('d/cafe\u0301.cr2'))]);
+      await new Promise((r) => setTimeout(r, 200));
+      await c1.query('COMMIT');
+      await second;
+      await c2.query('COMMIT');
+    } finally {
+      c1.release();
+      c2.release();
+    }
+    const rows = await items();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.rel_path_raw).toEqual(Buffer.from('d/cafe\u0301.cr2'));
+    expect(rows[0]!.last).toBe('8');
+  });
 });
 
 describe('runs', () => {

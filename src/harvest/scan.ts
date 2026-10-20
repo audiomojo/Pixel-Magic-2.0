@@ -169,7 +169,13 @@ export async function upsertBatch(
   const byKey = new Map<string, ExistingRow[]>();
   for (const r of rows) byKey.set(r.path_key, [...(byKey.get(r.path_key) ?? []), r]);
 
-  const upd = { id: [] as string[], old: [] as string[], next: [] as string[] };
+  const upd = {
+    id: [] as string[],
+    old: [] as string[],
+    next: [] as string[],
+    rel: [] as string[],
+    raw: [] as (string | null)[],
+  };
   const ins: Candidate[] = [];
   const seen = new Set<string>();
   for (const b of batch) {
@@ -183,6 +189,8 @@ export async function upsertBatch(
       upd.id.push(hit.id);
       upd.old.push(hit.state);
       upd.next.push(seenAgain(hit, maxAttempts));
+      upd.rel.push(b.rel);
+      upd.raw.push(b.raw?.toString('hex') ?? null);
     } else {
       const k = `${b.key}\0${b.size}\0${b.mtimeNs}`;
       if (seen.has(k)) continue; // an NFC/NFD twin in the same directory
@@ -190,14 +198,18 @@ export async function upsertBatch(
       ins.push(b);
     }
   }
+  // The spelling is refreshed from the scan: an NFC <-> NFD (or case) respell keeps the key, and
+  // stale raw bytes would no longer reopen the file.
   if (upd.id.length) {
     await c.query(
       `UPDATE harvest_items i
        SET last_seen_run = $1::bigint,
-           state = CASE WHEN i.state = u.old THEN u.next ELSE i.state END
-       FROM unnest($2::bigint[], $3::text[], $4::text[]) AS u(id, old, next)
+           state = CASE WHEN i.state = u.old THEN u.next ELSE i.state END,
+           rel_path = u.rel, rel_path_raw = decode(u.raw, 'hex')
+       FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::text[])
+         AS u(id, old, next, rel, raw)
        WHERE i.id = u.id`,
-      [runId, upd.id, upd.old, upd.next],
+      [runId, upd.id, upd.old, upd.next, upd.rel, upd.raw],
     );
   }
   if (ins.length) {
@@ -210,7 +222,8 @@ export async function upsertBatch(
        FROM unnest($3::text[], $4::text[], $5::text[], $6::bigint[], $7::bigint[], $8::text[])
          AS t(rel, raw, key, size, mtime, kind)
        ON CONFLICT (source_id, path_key, size_bytes, mtime_ns)
-       DO UPDATE SET last_seen_run = EXCLUDED.last_seen_run`,
+       DO UPDATE SET last_seen_run = EXCLUDED.last_seen_run,
+                     rel_path = EXCLUDED.rel_path, rel_path_raw = EXCLUDED.rel_path_raw`,
       [
         sourceId,
         runId,
