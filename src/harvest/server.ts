@@ -13,7 +13,7 @@ import type { RunControl } from './activities.js';
 import { childContext, keepDir, ROOT_CONTEXT } from './classify.js';
 import type { HarvestSettings } from './config.js';
 import { GuardedFs, sourcePath } from './paths.js';
-import { createRun, finishRunRows, startNextQueued } from './runs.js';
+import { addRunItems, createRun, finishRunRows, startNextQueued } from './runs.js';
 import {
   detectSources,
   registerDetected,
@@ -585,21 +585,22 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     const b = parse(reviewBody, body);
     const to = b.action === 'send' ? 'PLANNED' : 'REJECTED';
     const sql = `UPDATE harvest_items SET state = '${to}' WHERE state = 'REVIEW'`;
+    const ret = 'RETURNING id::text AS id, source_id::text AS source_id, rel_path';
+    type Approved = { id: string; source_id: string; rel_path: string };
     const { rows } =
       'itemIds' in b
-        ? await pool.query<{ source_id: string; rel_path: string }>(
-            `${sql} AND id = ANY($1::bigint[]) RETURNING source_id::text AS source_id, rel_path`,
-            [b.itemIds],
-          )
-        : await pool.query<{ source_id: string; rel_path: string }>(
-            `${sql} AND source_id = $1 AND ${PARENT_SQL} = $2 RETURNING source_id::text AS source_id, rel_path`,
-            [b.sourceId, b.path],
-          );
+        ? await pool.query<Approved>(`${sql} AND id = ANY($1::bigint[]) ${ret}`, [b.itemIds])
+        : await pool.query<Approved>(`${sql} AND source_id = $1 AND ${PARENT_SQL} = $2 ${ret}`, [
+            b.sourceId,
+            b.path,
+          ]);
     if (b.action === 'skip' || rows.length === 0) return { changed: rows.length };
+    const ids = rows.map((r) => r.id);
     // Approved. A live (not dry) run whose folders cover every approved item sends them when
-    // signalled; otherwise a send-only run over the items' folders (no scan) is queued.
-    const active = await pool.query<{ id: string; dry_run: boolean }>(
-      `SELECT id::text AS id, dry_run FROM harvest_runs
+    // signalled (a send-only one records them first: it sends only its own items); otherwise a
+    // send-only run over the items' folders (no scan) is queued with exactly these items.
+    const active = await pool.query<{ id: string; dry_run: boolean; send_only: boolean }>(
+      `SELECT id::text AS id, dry_run, send_only FROM harvest_runs
        WHERE state IN ${ACTIVE_STATES} ORDER BY id LIMIT 1`,
     );
     const act = active.rows[0];
@@ -617,6 +618,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         ),
       );
       if (covered) {
+        if (act.send_only) await addRunItems(pool, act.id, ids);
         await viaTemporal('signalling the run', () => control.signal(act.id, 'itemsApproved'));
         return { changed: rows.length, runId: act.id };
       }
@@ -626,7 +628,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       const relPath = parentDir(r.rel_path);
       folders.set(`${r.source_id}\0${relPath}`, { sourceId: r.source_id, relPath });
     }
-    const runId = await createRun(pool, [...folders.values()], { sendOnly: true });
+    const runId = await createRun(pool, [...folders.values()], { sendOnly: true, items: ids });
     await viaTemporal('starting the run (it stays queued)', () => startNextQueued(pool, control));
     return { changed: rows.length, runId };
   }

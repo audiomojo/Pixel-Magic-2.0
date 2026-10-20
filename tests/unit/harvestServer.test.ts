@@ -8,7 +8,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { DataLayout } from '../../src/fsops.js';
 import type { RunControl } from '../../src/harvest/activities.js';
 import { loadHarvestSettings } from '../../src/harvest/config.js';
-import { createRun, setRunState } from '../../src/harvest/runs.js';
+import { createRun, finishRunRows, setRunState } from '../../src/harvest/runs.js';
 import { createHarvestServer, type HarvestServerDeps } from '../../src/harvest/server.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { HEIC_SCENE0 } from '../helpers/images.js';
@@ -741,6 +741,43 @@ describe('review', () => {
       { rel_path: '', dry_run: false },
       { rel_path: 'Pics', dry_run: false },
     ]);
+  });
+
+  const runItems = async (runId: string): Promise<string[]> =>
+    (
+      await pgh.pool.query<{ id: string }>(
+        'SELECT item_id::text AS id FROM harvest_run_items WHERE run_id = $1 ORDER BY item_id',
+        [runId],
+      )
+    ).rows.map((r) => r.id);
+
+  test('a send-only run records exactly the approved items (F-1)', async () => {
+    const e = await setup();
+    const a = await item(e, 'Pics/a.png', 'REVIEW');
+    const b = await item(e, 'Pics/b.png', 'REVIEW');
+    await item(e, 'Pics/c.png', 'REVIEW'); // not approved
+    await item(e, 'Pics/p.jpg', 'PLANNED'); // a photo waiting for a normal run
+    const r = await e.post('/api/review', { itemIds: [a, b], action: 'send' });
+    expect(await runItems(r.json.runId)).toEqual([a, b].sort((x, y) => Number(x) - Number(y)));
+  });
+
+  test('approvals covered by an active send-only run join its items; a normal run adds none', async () => {
+    const e = await setup();
+    const x = await item(e, 'Pics/x.png', 'REVIEW');
+    const first = await e.post('/api/review', { itemIds: [x], action: 'send' });
+    const so = first.json.runId as string;
+    await setRunState(pgh.pool, so, 'sending');
+    const y = await item(e, 'Pics/y.png', 'REVIEW');
+    const r = await e.post('/api/review', { itemIds: [y], action: 'send' });
+    expect(r.json.runId).toBe(so);
+    expect(await runItems(so)).toEqual([x, y]);
+    expect(e.calls).toEqual([`start ${so}`, `signal ${so} itemsApproved`]);
+    await finishRunRows(pgh.pool, so, 'done');
+    const normal = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: '' }], false);
+    await setRunState(pgh.pool, normal, 'sending');
+    const z = await item(e, 'Pics/z.png', 'REVIEW');
+    expect((await e.post('/api/review', { itemIds: [z], action: 'send' })).json.runId).toBe(normal);
+    expect(await runItems(normal)).toEqual([]); // its folders already hold the item
   });
 
   test('approving at a source root queues a send-only run for that folder only', async () => {

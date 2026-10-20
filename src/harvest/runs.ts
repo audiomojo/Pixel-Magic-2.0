@@ -3,17 +3,21 @@ import { withTx } from '../db.js';
 import type { RunControl } from './activities.js';
 
 /**
- * Creates a queued run over the given folders (`sendOnly`: only PLANNED items under them are
- * sent, nothing is scanned; used for review approvals): upserts `harvest_folders`, then the run and its
- * `harvest_run_folders` rows (all `queued`). Returns the run id.
+ * Creates a queued run over the given folders: upserts `harvest_folders`, then the run and its
+ * `harvest_run_folders` rows (all `queued`). Returns the run id. `sendOnly` (review approvals):
+ * nothing is scanned and only `items` (the approved ids, recorded in `harvest_run_items`) are
+ * sent, while still PLANNED; the folders are their parent directories, for display and counters.
  */
 export async function createRun(
   pool: pg.Pool,
   folders: { sourceId: string; relPath: string }[],
-  options: boolean | { dryRun?: boolean; sendOnly?: boolean },
+  options: boolean | { dryRun?: boolean; sendOnly?: boolean; items?: string[] },
 ): Promise<string> {
-  const { dryRun = false, sendOnly = false } =
-    typeof options === 'boolean' ? { dryRun: options } : options;
+  const {
+    dryRun = false,
+    sendOnly = false,
+    items = [],
+  } = typeof options === 'boolean' ? { dryRun: options } : options;
   return withTx(pool, async (c) => {
     const ids: string[] = [];
     for (const f of folders) {
@@ -38,8 +42,23 @@ export async function createRun(
         [runId, folderId, position],
       );
     }
+    if (sendOnly) await addRunItems(c, runId, items);
     return runId;
   });
+}
+
+/** Records approved items for a send-only run (F-1); a send-only run sends only these. */
+export async function addRunItems(
+  c: pg.Pool | pg.PoolClient,
+  runId: string,
+  items: string[],
+): Promise<void> {
+  if (items.length === 0) return;
+  await c.query(
+    `INSERT INTO harvest_run_items (run_id, item_id)
+     SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING`,
+    [runId, items],
+  );
 }
 
 export interface RunFolder {

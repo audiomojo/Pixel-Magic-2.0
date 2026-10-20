@@ -1018,6 +1018,48 @@ describe('paging (I5)', () => {
   });
 });
 
+describe('send-only runs (F-1)', () => {
+  test('approving 3 maybes in a folder with 100 PLANNED photos sends exactly those 3', async () => {
+    const spec: TreeSpec = {};
+    for (let i = 0; i < 100; i++) spec[`DCIM/p${String(i).padStart(3, '0')}.cr2`] = 200 + i;
+    for (const n of ['m1', 'm2', 'm3']) spec[`DCIM/${n}.cr2`] = randomBytes(400);
+    const e = await setup(spec);
+    // The three stand in for approved maybes (REVIEW → PLANNED); the 100 photos stay PLANNED.
+    const approved = (await items()).filter((i) => /\/m\d\.cr2$/.test(i.rel_path)).map((i) => i.id);
+    await pgh.pool.query("UPDATE harvest_items SET kind = 'maybe' WHERE id = ANY($1::bigint[])", [
+      approved,
+    ]);
+    const so = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: 'DCIM' }], {
+      sendOnly: true,
+      items: approved,
+    });
+    const { sendBatch } = createHarvestActivities(e.deps);
+    expect(await runActivity(sendBatch, [so, {}])).toMatchObject({ outcome: 'DONE', sent: 3 });
+    const rows = await items();
+    expect(
+      rows
+        .filter((r) => r.state === 'SENT')
+        .map((r) => r.id)
+        .sort(),
+    ).toEqual([...approved].sort());
+    expect(rows.filter((r) => r.state === 'PLANNED')).toHaveLength(100);
+  });
+
+  test('a root-level approval sends exactly the approved items', async () => {
+    const e = await setup({ 'top.cr2': 300, 'other.cr2': 301, 'DCIM/a.cr2': 302 });
+    const top = await item('top.cr2');
+    const so = await createRun(pgh.pool, [{ sourceId: e.sourceId, relPath: '' }], {
+      sendOnly: true,
+      items: [top.id],
+    });
+    const { sendBatch } = createHarvestActivities(e.deps);
+    expect(await runActivity(sendBatch, [so, {}])).toMatchObject({ outcome: 'DONE', sent: 1 });
+    expect((await item('top.cr2')).state).toBe('SENT');
+    expect((await item('other.cr2')).state).toBe('PLANNED');
+    expect((await item('DCIM/a.cr2')).state).toBe('PLANNED');
+  });
+});
+
 describe('cancellation and heartbeats', () => {
   test('cancellation deletes the part', async () => {
     const e = await setup({ 'DCIM/big.cr2': 64 * 1024 * 1024 });
