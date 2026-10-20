@@ -140,6 +140,21 @@ export function folderOf(scope: SendScope, sourceId: string, key: string): numbe
   return best;
 }
 
+export type FolderState = 'queued' | 'scanning' | 'sending' | 'waiting_source' | 'done';
+
+/** Sets one run folder's state (spec §9: `waiting_source` while its drive is unplugged). */
+export async function setFolderState(
+  pool: pg.Pool,
+  runId: string,
+  folderId: string,
+  state: FolderState,
+): Promise<void> {
+  await pool.query(
+    'UPDATE harvest_run_folders SET state = $3 WHERE run_id = $1 AND folder_id = $2',
+    [runId, folderId, state],
+  );
+}
+
 export type RunState =
   'queued' | 'scanning' | 'sending' | 'paused' | 'done' | 'cancelled' | 'failed';
 

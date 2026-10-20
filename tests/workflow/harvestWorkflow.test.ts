@@ -81,6 +81,10 @@ const activities = {
     cur.sendStates.push(state);
     return cur.send();
   },
+  setFolderState: (_runId: string, folderId: string, state: string) => {
+    cur.calls.push(`folder ${folderId} ${state}`);
+    return Promise.resolve();
+  },
   setRunState: (_runId: string, state: string, reason?: string | null) => {
     cur.calls.push(reason ? `state ${state}: ${reason}` : `state ${state}`);
     return Promise.resolve();
@@ -284,8 +288,9 @@ test('SOURCE_GONE during scan pauses and retries the same folder', async () => {
   });
   await run(f);
   const i = f.calls.indexOf('scanFolder f1');
-  expect(f.calls.slice(i, i + 4)).toEqual([
+  expect(f.calls.slice(i, i + 5)).toEqual([
     'scanFolder f1',
+    'folder f1 waiting_source', // spec §9 (M1)
     'state paused: Drive unplugged',
     'scanFolder f1',
     'state scanning',

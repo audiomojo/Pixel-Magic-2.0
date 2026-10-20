@@ -214,6 +214,13 @@ const counters = async (runId: string) =>
   ).rows[0]!;
 
 const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+const folderStates = async (runId: string): Promise<string[]> =>
+  (
+    await pgh.pool.query<{ state: string }>(
+      'SELECT state FROM harvest_run_folders WHERE run_id = $1 ORDER BY position',
+      [runId],
+    )
+  ).rows.map((r) => r.state);
 
 describe('copy protocol', () => {
   test('sends photos atomically', async () => {
@@ -626,6 +633,28 @@ describe('source changes', () => {
     mounted = false;
     expect(await e.send()).toMatchObject({ outcome: 'SOURCE_GONE', reason: 'Drive unplugged' });
     expect(await item('DCIM/a.cr2')).toMatchObject({ state: 'PLANNED', attempts: 0 });
+    expect(await folderStates(e.runId)).toEqual(['waiting_source']); // spec §9 (M1)
+  });
+
+  test('run folder states during sends: sending, then done (M1)', async () => {
+    const e = await setup({ 'A/a.cr2': randomBytes(500), 'B/b.cr2': randomBytes(600) });
+    const run = await createRun(
+      pgh.pool,
+      [
+        { sourceId: e.sourceId, relPath: 'A' },
+        { sourceId: e.sourceId, relPath: 'B' },
+      ],
+      false,
+    );
+    const { sendBatch } = createHarvestActivities({ ...e.deps, sendBatchSize: 1 });
+    const r1 = await runActivity(sendBatch, [run, {}]);
+    expect(await folderStates(run)).toEqual(['sending', 'queued']);
+    const r2 = await runActivity(sendBatch, [run, { cursor: r1.cursor }]);
+    expect(await folderStates(run)).toEqual(['done', 'sending']);
+    expect(await runActivity(sendBatch, [run, { cursor: r2.cursor }])).toMatchObject({
+      outcome: 'DONE',
+    });
+    expect(await folderStates(run)).toEqual(['done', 'done']);
   });
 
   test('unplugged mid-copy: SOURCE_GONE, never FAILED, part removed', async () => {

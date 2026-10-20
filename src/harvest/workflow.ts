@@ -58,8 +58,8 @@ export const HARVEST_ACTIVITY_OPTIONS = {
 type A = ReturnType<typeof createHarvestActivities>;
 const { scanFolder } = proxyActivities<Pick<A, 'scanFolder'>>(HARVEST_ACTIVITY_OPTIONS.scanFolder);
 const { sendBatch } = proxyActivities<Pick<A, 'sendBatch'>>(HARVEST_ACTIVITY_OPTIONS.sendBatch);
-const { loadRun, setRunState, finishRun, startNextQueued } = proxyActivities<
-  Pick<A, 'loadRun' | 'setRunState' | 'finishRun' | 'startNextQueued'>
+const { loadRun, setRunState, setFolderState, finishRun, startNextQueued } = proxyActivities<
+  Pick<A, 'loadRun' | 'setRunState' | 'setFolderState' | 'finishRun' | 'startNextQueued'>
 >(HARVEST_ACTIVITY_OPTIONS.other);
 
 export const BATCHES_PER_RUN = 50;
@@ -163,6 +163,8 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
               // Nothing could be read (no Full Disk Access, say): wait for the user to resume.
               await waitPaused('scanning', res.reason ?? 'cannot read the folder');
             } else {
+              // T5-b: the scan only reports SOURCE_GONE; the folder waits for its drive (§9).
+              await setFolderState(runId, folder.folderId, 'waiting_source');
               await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
             }
           }

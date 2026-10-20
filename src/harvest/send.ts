@@ -13,7 +13,7 @@ import {
   type ReadFsOps,
   type SourcePath,
 } from './paths.js';
-import { finishRunRows, loadScope, underKey, type SendScope } from './runs.js';
+import { finishRunRows, loadScope, setFolderState, underKey, type SendScope } from './runs.js';
 import { resolveMount } from './sources.js';
 import { checkGate } from './throttle.js';
 
@@ -577,8 +577,20 @@ export function makeSendBatch(deps: HarvestDeps) {
       cursor,
       consecutive,
     });
+    // Run folder states (spec §9): the folder being sent is `sending`, one whose drive is gone
+    // `waiting_source`, every other `done` once its turn has passed.
+    let current: string | null = null;
     for (const it of batch) {
       signal.throwIfAborted();
+      if (it.folder_id !== current) {
+        await pool.query(
+          `UPDATE harvest_run_folders
+           SET state = CASE WHEN folder_id = $2 THEN 'sending' ELSE 'done' END
+           WHERE run_id = $1 AND (folder_id = $2 OR state IN ('sending', 'waiting_source'))`,
+          [runId, it.folder_id],
+        );
+        current = it.folder_id;
+      }
       let out: ItemOutcome;
       try {
         out = await sendItem(it);
@@ -586,7 +598,12 @@ export function makeSendBatch(deps: HarvestDeps) {
         throw e instanceof Crash ? e.cause : e;
       }
       // A stop leaves the cursor before this item: it is tried again first.
-      if (typeof out === 'object') return stopped(out.stop, out.reason);
+      if (typeof out === 'object') {
+        if (out.stop === 'SOURCE_GONE') {
+          await setFolderState(pool, runId, it.folder_id, 'waiting_source');
+        }
+        return stopped(out.stop, out.reason);
+      }
       cursor = { pos: it.pos, key: it.path_key, id: it.id };
       if (out === 'sent') res.sent++;
       else if (out === 'known') res.known++;
@@ -601,6 +618,12 @@ export function makeSendBatch(deps: HarvestDeps) {
     // behind it (an error under the cap, an approval, a promoted duplicate) start a new pass.
     if (batch.length === limit) return { ...res, outcome: 'MORE', cursor, consecutive };
     const again = await anyPlanned(pool, scope);
+    if (!again) {
+      await pool.query(
+        `UPDATE harvest_run_folders SET state = 'done' WHERE run_id = $1 AND state <> 'done'`,
+        [runId],
+      );
+    }
     return { ...res, outcome: again ? 'MORE' : 'DONE', cursor: null, consecutive };
   }
 
