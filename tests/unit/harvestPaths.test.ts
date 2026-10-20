@@ -190,7 +190,8 @@ describe('copyInto and publishNoReplace', () => {
       mtimeNs: MT,
       onChunk: (n) => seen.push(n),
     });
-    expect(readFileSync(dest)).toEqual(bytes);
+    // Buffer.equals: a deep toEqual over 3 MB walks every byte (seconds under coverage).
+    expect(readFileSync(dest).equals(bytes)).toBe(true);
     expect(seen).toEqual([1048576, 2097152, 3000000]);
     const st = lstatSync(dest, { bigint: true });
     expect(got).toBe(st.mtimeNs);
@@ -209,7 +210,8 @@ describe('copyInto and publishNoReplace', () => {
   test('copyInto reads a source given as raw bytes', async () => {
     const dest = join(root, 'c2.part');
     await g.copyInto(Buffer.from(src), dest, { mode: 0o600, mtimeNs: MT });
-    expect(readFileSync(dest)).toEqual(bytes);
+    // Buffer.equals: a deep toEqual over 3 MB walks every byte (seconds under coverage).
+    expect(readFileSync(dest).equals(bytes)).toBe(true);
   });
 
   test('sourcePath joins the mount and the raw bytes exactly', () => {
