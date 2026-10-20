@@ -25,10 +25,12 @@ export interface CliDeps {
   node?: string;
   repo?: string;
   logDir?: string;
+  /** Delay between bootstrap retries; tests inject a no-op. */
+  sleep?: (ms: number) => Promise<void>;
   pool?: Pick<pg.Pool, 'query'>;
 }
 
-const USAGE = 'usage: harvest/cli install | uninstall | status\n';
+const USAGE = 'usage: harvest/cli install | uninstall | stop | start | status\n';
 
 /** The real runner; `exec` is injectable so tests never reach launchctl. */
 export const makeLaunchctl =
@@ -60,11 +62,34 @@ export function withDefaults(d: CliDeps): Required<Omit<CliDeps, 'pool'>> {
     node: d.node ?? process.execPath,
     repo: d.repo ?? REPO_ROOT,
     logDir: d.logDir ?? join(loadHarvestSettings().dataDir, 'logs'),
+    sleep: d.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
   };
 }
 
+const BOOTSTRAP_TRIES = 3;
+const BOOTSTRAP_DELAY_MS = 1000;
+
+/**
+ * `launchctl bootstrap`, retried on "Input/output error" (exit 5: a bootout may still be tearing
+ * down). "Already loaded" counts as success. Returns an error message, or null when loaded.
+ */
+async function bootstrap(
+  d: ReturnType<typeof withDefaults>,
+  target: string,
+): Promise<string | null> {
+  let r = { code: 0, stderr: '' };
+  for (let i = 0; i < BOOTSTRAP_TRIES; i++) {
+    if (i > 0) await d.sleep(BOOTSTRAP_DELAY_MS);
+    r = await d.launchctl(['bootstrap', `gui/${String(d.uid)}`, target]);
+    if (r.code === 0 || /already (loaded|bootstrapped)/i.test(r.stderr)) return null;
+    if (r.code !== 5 && !/input\/output error/i.test(r.stderr)) break;
+  }
+  return r.stderr.trim();
+}
+
 async function install(deps: CliDeps): Promise<number> {
-  const { launchctl, agentsDir: dir, uid, node, repo, logDir } = withDefaults(deps);
+  const d = withDefaults(deps);
+  const { launchctl, agentsDir: dir, uid, node, repo, logDir } = d;
   const target = join(dir, `${LABEL}.plist`);
   const domain = `gui/${String(uid)}`;
 
@@ -84,9 +109,9 @@ async function install(deps: CliDeps): Promise<number> {
 
   // Idempotent: unload whatever is loaded (failure = nothing was), then load the new plist.
   await launchctl(['bootout', `${domain}/${LABEL}`]);
-  const r = await launchctl(['bootstrap', domain, target]);
-  if (r.code !== 0 && !/already (loaded|bootstrapped)/i.test(r.stderr)) {
-    fail(`launchctl bootstrap failed: ${r.stderr.trim()}`);
+  const err = await bootstrap(d, target);
+  if (err !== null) {
+    fail(`launchctl bootstrap failed: ${err}`);
     return 1;
   }
   out(`installed ${target}; the harvester starts now and at every login`);
@@ -106,6 +131,35 @@ async function uninstall(deps: CliDeps): Promise<number> {
       if (e.code !== 'ENOENT') throw e;
     });
   out('uninstalled the harvester agent');
+  return 0;
+}
+
+/** Unloads the agent but keeps the plist (so `start` can load it again). */
+async function stop(deps: CliDeps): Promise<number> {
+  const { launchctl, uid } = withDefaults(deps);
+  const r = await launchctl(['bootout', `gui/${String(uid)}/${LABEL}`]);
+  if (r.code !== 0 && !notLoaded(r)) {
+    fail(`launchctl bootout failed: ${r.stderr.trim()}`);
+    return 1;
+  }
+  out('stopped the harvester agent (start it again with make harvest-start)');
+  return 0;
+}
+
+/** Loads the plist that `install` wrote. */
+async function start(deps: CliDeps): Promise<number> {
+  const d = withDefaults(deps);
+  const target = join(d.agentsDir, `${LABEL}.plist`);
+  if (!(await new GuardedFs([d.agentsDir]).exists(target))) {
+    fail('not installed: run make harvest-install first');
+    return 1;
+  }
+  const err = await bootstrap(d, target);
+  if (err !== null) {
+    fail(`launchctl bootstrap failed: ${err}`);
+    return 1;
+  }
+  out('started the harvester agent');
   return 0;
 }
 
@@ -144,6 +198,10 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
         return await install(deps);
       case 'uninstall':
         return await uninstall(deps);
+      case 'stop':
+        return await stop(deps);
+      case 'start':
+        return await start(deps);
       case 'status': {
         if (deps.pool) return await status(deps.pool);
         const pool = createPool(loadHarvestSettings().databaseUrl, 2);

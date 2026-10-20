@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { makeLaunchctl, run, withDefaults, type LaunchctlRunner } from '../../src/harvest/cli.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
@@ -19,6 +20,7 @@ const deps = () => ({
   node: '/opt/node/bin/node',
   repo: '/repo',
   logDir: join(dir, 'logs'),
+  sleep: () => Promise.resolve(),
 });
 const plist = () => join(dir, 'LaunchAgents', 'com.pixelmagic.harvester.plist');
 
@@ -79,6 +81,55 @@ test('install treats "already loaded" from bootstrap as success', async () => {
     { code: 5, stderr: 'Bootstrap failed: 5: Input/output error (already loaded)' },
   ];
   expect(await run(['install'], deps())).toBe(0);
+});
+
+test('install retries bootstrap on an Input/output error (bootout still tearing down)', async () => {
+  capture();
+  const sleeps: number[] = [];
+  result = [
+    { code: 0, stderr: '' },
+    { code: 5, stderr: 'Bootstrap failed: 5: Input/output error' },
+    { code: 0, stderr: '' },
+  ];
+  const d = { ...deps(), sleep: (ms: number) => (sleeps.push(ms), Promise.resolve()) };
+  expect(await run(['install'], d)).toBe(0);
+  expect(calls.filter((c) => c[0] === 'bootstrap')).toHaveLength(2);
+  expect(sleeps).toEqual([1000]);
+});
+
+test('install gives up after 3 bootstrap attempts', async () => {
+  const got = capture();
+  const io = { code: 5, stderr: 'Input/output error' };
+  result = [{ code: 0, stderr: '' }, io, io, io];
+  expect(await run(['install'], deps())).toBe(1);
+  expect(calls.filter((c) => c[0] === 'bootstrap')).toHaveLength(3);
+  expect(got().err).toContain('Input/output error');
+});
+
+test('stop boots out and keeps the plist; start bootstraps it; start needs an install', async () => {
+  const got = capture();
+  expect(await run(['start'], deps())).toBe(1);
+  expect(got().err).toContain('not installed');
+  await run(['install'], deps());
+  calls = [];
+  expect(await run(['stop'], deps())).toBe(0);
+  expect(calls).toEqual([['bootout', 'gui/501/com.pixelmagic.harvester']]);
+  await expect(stat(plist())).resolves.toBeDefined();
+  calls = [];
+  expect(await run(['start'], deps())).toBe(0);
+  expect(calls).toEqual([['bootstrap', 'gui/501', plist()]]);
+});
+
+test('stop tolerates a not-loaded agent; start and stop report real errors', async () => {
+  const got = capture();
+  result = [{ code: 3, stderr: 'No such process' }];
+  expect(await run(['stop'], deps())).toBe(0);
+  result = [{ code: 1, stderr: 'denied' }];
+  expect(await run(['stop'], deps())).toBe(1);
+  await run(['install'], deps());
+  result = [{ code: 1, stderr: 'broken' }];
+  expect(await run(['start'], deps())).toBe(1);
+  expect(got().err).toContain('broken');
 });
 
 test('install fails when bootstrap fails for another reason', async () => {
@@ -144,7 +195,7 @@ test('defaults: ~/Library/LaunchAgents, this uid and node, the repo and DATA_DIR
   expect(d.node).toBe(process.execPath);
   expect(d.logDir).toMatch(/logs$/);
   expect(typeof d.launchctl).toBe('function');
-  expect(d.repo).toBe(process.cwd());
+  expect(d.repo).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
 });
 
 let pgh: PgHandle;

@@ -70,7 +70,9 @@ Files whose bytes are already in the vault are not copied.
     make harvest-install     # build, write ~/Library/LaunchAgents/com.pixelmagic.harvester.plist, load it
     make harvest-uninstall   # unload and remove it
     make harvest-status      # active run, item counts, gate, host heartbeat
-    make harvester           # run in the foreground instead (stop the agent first)
+    make harvest-stop        # unload the agent but keep it installed
+    make harvest-start       # load it again
+    make harvester           # run in the foreground; needs `make harvest-stop` first
 
 The page is at <http://127.0.0.1:3020> (this Mac only). Pick a drive, tick folders (or the
 whole drive) and press **Start harvest**, or **Dry run** to see what would be sent first. A
@@ -79,6 +81,10 @@ extensions or in project-like folders are "possible photos": they wait on the **
 for you to send or skip them (the Grafana "Harvest" row counts them). Pause, resume and cancel
 are on the page; a run waits by itself when the disk or the pipeline backlog is over its limit,
 or when a drive is unplugged, and resumes when that clears.
+
+Approving possible photos sends only those files: an approval never scans a drive. A drive the
+harvester cannot identify shows greyed on the page as "couldn't identify this drive"; press
+**Refresh drives** to retry.
 
 The dev/compose stack (Postgres and Temporal) must be up and migrated (`make up`) before the
 harvester can work; it retries until they answer.

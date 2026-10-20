@@ -1,6 +1,6 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
 	corpus-manifest corpus-verify \
-	harvest-install harvest-uninstall harvester harvest-status \
+	harvest-install harvest-uninstall harvest-stop harvest-start harvester harvest-status \
 	test-smoke test-standard update-golden golden-smoke chaos
 
 CORPUS := test-automation/sample-images
@@ -89,7 +89,14 @@ harvest-install: build
 harvest-uninstall:
 	node dist/harvest/cli.js uninstall
 
-# Run the harvester in the foreground (stop the launchd agent first: both would use the port).
+# Stop / start the installed agent without removing it (plist kept).
+harvest-stop:
+	node dist/harvest/cli.js stop
+
+harvest-start:
+	node dist/harvest/cli.js start
+
+# Run the harvester in the foreground (run `make harvest-stop` first: both would use the port).
 harvester: build
 	node --env-file-if-exists=.env dist/harvest/host.js
 
