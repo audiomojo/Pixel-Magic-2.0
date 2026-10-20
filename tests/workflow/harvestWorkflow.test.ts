@@ -469,25 +469,29 @@ test('the send cursor and error count are carried between batches and across con
       if (n === 3) {
         return {
           ...batch('PAUSED_ERRORS', '25 errors in a row'),
-          cursor: { pos: 0, key: 'k3', id: '3' },
+          cursor: { pos: 0, part: 0, at: 'k3', id: '3' },
           consecutive: 25,
         };
       }
       if (n >= 60) return batch('DONE');
-      return { ...batch('MORE'), cursor: { pos: 0, key: `k${n}`, id: String(n) }, consecutive: 1 };
+      return {
+        ...batch('MORE'),
+        cursor: { pos: 0, part: 0, at: `k${n}`, id: String(n) },
+        consecutive: 1,
+      };
     },
   });
   const h = await begin(f);
   await until(f, (c) => c.includes('state paused: 25 errors in a row'));
   await h.signal('resume');
   expect(await h.result()).toBe('done');
-  const st = f.sendStates as { cursor: { key: string } | null; consecutive: number }[];
+  const st = f.sendStates as { cursor: { at: string } | null; consecutive: number }[];
   expect(st[0]).toEqual({ cursor: null, consecutive: 0 });
-  expect(st[1]).toEqual({ cursor: { pos: 0, key: 'k1', id: '1' }, consecutive: 1 });
+  expect(st[1]).toEqual({ cursor: { pos: 0, part: 0, at: 'k1', id: '1' }, consecutive: 1 });
   // After a resume from PAUSED_ERRORS the count starts again; the cursor is kept.
-  expect(st[3]).toEqual({ cursor: { pos: 0, key: 'k3', id: '3' }, consecutive: 0 });
+  expect(st[3]).toEqual({ cursor: { pos: 0, part: 0, at: 'k3', id: '3' }, consecutive: 0 });
   // Batch 51 runs in a new execution with the cursor of batch 50.
-  expect(st[50]).toEqual({ cursor: { pos: 0, key: 'k50', id: '50' }, consecutive: 1 });
+  expect(st[50]).toEqual({ cursor: { pos: 0, part: 0, at: 'k50', id: '50' }, consecutive: 1 });
   const d = await h.describe();
   expect(d.runId).not.toBe(h.firstExecutionRunId);
 });
@@ -500,7 +504,7 @@ test('DONE with an approval starts a new pass from the first folder', async () =
     send: async () => {
       if (n++ === 0) {
         await gate;
-        return { ...batch('DONE'), cursor: { pos: 1, key: 'z', id: '9' } };
+        return { ...batch('DONE'), cursor: { pos: 1, part: 0, at: 'z', id: '9' } };
       }
       return batch('DONE');
     },

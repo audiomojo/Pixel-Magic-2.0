@@ -20,7 +20,10 @@ import { checkGate } from './throttle.js';
 /** Where the send pass stands: the run folder (index in position order) and the last item. */
 export interface SendCursor {
   pos: number;
-  key: string;
+  /** 0: items spelled exactly under the folder; 1: other spellings (see pageQuery). */
+  part: 0 | 1;
+  /** The last item's rel_path (part 0) or path_key (part 1): byte order, then id. */
+  at: string;
   id: string;
 }
 
@@ -96,8 +99,9 @@ interface Item {
   label: string;
   source_kind: string | null;
   folder_id: string;
-  /** Index of the item's run folder in position order. */
+  /** Index of the item's run folder in position order, and the page part (see pageQuery). */
   pos: number;
+  part: 0 | 1;
 }
 
 type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
@@ -118,16 +122,21 @@ type ItemOutcome =
   | Stop;
 
 /**
- * One page of a run folder's PLANNED items (spec §7.3) in send order — `path_key` byte order,
- * then id — after `after` (keyset). Items under a deeper selected folder are left to it; a
- * send-only run takes only its own approved items (`harvest_run_items`). The key range
- * `[key/, key0)` in "C" collation is exactly the prefix `key/`, and is a range scan of
- * `harvest_items_planned_key_idx`.
+ * One page of a run folder's PLANNED items (spec §7.3) in send order, after `after` (keyset).
+ * Membership is the `path_key` prefix `key/` (the deepest selected folder wins; a send-only run
+ * takes only its own approved items, `harvest_run_items`). Two parts:
+ * - part 0: items spelled exactly under the folder's rel_path, in `rel_path` byte order (as the
+ *   scan walks), then id: a range scan of `harvest_items_planned_rel_idx`, no sort. After the
+ *   run's scan (which refreshes spellings) that is every item.
+ * - part 1: the rest under the key (another case spelling of the folder, renamed since), in
+ *   `path_key` byte order, then id: a range scan of `harvest_items_planned_key_idx`. It runs
+ *   once part 0 is exhausted, when the key range holds little more than these.
  */
 export function pageQuery(
   scope: SendScope,
   pos: number,
-  after: { key: string; id: string } | null,
+  part: 0 | 1,
+  after: { at: string; id: string } | null,
   limit: number,
 ): { text: string; values: unknown[] } {
   const f = scope.folders[pos]!;
@@ -135,8 +144,17 @@ export function pageQuery(
   const p = (v: unknown): string => `$${values.push(v)}`;
   const where = ['i.source_id = $1', "i.state = 'PLANNED'"];
   if (f.key !== '') {
-    where.push(`i.path_key COLLATE "C" >= ${p(`${f.key}/`)}`);
-    where.push(`i.path_key COLLATE "C" < ${p(`${f.key}0`)}`);
+    // An item spelled under `rel/` has a path_key under `key/` (rel is NFC, and '/' ends the
+    // folder name's case context), so part 0 needs no path_key condition: it would only make
+    // the planner misjudge the range (the two columns are correlated).
+    const exact = `i.rel_path COLLATE "C" >= ${p(`${f.relPath}/`)}
+                   AND i.rel_path COLLATE "C" < ${p(`${f.relPath}0`)}`;
+    if (part === 0) where.push(exact);
+    else {
+      where.push(`i.path_key COLLATE "C" >= ${p(`${f.key}/`)}`);
+      where.push(`i.path_key COLLATE "C" < ${p(`${f.key}0`)}`);
+      where.push(`NOT (${exact})`);
+    }
   }
   const deeper = scope.folders.filter(
     (d, i) => i !== pos && d.sourceId === f.sourceId && d.key !== f.key && underKey(d.key, f.key),
@@ -154,9 +172,10 @@ export function pageQuery(
                WHERE ri.run_id = ${p(scope.runId)} AND ri.item_id = i.id)`,
     );
   }
+  const col = part === 0 ? 'i.rel_path' : 'i.path_key';
   if (after) {
     where.push(
-      `(i.path_key COLLATE "C", i.id) > (${p(after.key)}::text COLLATE "C", ${p(after.id)}::bigint)`,
+      `(${col} COLLATE "C", i.id) > (${p(after.at)}::text COLLATE "C", ${p(after.id)}::bigint)`,
     );
   }
   const text = `/* harvest:next-items */
@@ -166,9 +185,20 @@ export function pageQuery(
             i.dropzone_mtime_ns::text AS dropzone_mtime_ns, s.label, s.kind AS source_kind
      FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
      WHERE ${where.join('\n       AND ')}
-     ORDER BY i.path_key COLLATE "C", i.id
+     ORDER BY ${col} COLLATE "C", i.id
      LIMIT ${p(limit)}`;
   return { text, values };
+}
+
+/** The (folder, part) steps of a pass in order: part 1 only for a folder other than the root. */
+function* steps(scope: SendScope, from: SendCursor | null): Generator<[number, 0 | 1]> {
+  for (let pos = from?.pos ?? 0; pos < scope.folders.length; pos++) {
+    for (const part of [0, 1] as const) {
+      if (part === 1 && scope.folders[pos]!.key === '') continue;
+      if (from && pos === from.pos && part < from.part) continue;
+      yield [pos, part];
+    }
+  }
 }
 
 /** The run's next ≤ `limit` PLANNED items from `cursor`, folder by folder in position order. */
@@ -179,19 +209,20 @@ async function nextItems(
   limit: number,
 ): Promise<Item[]> {
   const out: Item[] = [];
-  for (let pos = cursor?.pos ?? 0; pos < scope.folders.length && out.length < limit; pos++) {
-    const after = cursor && pos === cursor.pos ? cursor : null;
-    const q = pageQuery(scope, pos, after, limit - out.length);
-    const { rows } = await pool.query<Omit<Item, 'folder_id' | 'pos'>>(q.text, q.values);
-    for (const r of rows) out.push({ ...r, folder_id: scope.folders[pos]!.folderId, pos });
+  for (const [pos, part] of steps(scope, cursor)) {
+    if (out.length >= limit) break;
+    const after = cursor && pos === cursor.pos && part === cursor.part ? cursor : null;
+    const q = pageQuery(scope, pos, part, after, limit - out.length);
+    const { rows } = await pool.query<Omit<Item, 'folder_id' | 'pos' | 'part'>>(q.text, q.values);
+    for (const r of rows) out.push({ ...r, folder_id: scope.folders[pos]!.folderId, pos, part });
   }
   return out;
 }
 
 /** Whether any item of the run's scope is still PLANNED (one LIMIT 1 page per folder). */
 async function anyPlanned(pool: pg.Pool, scope: SendScope): Promise<boolean> {
-  for (let pos = 0; pos < scope.folders.length; pos++) {
-    const q = pageQuery(scope, pos, null, 1);
+  for (const [pos, part] of steps(scope, null)) {
+    const q = pageQuery(scope, pos, part, null, 1);
     if ((await pool.query(q.text, q.values)).rowCount) return true;
   }
   return false;
@@ -456,6 +487,7 @@ export function makeSendBatch(deps: HarvestDeps) {
           sha256: it.sha256,
           headHash: it.head_hash,
           pathKey: it.path_key,
+          relPath: it.rel_path,
           runId,
         },
         {
@@ -604,7 +636,12 @@ export function makeSendBatch(deps: HarvestDeps) {
         }
         return stopped(out.stop, out.reason);
       }
-      cursor = { pos: it.pos, key: it.path_key, id: it.id };
+      cursor = {
+        pos: it.pos,
+        part: it.part,
+        at: it.part === 0 ? it.rel_path : it.path_key,
+        id: it.id,
+      };
       if (out === 'sent') res.sent++;
       else if (out === 'known') res.known++;
       else if (out === 'dup') res.dups++;

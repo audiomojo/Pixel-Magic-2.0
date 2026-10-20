@@ -35,6 +35,7 @@ interface Item {
   sha256: string | null;
   headHash: string | null;
   pathKey: string;
+  relPath: string;
   runId: string | null;
   /** Relative to the source root (and, for SENT, under harvest/Drive/ in the drop zone). */
   rel: string;
@@ -110,6 +111,7 @@ async function setup() {
       sha256: o.sha ?? null,
       headHash: o.head ?? null,
       pathKey: rel.toLowerCase(),
+      relPath: rel,
       runId,
       rel,
     };
@@ -338,7 +340,7 @@ describe('checkKnown', () => {
     const winner = await add(data); // an earlier PLANNED item: read from its source
     // The stored rel_path no longer opens the file; its raw bytes do.
     await pgh.pool.query(
-      `UPDATE harvest_items SET rel_path_raw = convert_to(rel_path, 'UTF8'), rel_path = 'nope/x.jpg'
+      `UPDATE harvest_items SET rel_path_raw = convert_to(rel_path, 'UTF8'), rel_path = 'd/a-nope.jpg'
        WHERE id = $1`,
       [winner.id],
     );

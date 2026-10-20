@@ -126,8 +126,10 @@ harvest_run_items (run_id FK ON DELETE CASCADE, item_id FK ON DELETE CASCADE,
 harvest_run_folders.root_ok boolean NOT NULL DEFAULT true
                                        -- false: the scan could not read the folder's root → no history
 -- indexes: harvest_items (duplicate_of) WHERE duplicate_of IS NOT NULL   -- promoteDuplicates
+--   harvest_items (source_id, rel_path COLLATE "C", id) WHERE state = 'PLANNED'
+--                                      -- sendBatch's keyset page over one run folder (send order)
 --   harvest_items (source_id, path_key COLLATE "C", id) WHERE state = 'PLANNED'
---                                      -- sendBatch's keyset page over one run folder
+--                                      -- the folder's items under another case spelling
 ```
 
 - `rel_path` is relative to the source root, stored NFC. `rel_path_raw` holds the original bytes when the name is not valid UTF-8. `path_key` is NFC + casefold: APFS is normalization-insensitive and SMB can deliver NFD/NFC twins.
@@ -222,7 +224,7 @@ A bounded, read-only TypeScript port of the `find-all-images` reader:
 
 ### 7.3 `sendBatch`
 
-Checks the gate once, then takes the run's next ≤ 500 PLANNED items, one run folder at a time in folder order, then by `path_key` (byte order), then id: a keyset page from a cursor the workflow carries (with the consecutive-error count) between calls and across continue-as-new. A full batch is `MORE`; at the end of a pass, any PLANNED item still in scope (an error under the cap, an approval, a promoted duplicate) starts a new pass, else `DONE`. For each:
+Checks the gate once, then takes the run's next ≤ 500 PLANNED items, one run folder at a time in folder order, then by `rel_path` (byte order, as the scan walks), then id — items of the folder recorded under another case spelling come after, by `path_key` — as a keyset page from a cursor the workflow carries (with the consecutive-error count) between calls and across continue-as-new. A full batch is `MORE`; at the end of a pass, any PLANNED item still in scope (an error under the cap, an approval, a promoted duplicate) starts a new pass, else `DONE`. For each:
 
 1. **Throttle gate** (§7.5).
 2. **Known content** (§7.4) → `KNOWN` or `DUP`, or continue.
@@ -414,7 +416,7 @@ Decisions made during implementation that changed or refined this spec, in plain
 - **I2 (known content):** a SENT candidate is never read from its source (linked: `files.sha256`; unlinked: its drop-zone copy while it is unchanged); a PLANNED candidate is read only on the mount its identity resolves to and only while size and mtime match; a PLANNED candidate qualifies only inside the current run's send scope and earlier in its send order (§7.4). `checkKnown` takes the run id and the item's path key.
 - **I3 / F-2:** see F-2.
 - **I4 (hung shares):** a pending containment probe per mount is reused by later detections, and `UV_THREADPOOL_SIZE=32` is set in the launchd agent, `make harvester` and `npm run harvester` (§9).
-- **I5 (send paging):** the gate is checked before any item query; items are paged per run folder with a `(path_key COLLATE "C", id)` keyset cursor carried by the workflow, selecting only the needed columns; a full batch is `MORE` without another query, and the end of a pass is one `LIMIT 1` probe per folder. Send order within a folder is now `path_key` byte order (casefolded) rather than `rel_path`, so the range scan is exact. Indexes in 0006 (§5); EXPLAIN on 120 000 rows shows an index range scan with no sort.
+- **I5 (send paging):** the gate is checked before any item query; items are paged per run folder with a `(rel_path COLLATE "C", id)` keyset cursor carried by the workflow, over the folder's exact `rel_path` range, selecting only the needed columns; items under the folder's key but another case spelling (renamed since; a rescan respells what it sees) follow in a second part keyed by `path_key`. A full batch is `MORE` without another query, and the end of a pass is one `LIMIT 1` probe per folder and part. Send order (`rel_path`, as the scan walks) is unchanged. Indexes in 0006 (§5); EXPLAIN on 120 000 rows shows index range scans with no sort.
 - **I6 (transient NAS errors):** transient errors on a live mount cost no attempt and count toward the 25-in-a-row pause (carried across batches); a rescan resets a FAILED item it sees again unchanged to PLANNED with 0 attempts (§5, §9).
 - **M1 (folder states):** a run folder is `waiting_source` while its drive is unplugged (scan: set by the workflow through `setFolderState`, keeping T5-b; send: by `sendBatch`) and `sending` while its items are sent (§9).
 - **M2 (pause during a scan):** a pause that arrives during a scan step shows at once as "pause requested — after the current folder step" and takes effect when the step ends.

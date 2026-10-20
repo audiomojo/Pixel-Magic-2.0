@@ -280,11 +280,10 @@ describe('copy protocol', () => {
     const srcOpens = rec.calls
       .filter((c) => c.op === 'openRead' && c.paths[0]!.startsWith(e.root))
       .map((c) => c.paths[0]);
-    // Send order is path_key byte order (casefolded): c.nef before DCIM/.
     expect(srcOpens).toEqual([
-      join(e.root, 'c.nef'),
       join(e.root, 'DCIM/a.cr2'),
       join(e.root, 'DCIM/sub/b.cr2'),
+      join(e.root, 'c.nef'),
     ]);
     for (const c of rec.calls.filter((c) => c.op === 'openRead' && !c.paths[0]!.startsWith(e.root)))
       expect(c.paths[0]!.startsWith(join(await fsp.realpath(e.dz), 'harvest'))).toBe(true);
@@ -965,9 +964,17 @@ describe('paging (I5)', () => {
     const e = await setup(five);
     const small = { sendBatchSize: 2 };
     const r1 = await e.send(small);
-    expect(r1).toMatchObject({ outcome: 'MORE', sent: 2, cursor: { pos: 0, key: 'dcim/b.cr2' } });
+    expect(r1).toMatchObject({
+      outcome: 'MORE',
+      sent: 2,
+      cursor: { pos: 0, part: 0, at: 'DCIM/b.cr2' },
+    });
     const r2 = await e.send(small, { cursor: r1.cursor });
-    expect(r2).toMatchObject({ outcome: 'MORE', sent: 2, cursor: { pos: 0, key: 'dcim/d.cr2' } });
+    expect(r2).toMatchObject({
+      outcome: 'MORE',
+      sent: 2,
+      cursor: { pos: 0, part: 0, at: 'DCIM/d.cr2' },
+    });
     const r3 = await e.send(small, { cursor: r2.cursor });
     expect(r3).toMatchObject({ outcome: 'DONE', sent: 1 });
     expect((await items()).every((i) => i.state === 'SENT')).toBe(true);
@@ -1050,6 +1057,42 @@ describe('paging (I5)', () => {
     ]);
   });
 
+  test('send order is rel_path byte order (as the scan walks): DCIM/ before c.nef', async () => {
+    const e = await setup({ 'c.nef': 300, 'DCIM/a.cr2': 301, 'b/x.cr2': 302 });
+    const beats: { item?: string }[] = [];
+    const { sendBatch } = createHarvestActivities(e.deps);
+    await runActivity(sendBatch, [e.runId, {}], {
+      onHeartbeat: (d) => beats.push(d as { item?: string }),
+    });
+    expect(beats.map((b) => b.item).filter(Boolean)).toEqual(['DCIM/a.cr2', 'b/x.cr2', 'c.nef']);
+  });
+
+  test('a case-variant rel_path under the folder key is still sent (the range is a superset)', async () => {
+    const e = await setup({ 'Photos/a.cr2': 300 }, { relPath: 'Photos' });
+    // An item recorded under another spelling of the folder (renamed in case since).
+    await pgh.pool.query(
+      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+       VALUES ($1, 'pHOTOS/zz.cr2', 'photos/zz.cr2', 1, 1, 'photo', 'PLANNED')`,
+      [e.sourceId],
+    );
+    const scope = await loadScope(pgh.pool, e.runId);
+    const page = async (part: 0 | 1) => {
+      const q = pageQuery(scope, 0, part, null, 10);
+      return (await pgh.pool.query<{ rel_path: string }>(q.text, q.values)).rows.map(
+        (r) => r.rel_path,
+      );
+    };
+    expect(await page(0)).toEqual(['Photos/a.cr2']);
+    expect(await page(1)).toEqual(['pHOTOS/zz.cr2']);
+    // Sent in that order: the exact spelling first, then the other one.
+    const beats: { item?: string }[] = [];
+    const { sendBatch } = createHarvestActivities(e.deps);
+    await runActivity(sendBatch, [e.runId, {}], {
+      onHeartbeat: (d) => beats.push(d as { item?: string }),
+    });
+    expect(beats.map((b) => b.item).filter(Boolean)).toEqual(['Photos/a.cr2', 'pHOTOS/zz.cr2']);
+  });
+
   test('EXPLAIN on 120k PLANNED rows: the page query is an index range scan, no sort', async () => {
     const { rows } = await pgh.pool.query<{ id: string }>(
       `INSERT INTO harvest_sources (identity, label, kind) VALUES ('local:X', 'X', 'local')
@@ -1071,15 +1114,27 @@ describe('paging (I5)', () => {
     await pgh.pool.query('ANALYZE harvest_items');
     const run = await createRun(pgh.pool, [{ sourceId: sid, relPath: 'D7' }], false);
     const scope = await loadScope(pgh.pool, run);
-    const explain = async (after: { key: string; id: string } | null) => {
-      const q = pageQuery(scope, 0, after, 500);
+    const explain = async (part: 0 | 1, after: { at: string; id: string } | null) => {
+      const q = pageQuery(scope, 0, part, after, 500);
       const r = await pgh.pool.query<{ 'QUERY PLAN': string }>(`EXPLAIN ${q.text}`, q.values);
       return r.rows.map((x) => x['QUERY PLAN']).join('\n');
     };
-    for (const plan of [await explain(null), await explain({ key: 'd7/f5007.cr2', id: '5007' })]) {
-      expect(plan).toMatch(/Index Scan using harvest_items_planned_key_idx/);
+    for (const plan of [
+      await explain(0, null),
+      await explain(0, { at: 'D7/f5007.cr2', id: '5007' }),
+    ]) {
+      expect(plan).toMatch(/Index Scan using harvest_items_planned_rel_idx/);
       expect(plan).not.toMatch(/Seq Scan|Sort/);
-      console.log(`EXPLAIN page query (120k rows):\n${plan}`);
+      console.log(`EXPLAIN page query, part 0 (120k rows):\n${plan}`);
+    }
+    // Part 1 (other spellings) reads only the folder's key range of the PLANNED key index.
+    for (const p1 of [
+      await explain(1, null),
+      await explain(1, { at: 'd7/f5007.cr2', id: '5007' }),
+    ]) {
+      expect(p1).toMatch(/Index Scan using harvest_items_planned_key_idx/);
+      expect(p1).not.toMatch(/Seq Scan|Sort/);
+      console.log(`EXPLAIN page query, part 1 (120k rows):\n${p1}`);
     }
     const dup = await pgh.pool.query<{ 'QUERY PLAN': string }>(
       `EXPLAIN SELECT id FROM harvest_items WHERE duplicate_of = 50 AND state = 'DUP'

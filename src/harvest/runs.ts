@@ -95,6 +95,7 @@ export async function runFolders(pool: pg.Pool, runId: string): Promise<RunFolde
 export interface ScopeFolder {
   folderId: string;
   sourceId: string;
+  relPath: string;
   /** pathKey of the folder's rel_path ('' = the whole source). */
   key: string;
 }
@@ -118,6 +119,7 @@ export async function loadScope(pool: pg.Pool, runId: string): Promise<SendScope
     folders: folders.map((f) => ({
       folderId: f.folderId,
       sourceId: f.sourceId,
+      relPath: f.relPath,
       key: pathKey(f.relPath),
     })),
   };

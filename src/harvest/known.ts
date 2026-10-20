@@ -22,8 +22,10 @@ export interface KnownItem {
   kind: 'photo' | 'maybe';
   sha256: string | null;
   headHash: string | null;
-  /** NFC + casefold of the item's rel_path: its place in the run's send order. */
+  /** NFC + casefold of the item's rel_path: the run folder it is sent under. */
   pathKey: string;
+  /** The item's rel_path: its place in the folder's send order. */
+  relPath: string;
   /** The run being sent (PLANNED candidates qualify only inside its scope), or null. */
   runId: string | null;
 }
@@ -69,20 +71,29 @@ const order = (kind: string, id: string): [number, bigint] => [
 const cmp = (a: [number, bigint], b: [number, bigint]) =>
   a[0] !== b[0] ? a[0] - b[0] : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0;
 
-/** Send order within a run: photo before maybe, then folder position, path_key bytes, id. */
-type SendOrder = [number, number, Buffer, bigint];
-const sendOrder = (kind: string, pos: number, key: string, id: string): SendOrder => [
-  kind === 'photo' ? 0 : 1,
-  pos,
-  Buffer.from(key),
-  BigInt(id),
-];
+/**
+ * Send order within a run (sendBatch's pageQuery): photo before maybe, then folder position,
+ * part (0: spelled exactly under the folder's rel_path, ordered by rel_path bytes; 1: another
+ * spelling, ordered by path_key bytes), then id.
+ */
+type SendOrder = [number, number, number, Buffer, bigint];
+function sendOrder(
+  scope: SendScope,
+  kind: string,
+  pos: number,
+  rel: string,
+  key: string,
+  id: string,
+): SendOrder {
+  const folderRel = scope.folders[pos]!.relPath;
+  const part = folderRel === '' || rel.startsWith(`${folderRel}/`) ? 0 : 1;
+  return [kind === 'photo' ? 0 : 1, pos, part, Buffer.from(part === 0 ? rel : key), BigInt(id)];
+}
 const before = (a: SendOrder, b: SendOrder): boolean => {
-  if (a[0] !== b[0]) return a[0] < b[0];
-  if (a[1] !== b[1]) return a[1] < b[1];
-  const k = Buffer.compare(a[2], b[2]);
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return (a[i] as number) < (b[i] as number);
+  const k = Buffer.compare(a[3], b[3]);
   if (k !== 0) return k < 0;
-  return a[3] < b[3];
+  return a[4] < b[4];
 };
 
 /** sha256 of the first 64 KiB (opened read-only). */
@@ -198,8 +209,8 @@ export async function checkKnown(
       const pos = folderOf(scope, c.source_id, c.path_key);
       if (pos === null) return false;
       return before(
-        sendOrder(c.kind, pos, c.path_key, c.id),
-        sendOrder(item.kind, myPos, item.pathKey, item.id),
+        sendOrder(scope, c.kind, pos, c.rel_path, c.path_key, c.id),
+        sendOrder(scope, item.kind, myPos, item.relPath, item.pathKey, item.id),
       );
     };
     const candidates = rows
