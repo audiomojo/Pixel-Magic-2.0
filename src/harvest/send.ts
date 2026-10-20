@@ -53,6 +53,22 @@ const PUBLISH_RETRIES = 5;
 const COPY_HEARTBEAT_MS = 1000;
 const COPY_HEARTBEAT_BYTES = 8 * 1024 * 1024;
 const DISK_FULL_CODES = new Set(['ENOSPC', 'EDQUOT']);
+/**
+ * Errors of a live but flaky share or network: they cost no attempt (a NAS blip must not end in
+ * FAILED forever) and count toward the consecutive-error pause instead. EIO only on a network
+ * source (on a local drive it is a real read error).
+ */
+const TRANSIENT_CODES = new Set([
+  'ETIMEDOUT',
+  'EAGAIN',
+  'ECONNRESET',
+  'EHOSTDOWN',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'ENETUNREACH',
+]);
+const isTransient = (e: unknown, sourceKind: string | null): boolean =>
+  TRANSIENT_CODES.has(code(e)) || (code(e) === 'EIO' && sourceKind === 'network');
 
 const code = (e: unknown): string => (e as NodeJS.ErrnoException | null)?.code ?? '';
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -86,9 +102,21 @@ interface Item {
 }
 
 type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
-/** `error`: an item error under the attempts cap; `capped`: one that reached it (FAILED). */
+/**
+ * `error`: an item error under the attempts cap; `capped`: one that reached it (FAILED);
+ * `transient`: a flaky-share error that cost no attempt.
+ */
 type ItemOutcome =
-  'sent' | 'known' | 'dup' | 'vanished' | 'failed' | 'error' | 'capped' | 'skipped' | Stop;
+  | 'sent'
+  | 'known'
+  | 'dup'
+  | 'vanished'
+  | 'failed'
+  | 'error'
+  | 'capped'
+  | 'transient'
+  | 'skipped'
+  | Stop;
 
 export interface ScopeFolder {
   folderId: string;
@@ -329,6 +357,15 @@ export function makeSendBatch(deps: HarvestDeps) {
       await promoteDuplicates(pool, it.id);
       return 'capped';
     };
+    /** A transient error: recorded on the row, the attempt count untouched. */
+    const flaky = async (it: Item, why: string): Promise<'transient'> => {
+      lastError = why;
+      await pool.query(
+        `UPDATE harvest_items SET last_error = $2 WHERE id = $1 AND state = 'PLANNED'`,
+        [it.id, why],
+      );
+      return 'transient';
+    };
     const markSent = async (
       it: Item,
       dzPath: string,
@@ -554,6 +591,7 @@ export function makeSendBatch(deps: HarvestDeps) {
         if (code(e) === 'ENOENT' && (await statOrNull(src)) === null) {
           return vanish(it, 'gone from the source');
         }
+        if (isTransient(e, it.source_kind)) return flaky(it, `${it.rel_path}: ${errText(e)}`);
         return fail(it, `${it.rel_path}: ${errText(e)}`);
       }
     };
@@ -596,7 +634,8 @@ export function makeSendBatch(deps: HarvestDeps) {
       else if (out === 'known') res.known++;
       else if (out === 'dup') res.dups++;
       else if (out === 'failed' || out === 'capped') res.failed++;
-      consecutive = out === 'error' || out === 'capped' ? consecutive + 1 : 0;
+      consecutive =
+        out === 'error' || out === 'capped' || out === 'transient' ? consecutive + 1 : 0;
       ctx.heartbeat({ ...counts(), item: it.rel_path });
       if (consecutive >= MAX_CONSECUTIVE_ERRORS) return stopped('PAUSED_ERRORS', lastError);
     }

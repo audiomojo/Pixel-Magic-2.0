@@ -142,13 +142,16 @@ interface ExistingRow {
   mtime_ns: string | bigint;
   state: string;
   kind: string;
-  attempts: number;
   path_key: string;
 }
 
-/** State an existing row takes when seen again (spec §5, §7.2); other states are left alone. */
-function seenAgain(row: ExistingRow, maxAttempts: number): string {
-  if (row.state === 'FAILED' && row.attempts < maxAttempts) return 'PLANNED';
+/**
+ * State an existing row takes when seen again (spec §5, §7.2); other states are left alone. A
+ * FAILED row seen again unchanged is PLANNED with its attempts reset (I6), so a later run
+ * retries it instead of it staying FAILED forever.
+ */
+function seenAgain(row: ExistingRow): string {
+  if (row.state === 'FAILED') return 'PLANNED';
   if (row.state === 'VANISHED') return row.kind === 'maybe' ? 'REVIEW' : 'PLANNED';
   return row.state;
 }
@@ -158,11 +161,10 @@ export async function upsertBatch(
   c: pg.PoolClient,
   sourceId: string,
   runId: string,
-  maxAttempts: number,
   batch: Candidate[],
 ): Promise<void> {
   const { rows } = await c.query<ExistingRow>(
-    `SELECT id::text AS id, path_key, size_bytes, mtime_ns, state, kind, attempts
+    `SELECT id::text AS id, path_key, size_bytes, mtime_ns, state, kind
      FROM harvest_items WHERE source_id = $1 AND path_key = ANY($2::text[])`,
     [sourceId, batch.map((b) => b.key)],
   );
@@ -188,7 +190,7 @@ export async function upsertBatch(
       seen.add(hit.id);
       upd.id.push(hit.id);
       upd.old.push(hit.state);
-      upd.next.push(seenAgain(hit, maxAttempts));
+      upd.next.push(seenAgain(hit));
       upd.rel.push(b.rel);
       upd.raw.push(b.raw?.toString('hex') ?? null);
     } else {
@@ -205,6 +207,7 @@ export async function upsertBatch(
       `UPDATE harvest_items i
        SET last_seen_run = $1::bigint,
            state = CASE WHEN i.state = u.old THEN u.next ELSE i.state END,
+           attempts = CASE WHEN i.state = 'FAILED' AND u.old = 'FAILED' THEN 0 ELSE i.attempts END,
            rel_path = u.rel, rel_path_raw = decode(u.raw, 'hex')
        FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::text[])
          AS u(id, old, next, rel, raw)
@@ -462,13 +465,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       const rel = joinRel(fr.comps);
       await withTx(pool, async (c) => {
         for (let i = 0; i < cands.length; i += BATCH) {
-          await upsertBatch(
-            c,
-            folder.source_id,
-            runId,
-            settings.maxAttempts,
-            cands.slice(i, i + BATCH),
-          );
+          await upsertBatch(c, folder.source_id, runId, cands.slice(i, i + BATCH));
         }
         await c.query(
           `UPDATE harvest_run_folders

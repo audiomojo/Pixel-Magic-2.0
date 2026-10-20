@@ -735,6 +735,55 @@ describe('errors and pauses', () => {
     expect(rows[25]).toMatchObject({ attempts: 0, state: 'PLANNED' });
   });
 
+  test('transient NAS errors cost no attempt; 25 in a row pause the run (I6)', async () => {
+    const spec: TreeSpec = {};
+    for (let i = 0; i < 26; i++) spec[`DCIM/f${String(i).padStart(2, '0')}.cr2`] = 200 + i;
+    const e = await setup(spec);
+    const codes = ['ETIMEDOUT', 'EAGAIN', 'ECONNRESET', 'EHOSTDOWN', 'EHOSTUNREACH', 'ENETDOWN'];
+    let n = 0;
+    const ops: FsOps = {
+      ...realFsOps,
+      openRead: (p) =>
+        String(p).startsWith(e.root)
+          ? Promise.reject(errno(codes[n++ % codes.length]!))
+          : realFsOps.openRead(p),
+    };
+    const res = await e.send({ fsOps: ops });
+    expect(res).toMatchObject({ outcome: 'PAUSED_ERRORS', failed: 0, consecutive: 25 });
+    const rows = await items();
+    expect(rows.every((r) => r.attempts === 0 && r.state === 'PLANNED')).toBe(true);
+    expect(rows[0]!.last_error).toMatch(/ETIMEDOUT/);
+  });
+
+  test('ENETUNREACH counts toward the pause across batches, not as attempts', async () => {
+    const e = await setup({ 'DCIM/a.cr2': 300 });
+    const ops: FsOps = {
+      ...realFsOps,
+      openRead: (p) =>
+        String(p).startsWith(e.root) ? Promise.reject(errno('ENETUNREACH')) : realFsOps.openRead(p),
+    };
+    // One flaky item retried pass after pass: the count is carried, so it still pauses.
+    const r1 = await e.send({ fsOps: ops }, { consecutive: 23 });
+    expect(r1).toMatchObject({ outcome: 'MORE', consecutive: 24, cursor: null });
+    const r2 = await e.send({ fsOps: ops }, { cursor: r1.cursor, consecutive: r1.consecutive });
+    expect(r2).toMatchObject({ outcome: 'PAUSED_ERRORS', consecutive: 25 });
+    expect((await item('DCIM/a.cr2')).attempts).toBe(0);
+  });
+
+  test('EIO costs an attempt on a local drive but not on a network share', async () => {
+    const e = await setup({ 'DCIM/a.cr2': 300 });
+    const ops: FsOps = {
+      ...realFsOps,
+      openRead: (p) =>
+        String(p).startsWith(e.root) ? Promise.reject(errno('EIO')) : realFsOps.openRead(p),
+    };
+    await e.send({ fsOps: ops });
+    expect((await item('DCIM/a.cr2')).attempts).toBe(1);
+    await pgh.pool.query("UPDATE harvest_sources SET kind = 'network'");
+    await e.send({ fsOps: ops });
+    expect((await item('DCIM/a.cr2')).attempts).toBe(1);
+  });
+
   test('a success resets the consecutive error count', async () => {
     const spec: TreeSpec = {};
     for (let i = 0; i < 30; i++) spec[`DCIM/f${String(i).padStart(2, '0')}.cr2`] = 200 + i;

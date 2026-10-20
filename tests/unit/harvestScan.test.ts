@@ -394,7 +394,7 @@ describe('scanFolder', () => {
     expect((await items()).map((r) => r.rel_path)).toEqual(['real/a.cr2']);
   });
 
-  test('FAILED below the cap and VANISHED rows seen again become PLANNED', async () => {
+  test('FAILED (even at the cap) and VANISHED rows seen again become PLANNED', async () => {
     const env = await setup({
       'a.cr2': 500,
       'b.cr2': 600,
@@ -420,12 +420,20 @@ describe('scanFolder', () => {
     const states = Object.fromEntries((await items()).map((r) => [r.rel_path, r.state]));
     expect(states).toEqual({
       'a.cr2': 'PLANNED',
-      'b.cr2': 'FAILED',
+      'b.cr2': 'PLANNED',
       'c.cr2': 'PLANNED',
       'd.png': 'REVIEW',
       'e.cr2': 'KNOWN',
       'f.cr2': 'REJECTED',
     });
+    // A rescan gives a FAILED item a fresh set of attempts for the next run (I6).
+    const att = await pgh.pool.query<{ rel_path: string; attempts: number }>(
+      "SELECT rel_path, attempts FROM harvest_items WHERE rel_path IN ('a.cr2', 'b.cr2') ORDER BY 1",
+    );
+    expect(att.rows).toEqual([
+      { rel_path: 'a.cr2', attempts: 0 },
+      { rel_path: 'b.cr2', attempts: 0 },
+    ]);
   });
 
   test('SOURCE_GONE when the mount is absent', async () => {
@@ -663,8 +671,8 @@ describe('raw path encoding', () => {
     const batch = [cand('d/bad�.cr2', bad), cand('d/bad�.cr2', bad), cand('d/ok.cr2', null)];
     const c = await pgh.pool.connect();
     try {
-      await upsertBatch(c, sources[0]!.id, '7', 5, batch);
-      await upsertBatch(c, sources[0]!.id, '8', 5, batch);
+      await upsertBatch(c, sources[0]!.id, '7', batch);
+      await upsertBatch(c, sources[0]!.id, '8', batch);
     } finally {
       c.release();
     }
@@ -694,18 +702,18 @@ describe('raw path encoding', () => {
         .rows;
     const c = await pgh.pool.connect();
     try {
-      await upsertBatch(c, sources[0]!.id, '7', 5, [cand(null)]);
+      await upsertBatch(c, sources[0]!.id, '7', [cand(null)]);
       expect(await raw()).toEqual([{ r: null }]);
       // Respelled on disk as NFD: the stored bytes must follow, or the source cannot be reopened.
-      await upsertBatch(c, sources[0]!.id, '8', 5, [cand(Buffer.from(nfd))]);
+      await upsertBatch(c, sources[0]!.id, '8', [cand(Buffer.from(nfd))]);
       expect(await raw()).toEqual([{ r: Buffer.from(nfd) }]);
       // Back to NFC, with an exFAT DST shift on the way (the same row by sameMtime).
-      await upsertBatch(c, sources[0]!.id, '9', 5, [
+      await upsertBatch(c, sources[0]!.id, '9', [
         cand(null, 1_700_000_000_000_000_000n + 3_600_000_000_000n),
       ]);
       expect(await raw()).toEqual([{ r: null }]);
       // A case respell keeps the key and refreshes rel_path.
-      await upsertBatch(c, sources[0]!.id, '10', 5, [{ ...cand(null), rel: 'd/CAF\u00c9.cr2' }]);
+      await upsertBatch(c, sources[0]!.id, '10', [{ ...cand(null), rel: 'd/CAF\u00c9.cr2' }]);
     } finally {
       c.release();
     }
@@ -734,9 +742,9 @@ describe('raw path encoding', () => {
     const c2 = await pgh.pool.connect();
     try {
       await c1.query('BEGIN');
-      await upsertBatch(c1, sid, '7', 5, [cand(null)]);
+      await upsertBatch(c1, sid, '7', [cand(null)]);
       await c2.query('BEGIN');
-      const second = upsertBatch(c2, sid, '8', 5, [cand(Buffer.from('d/cafe\u0301.cr2'))]);
+      const second = upsertBatch(c2, sid, '8', [cand(Buffer.from('d/cafe\u0301.cr2'))]);
       await new Promise((r) => setTimeout(r, 200));
       await c1.query('COMMIT');
       await second;
