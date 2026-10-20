@@ -656,6 +656,47 @@ describe('source changes', () => {
     expect(await folderStates(run)).toEqual(['done', 'done']);
   });
 
+  test('sending while scanning leaves the scan its folder states; a pass ends DONE', async () => {
+    const e = await setup({ 'A/a.cr2': randomBytes(500), 'B/b.cr2': randomBytes(600) });
+    const run = await createRun(
+      pgh.pool,
+      [
+        { sourceId: e.sourceId, relPath: 'A' },
+        { sourceId: e.sourceId, relPath: 'B' },
+      ],
+      false,
+    );
+    await pgh.pool.query(
+      `UPDATE harvest_run_folders SET state = CASE WHEN position = 0 THEN 'done' ELSE 'scanning' END
+       WHERE run_id = $1`,
+      [run],
+    );
+    const { sendBatch } = createHarvestActivities({ ...e.deps, sendBatchSize: 1 });
+    const r1 = await runActivity(sendBatch, [run, { whileScanning: true }]);
+    expect(r1).toMatchObject({ outcome: 'MORE', sent: 1 });
+    const r2 = await runActivity(sendBatch, [run, { cursor: r1.cursor, whileScanning: true }]);
+    expect(r2).toMatchObject({ outcome: 'MORE', sent: 1 });
+    // the pass is over: DONE with a fresh cursor, and the folders are as the scan left them
+    const r3 = await runActivity(sendBatch, [run, { cursor: r2.cursor, whileScanning: true }]);
+    expect(r3).toMatchObject({ outcome: 'DONE', sent: 0, cursor: null });
+    expect(await folderStates(run)).toEqual(['done', 'scanning']);
+    expect(await item('B/b.cr2')).toMatchObject({ state: 'SENT' });
+  });
+
+  test("unplugged while scanning: SOURCE_GONE, the folder state is the scan's", async () => {
+    let mounted = true;
+    const e = await setup({ 'DCIM/a.cr2': randomBytes(500) }, { mounted: () => mounted });
+    await pgh.pool.query(`UPDATE harvest_run_folders SET state = 'scanning' WHERE run_id = $1`, [
+      e.runId,
+    ]);
+    mounted = false;
+    const { sendBatch } = createHarvestActivities(e.deps);
+    expect(await runActivity(sendBatch, [e.runId, { whileScanning: true }])).toMatchObject({
+      outcome: 'SOURCE_GONE',
+    });
+    expect(await folderStates(e.runId)).toEqual(['scanning']);
+  });
+
   test('unplugged mid-copy: SOURCE_GONE, never FAILED, part removed', async () => {
     const e = await setup(
       { 'DCIM/a.cr2': randomBytes(500), 'DCIM/b.cr2': randomBytes(600) },

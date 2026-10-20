@@ -7,7 +7,7 @@ import {
   WorkflowFailedError,
   type WorkflowHandleWithFirstExecutionRunId,
 } from '@temporalio/client';
-import { afterAll, beforeAll, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import type { ScanFolderResult } from '../../src/harvest/scan.js';
 import type { SendBatchResult } from '../../src/harvest/send.js';
 import { STALLED_REASON } from '../../src/harvest/throttle.js';
@@ -38,6 +38,10 @@ interface Fakes {
   sendStates: unknown[];
   scan: (runId: string, folderId: string) => Promise<ScanFolderResult> | ScanFolderResult;
   send: () => Promise<SendBatchResult> | SendBatchResult;
+  /** sendBatch calls made while the scan runs (whileScanning): recorded apart from `calls`. */
+  early: string[];
+  earlyStates: unknown[];
+  earlySend: () => Promise<SendBatchResult> | SendBatchResult;
   dryRun: boolean;
   sendOnly: boolean;
   folders: { folderId: string; state: string }[];
@@ -48,6 +52,9 @@ function fakes(o: Partial<Fakes> = {}): Fakes {
     sendStates: [],
     scan: () => SCAN_DONE,
     send: () => batch('DONE'),
+    early: [],
+    earlyStates: [],
+    earlySend: () => batch('DONE'),
     dryRun: false,
     sendOnly: false,
     folders: [
@@ -76,7 +83,12 @@ const activities = {
     cur.calls.push(`scanFolder ${folderId}`);
     return cur.scan(runId, folderId);
   },
-  sendBatch: async (_runId: string, state?: unknown) => {
+  sendBatch: async (_runId: string, state?: { whileScanning?: boolean }) => {
+    if (state?.whileScanning) {
+      cur.early.push('sendBatch');
+      cur.earlyStates.push(state);
+      return cur.earlySend();
+    }
     cur.calls.push('sendBatch');
     cur.sendStates.push(state);
     return cur.send();
@@ -605,3 +617,101 @@ test.each([true, false])(
     ]);
   },
 );
+
+describe('sending while the scan runs', () => {
+  /** A scan step that returns only once `ready` holds (real time), heartbeating meanwhile. */
+  const scanUntil = (ready: () => boolean) => async (): Promise<ScanFolderResult> => {
+    const ctx = Context.current();
+    for (let i = 0; i < 400 && !ready(); i++) {
+      ctx.heartbeat();
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return SCAN_DONE;
+  };
+
+  test('photos found so far are sent during a scan step; the send phase then finishes', async () => {
+    let n = 0;
+    const f: Fakes = fakes({
+      folders: [{ folderId: 'f1', state: 'queued' }],
+      earlySend: () => ({ ...batch(n++ === 0 ? 'MORE' : 'DONE'), sent: 500 }),
+    });
+    f.scan = scanUntil(() => f.early.length >= 2);
+    expect(await run(f)).toBe('done');
+    expect(f.early).toEqual(['sendBatch', 'sendBatch']);
+    expect(f.earlyStates[0]).toEqual({ cursor: null, consecutive: 0, whileScanning: true });
+    // the scan's own order is unchanged; sending during it never wrote the run state
+    expect(f.calls).toEqual([
+      'loadRun 7',
+      'state scanning',
+      'scanFolder f1',
+      'state sending',
+      'sendBatch',
+      'finishRun done',
+      'startNextQueued',
+    ]);
+    expect(f.sendStates[0]).toEqual({ cursor: null, consecutive: 0 });
+  });
+
+  test('a gate or repeated errors during the scan wait silently; the error count carries on', async () => {
+    const f: Fakes = fakes({
+      folders: [{ folderId: 'f1', state: 'queued' }],
+      earlySend: () => ({ ...batch('PAUSED_ERRORS', 'x: EIO'), consecutive: 25 }),
+    });
+    f.scan = scanUntil(() => f.early.length >= 1);
+    expect(await run(f)).toBe('done');
+    expect(f.early).toHaveLength(1); // waits for the scan, not retried
+    expect(f.calls.some((c) => c.startsWith('state paused'))).toBe(false);
+    expect(f.sendStates[0]).toEqual({ cursor: null, consecutive: 25 });
+  });
+
+  test('a dry run sends nothing during the scan either', async () => {
+    const f = fakes({ dryRun: true });
+    expect(await run(f)).toBe('done');
+    expect(f.early).toHaveLength(0);
+  });
+
+  test('continue-as-new during the scan restarts the scan phase and keeps sending', async () => {
+    let n = 0;
+    const f = fakes({
+      scan: (_r, folder) =>
+        folder === 'f1' && n++ < 30
+          ? { ...SCAN_DONE, outcome: 'SOURCE_GONE', reason: 'Drive unplugged' }
+          : SCAN_DONE,
+      earlySend: () => ({ ...batch('DONE'), consecutive: 3 }),
+    });
+    const h = await begin(f, { runId: '7', maxHistory: 100 });
+    expect(await h.result()).toBe('done');
+    expect(count(f, 'loadRun 7')).toBeGreaterThan(1);
+    expect(count(f, 'finishRun done')).toBe(1);
+    expect(f.early.length).toBeGreaterThan(1);
+    // the error count crossed continue-as-new into the send phase
+    expect(f.sendStates[0]).toEqual({ cursor: null, consecutive: 3 });
+  });
+
+  test('cancel waits for the scan step and the in-flight send before finishRun(cancelled)', async () => {
+    const slowStop = (label: string) => async () => {
+      const ctx = Context.current();
+      const beat = setInterval(() => ctx.heartbeat(), 50);
+      try {
+        await ctx.cancelled;
+      } catch {
+        // cancelled: clean up slowly
+      } finally {
+        clearInterval(beat);
+      }
+      await new Promise((r) => setTimeout(r, 300));
+      f.calls.push(`${label} returned`);
+      return label === 'scan' ? SCAN_DONE : batch('DONE');
+    };
+    const f: Fakes = fakes({ folders: [{ folderId: 'f1', state: 'queued' }] });
+    f.scan = slowStop('scan') as Fakes['scan'];
+    f.earlySend = slowStop('send') as Fakes['earlySend'];
+    const h = await begin(f);
+    await until(f, (c) => c.includes('scanFolder f1') && f.early.length === 1);
+    await h.cancel();
+    await expect(h.result()).rejects.toBeInstanceOf(WorkflowFailedError);
+    const end = f.calls.slice(-4);
+    expect([...end.slice(0, 2)].sort()).toEqual(['scan returned', 'send returned']);
+    expect(end.slice(2)).toEqual(['finishRun cancelled', 'startNextQueued']);
+  });
+});

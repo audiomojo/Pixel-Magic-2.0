@@ -100,7 +100,8 @@ The page is at <http://127.0.0.1:3020> (this Mac only). Pick a drive, tick folde
 whole drive) and press **Start harvest**, or **Dry run** to see what would be sent first. A
 folder you harvested before shows its date; a rescan sends only what is new. Files with unusual
 extensions or in project-like folders are "possible photos": they wait on the **Review** view
-for you to send or skip them (the Grafana "Harvest" row counts them). Pause, resume and cancel
+for you to send or skip them (the Grafana "Harvest" row counts them). Copying starts while the drive is still being scanned: photos
+found so far go to the drop zone, so the pipeline works in parallel with the scan. Pause, resume and cancel
 are on the page; a run waits by itself when the disk or the pipeline backlog is over its limit,
 or when a drive is unplugged, and resumes when that clears.
 

@@ -32,6 +32,12 @@ export interface SendState {
   cursor?: SendCursor | null;
   /** Consecutive item errors so far (25 pause the run), carried across batches. */
   consecutive?: number;
+  /**
+   * Sent while the run is still scanning: the run folder states belong to the scan (a folder
+   * marked `done` would be skipped after continue-as-new), so they are left alone, and the end
+   * of a pass is DONE (the workflow waits, then starts another pass for what the scan added).
+   */
+  whileScanning?: boolean;
 }
 
 export interface SendBatchResult {
@@ -611,10 +617,11 @@ export function makeSendBatch(deps: HarvestDeps) {
     });
     // Run folder states (spec §9): the folder being sent is `sending`, one whose drive is gone
     // `waiting_source`, every other `done` once its turn has passed.
+    const scanning = state.whileScanning === true;
     let current: string | null = null;
     for (const it of batch) {
       signal.throwIfAborted();
-      if (it.folder_id !== current) {
+      if (!scanning && it.folder_id !== current) {
         await pool.query(
           `UPDATE harvest_run_folders
            SET state = CASE WHEN folder_id = $2 THEN 'sending' ELSE 'done' END
@@ -631,7 +638,7 @@ export function makeSendBatch(deps: HarvestDeps) {
       }
       // A stop leaves the cursor before this item: it is tried again first.
       if (typeof out === 'object') {
-        if (out.stop === 'SOURCE_GONE') {
+        if (out.stop === 'SOURCE_GONE' && !scanning) {
           await setFolderState(pool, runId, it.folder_id, 'waiting_source');
         }
         return stopped(out.stop, out.reason);
@@ -654,6 +661,7 @@ export function makeSendBatch(deps: HarvestDeps) {
     // A full batch: more may follow the cursor. Otherwise the pass is over; items left PLANNED
     // behind it (an error under the cap, an approval, a promoted duplicate) start a new pass.
     if (batch.length === limit) return { ...res, outcome: 'MORE', cursor, consecutive };
+    if (scanning) return { ...res, outcome: 'DONE', cursor: null, consecutive };
     const again = await anyPlanned(pool, scope);
     if (!again) {
       await pool.query(

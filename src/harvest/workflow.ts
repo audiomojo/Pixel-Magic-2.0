@@ -10,6 +10,7 @@ import {
   defineQuery,
   defineSignal,
   isCancellation,
+  patched,
   TemporalFailure,
   proxyActivities,
   setHandler,
@@ -18,7 +19,7 @@ import {
   type RetryPolicy,
 } from '@temporalio/workflow';
 import type { createHarvestActivities } from './activities.js';
-import type { SendCursor } from './send.js';
+import type { SendBatchResult, SendCursor } from './send.js';
 import { STALLED_REASON } from './constants.js';
 
 export const pauseSignal = defineSignal('pause');
@@ -68,6 +69,10 @@ const MAX_HISTORY = 10_000;
 const GATE_RECHECK = '30s';
 const STALL_RECHECK = '5m';
 const SOURCE_RECHECK = '60s';
+/** While the scan runs: the wait before another send pass over what the scan has added. */
+const EARLY_PASS_WAIT = '30s';
+/** Marks histories that send while scanning (older ones replay the scan-then-send order). */
+export const SEND_WHILE_SCANNING = 'send-while-scanning';
 /** Shown at once when a pause arrives during a scan step (it takes effect after the step). */
 export const PAUSE_REQUESTED = 'pause requested — after the current folder step';
 
@@ -91,6 +96,12 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
   let paused = false;
   let resumes = 0;
   let approved = false;
+  /** Consecutive item errors (sendBatch), carried from sends during the scan into the send phase. */
+  let consecutive = input.consecutive ?? 0;
+  /** Sending during the scan: set when the scan is over, or either loop wants continue-as-new. */
+  let scanFinished = false;
+  let canRequested = false;
+  let failed = false;
   /** What the run row currently says, to skip writes that change nothing. */
   let shown = '';
 
@@ -155,6 +166,103 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     return await step;
   }
 
+  type Run = Awaited<ReturnType<typeof loadRun>>;
+
+  /**
+   * Scans the run's folders (done ones are skipped). Returns 'can' at a safe point (between
+   * folder steps) when the history is long or the send loop asked to continue as new: done
+   * folders are skipped and the scan cursor is in the database.
+   */
+  async function scanLoop(run: Run): Promise<'done' | 'can'> {
+    await show('scanning');
+    for (const folder of run.folders) {
+      if (folder.state === 'done') continue;
+      for (;;) {
+        await userPause('scanning');
+        // A long unplug retries every 60 s (~11 events each): restart before the history limit.
+        if (canRequested || workflowInfo().historyLength > maxHistory) {
+          canRequested = true;
+          return 'can';
+        }
+        const res = await scanStep(folder.folderId);
+        if (res.outcome === 'DONE') {
+          if (!paused) await show('scanning');
+          break;
+        }
+        if (res.outcome === 'UNREADABLE') {
+          // Nothing could be read (no drive access, say): wait for the user to resume.
+          await waitPaused('scanning', res.reason ?? 'cannot read the folder');
+        } else {
+          // T5-b: the scan only reports SOURCE_GONE; the folder waits for its drive (§9).
+          await setFolderState(runId, folder.folderId, 'waiting_source');
+          await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
+        }
+      }
+    }
+    return 'done';
+  }
+
+  /**
+   * Sends what the scan has found so far, while it goes on, so the pipeline works in parallel.
+   * Passes repeat (each from the first folder) until the scan is over; then the send phase
+   * takes over and finishes. It never touches the run row's state: waits (gate, unplug) are
+   * silent here and shown by the send phase; disk full and repeated errors wait for the scan.
+   */
+  async function sendWhileScanning(): Promise<void> {
+    const stop = () => scanFinished || canRequested || failed;
+    let cursor: SendCursor | null = null;
+    while (!stop()) {
+      await userPause('scanning');
+      if (stop()) break;
+      if (workflowInfo().historyLength > maxHistory) {
+        canRequested = true;
+        break;
+      }
+      const res: SendBatchResult = await sendBatch(runId, {
+        cursor,
+        consecutive,
+        whileScanning: true,
+      });
+      cursor = res.cursor;
+      consecutive = res.consecutive;
+      if (res.outcome === 'MORE') continue;
+      const wait =
+        res.outcome === 'DONE'
+          ? EARLY_PASS_WAIT
+          : res.outcome === 'GATED'
+            ? res.reason === STALLED_REASON
+              ? STALL_RECHECK
+              : GATE_RECHECK
+            : res.outcome === 'SOURCE_GONE'
+              ? SOURCE_RECHECK
+              : undefined;
+      if (wait === undefined) await condition(stop);
+      else await condition(stop, wait);
+    }
+  }
+
+  /** Runs both loops to their end (activities included, also on failure or cancellation). */
+  async function scanAndSend(run: Run): Promise<'done' | 'can'> {
+    const settled = await Promise.allSettled([
+      scanLoop(run).then(
+        (r) => {
+          if (r === 'done') scanFinished = true;
+          return r;
+        },
+        (e: unknown) => {
+          failed = true;
+          throw e;
+        },
+      ),
+      sendWhileScanning().catch((e: unknown) => {
+        failed = true;
+        throw e;
+      }),
+    ]);
+    for (const r of settled) if (r.status === 'rejected') throw r.reason;
+    return scanFinished ? 'done' : 'can';
+  }
+
   async function body(): Promise<'done'> {
     if (phase === 'scan') {
       const run = await loadRun(runId);
@@ -162,34 +270,14 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
         // Review approvals: the items are already PLANNED; nothing is scanned.
         phase = 'send';
       } else {
-        await show('scanning');
-        for (const folder of run.folders) {
-          if (folder.state === 'done') continue;
-          for (;;) {
-            await userPause('scanning');
-            // A long unplug retries every 60 s (~11 events each): restart before the history
-            // limit. Done folders are skipped and the scan cursor is in the database.
-            if (workflowInfo().historyLength > maxHistory) {
-              return await continueAsNew<typeof HarvestWorkflow>({
-                runId,
-                phase: 'scan',
-                ...carry,
-              });
-            }
-            const res = await scanStep(folder.folderId);
-            if (res.outcome === 'DONE') {
-              if (!paused) await show('scanning');
-              break;
-            }
-            if (res.outcome === 'UNREADABLE') {
-              // Nothing could be read (no Full Disk Access, say): wait for the user to resume.
-              await waitPaused('scanning', res.reason ?? 'cannot read the folder');
-            } else {
-              // T5-b: the scan only reports SOURCE_GONE; the folder waits for its drive (§9).
-              await setFolderState(runId, folder.folderId, 'waiting_source');
-              await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
-            }
-          }
+        const parallel = !run.dryRun && patched(SEND_WHILE_SCANNING);
+        if ((parallel ? await scanAndSend(run) : await scanLoop(run)) === 'can') {
+          return await continueAsNew<typeof HarvestWorkflow>({
+            runId,
+            phase: 'scan',
+            ...(parallel ? { consecutive } : {}),
+            ...carry,
+          });
         }
         if (run.dryRun) {
           phase = 'done';
@@ -200,7 +288,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     }
 
     let batches = input.batches ?? 0;
-    let send = { cursor: input.cursor ?? null, consecutive: input.consecutive ?? 0 };
+    let send = { cursor: input.cursor ?? null, consecutive };
     await show('sending');
     for (;;) {
       await userPause('sending');
