@@ -912,6 +912,30 @@ describe('known content', () => {
     expect(await counters(e.runId)).toEqual({ sent: 1, known: 1, dups: 1, bytes_sent: 2000 });
   });
 
+  test('every decision (sent, known, dup) records decided_at for the dashboard rate', async () => {
+    const dup = randomBytes(2000);
+    const vault = randomBytes(1800);
+    const e = await setup({ 'DCIM/a.cr2': dup, 'DCIM/b.cr2': dup, 'DCIM/c.cr2': vault });
+    await pgh.pool.query(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state) VALUES ($1, 'cr2', 'still', 1800, 'INGESTED')`,
+      [sha(vault)],
+    );
+    const before = await pgh.pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM harvest_items WHERE decided_at IS NOT NULL`,
+    );
+    expect(before.rows[0]!.n).toBe(0); // PLANNED items are undecided
+    await e.send();
+    const { rows } = await pgh.pool.query<{ state: string; recent: boolean }>(
+      `SELECT state, decided_at > now() - interval '1 minute' AS recent FROM harvest_items
+       ORDER BY state`,
+    );
+    expect(rows).toEqual([
+      { state: 'DUP', recent: true },
+      { state: 'KNOWN', recent: true },
+      { state: 'SENT', recent: true },
+    ]);
+  });
+
   test('a DUP whose target stopped being SENT/PLANNED is sent instead', async () => {
     const dup = randomBytes(2000);
     const e = await setup({ 'DCIM/a.cr2': dup, 'DCIM/b.cr2': dup });

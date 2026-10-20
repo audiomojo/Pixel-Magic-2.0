@@ -81,7 +81,7 @@ A source's identity never depends on how it was mounted or named.
 
 `GET /api/sources/:id/tree?path=` lists one directory of the live source: sub-folder names only, sorted, with symlinks and pruned folders (§6.2) hidden. It uses `readdir` only, never writes, and times out after 10 s per call.
 
-## 5. Data model (migrations `0005_harvest.sql`, `0006_harvest_fixes.sql`)
+## 5. Data model (migrations `0005_harvest.sql`, `0006_harvest_fixes.sql`, `0007_harvest_decided_at.sql`)
 
 ```sql
 harvest_sources (id bigserial PK, identity text UNIQUE NOT NULL, label text UNIQUE NOT NULL,
@@ -352,13 +352,13 @@ Parsed with the existing config rules (empty = unset, bounds enforced).
 - **Sources untouched:** the fixture source is made read-only (`chmod -R a-w`, plus `uchg` on one file) before a full harvest; bytes, mtimes, modes and flags are snapshotted before and after; a wrapper over `node:fs` fails the test on any mutating call whose path is not under the allowed roots.
 - **Workflow** (TestWorkflowEnvironment): scan → send → finish; pause, resume and cancel; unplug and replug; a queued second run; approving maybes mid-run; continue-as-new.
 - **HTTP:** every endpoint; Host/Origin/header protection; thumbnails and cache eviction.
-- **Dashboard SQL** tests for the Harvest tiles (§13).
+- **Dashboard SQL** tests for the Harvest tiles and the Now strip (§13).
 - **End-to-end tier (`make test-harvest`):** on a `pmtest_*` stack, a fixture source made of clones of the sample corpus in a temp folder (the corpus stays read-only; nothing leaves the Mac). Harvest it twice; assert each distinct sha256 is in the vault once, the second run sends 0, and the source is unchanged.
 - **Gates:** `npm test`, lint, format:check, typecheck, build, coverage (≥ 85 % branches on new files), plus the existing smoke tier.
 
 ## 13. Observability and operations
 
-- **Grafana:** a "Harvest" row: sent and known (today, total), the backlog, the active run's state and pause reason, and the harvester's last heartbeat (red after 5 minutes while a run is active). The row links to the page.
+- **Grafana:** a "Harvest" row: sent and known (today, total), the backlog, the active run's state and pause reason, and the harvester's last heartbeat (red after 5 minutes while a run is active). The row links to the page. Above it, a "Now" strip with one tile per step (§15, dashboard step strip), and a "Harvest / min" chart in the row.
 - **Make targets:** `harvest-install`, `harvest-uninstall`, `harvester` (foreground), `harvest-status` (terminal summary), `test-harvest`.
 - **README:** what harvest does and never does, installing the agent, the page, limits, and the rollout below.
 
@@ -423,3 +423,4 @@ Decisions made during implementation that changed or refined this spec, in plain
 - **M8 (startup):** a test pins that the host's startup `startNextQueued` starts only an already-queued run (§10.7).
 - **Least-privilege runtime (2026-10-20, user-approved):** the agent no longer runs the shared Node binary. `install` copies the Node it runs under (symlinks resolved, plus `libnode*.dylib` from beside it or `../lib`, since Homebrew's node loads libnode from `@loader_path`) into `~/Library/Application Support/PixelMagic/harvester/` as `pixel-magic-harvester`, through a `GuardedFs` on that directory; unchanged bytes are left alone so a reinstall keeps the grant, changed ones are replaced via `.part` + rename, and the copy must pass `--version` before the agent is loaded. The README grants it Removable Volumes and Network Volumes only, never Full Disk Access. `status` names it and says when it is out of date with the current Node; `uninstall` removes it.
 - **Send while scanning (2026-10-20, user-requested):** the drop zone no longer waits for the whole scan. During the scan phase the workflow runs a second loop calling `sendBatch(runId, { whileScanning: true })`: passes from the first folder over the PLANNED items committed so far, 30 s between passes, until the scan ends; a shut gate or an unplug retries silently (30 s / 5 min / 60 s), disk full and 25 errors in a row wait for the scan, and the send phase then shows them. In this mode `sendBatch` never writes run folder states (the scan owns them; a folder marked `done` would be skipped after continue-as-new) and ends a pass with `DONE` without probing for leftovers. Known-content dedupe is unchanged: a twin met later is DUP against the SENT one, one met earlier in send order sends and the later twin becomes DUP. Continue-as-new is taken only between scan steps, after the in-flight send batch ends; the error count carries into the next execution and into the send phase. Both loops are awaited to their end on cancellation or failure. Histories started before this change replay the old order (`patched('send-while-scanning')`). Cost: the drive is read by the scan and the copies at once (slower on a spinning disk).
+- **Dashboard step strip (2026-10-20, user-requested):** a stretch of photos already in the vault showed no activity anywhere in Grafana (only `sent_at` was recorded, and the Harvest row sat below the fold). Migration `0007` adds `harvest_items.decided_at`, set by `sendBatch` on every SENT, KNOWN or DUP decision. The dashboard opens with a "Now" strip, one tile per step: ① scan (folders and photos found, or done), ② check & copy (% of the run decided, PLANNED items left in the run's folders, decisions per minute over the last 10 minutes or since the first one, and the time left at that rate; no time left while scanning, as the total still grows), ③ drop zone, ④ ingest, ⑤ decode, ⑥ cluster (backlog and finished per minute over 5 minutes). Each tile is green while working (a decision or finish in the last 2 minutes), orange while waiting or paused, grey when idle or done. The Harvest row follows, with a "Harvest / min" chart (copied, already in vault, duplicate); the pipeline panels move below it under a "Pipeline" row.

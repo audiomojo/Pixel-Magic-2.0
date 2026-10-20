@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
 const DASH = 'infra/grafana/dashboards/pipeline-live.json';
@@ -23,6 +23,13 @@ const REQUIRED = [
   'Harvest run',
   'Harvester heartbeat',
   'Possible photos awaiting review',
+  'Harvest / min',
+  '① Scan',
+  '② Check & copy',
+  '③ Drop zone',
+  '④ Ingest',
+  '⑤ Decode',
+  '⑥ Cluster',
 ];
 
 interface Target {
@@ -296,4 +303,240 @@ test('dashboard has required panels and 5s refresh', () => {
   expect(d.title).toBe('Pixel Magic: Pipeline Live');
   expect(d.panels.map((p) => p.title)).toEqual(expect.arrayContaining(REQUIRED));
   expect(d.refresh).toBe('5s');
+});
+
+describe('Now strip', () => {
+  const text = async (title: string) => String((await row(title)).value);
+  const NOW = ['① Scan', '② Check & copy', '③ Drop zone', '④ Ingest', '⑤ Decode', '⑥ Cluster'];
+
+  /** A run over the whole of source `Exp` (rel_path ''), with its folder counters. */
+  async function run(
+    state: string,
+    o: { folder?: string; counters?: Partial<Record<string, number>>; dryRun?: boolean } = {},
+  ) {
+    const { pool } = pgh;
+    const src = await pool.query<{ id: string }>(
+      `INSERT INTO harvest_sources (identity, label, kind) VALUES ('i', 'Exp', 'local')
+       ON CONFLICT (identity) DO UPDATE SET kind = 'local' RETURNING id`,
+    );
+    const folder = await pool.query<{ id: string }>(
+      `INSERT INTO harvest_folders (source_id, rel_path) VALUES ($1, '') RETURNING id`,
+      [src.rows[0]!.id],
+    );
+    const r = await pool.query<{ id: string }>(
+      `INSERT INTO harvest_runs (state, dry_run) VALUES ($1, $2) RETURNING id`,
+      [state, o.dryRun ?? false],
+    );
+    const c = { dirs: 0, photos: 0, sent: 0, known: 0, dups: 0, ...o.counters };
+    await pool.query(
+      `INSERT INTO harvest_run_folders (run_id, folder_id, position, state, dirs, photos, sent, known, dups)
+       VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8)`,
+      [
+        r.rows[0]!.id,
+        folder.rows[0]!.id,
+        o.folder ?? 'sending',
+        c.dirs,
+        c.photos,
+        c.sent,
+        c.known,
+        c.dups,
+      ],
+    );
+    return r.rows[0]!.id;
+  }
+
+  /** `n` harvest items in `state`, decided `ago` (a Postgres interval) or undecided (null). */
+  async function items(state: string, n: number, ago: string | null, from = 0) {
+    const { pool } = pgh;
+    await harvestItem(state, from); // makes the source
+    await pool.query(
+      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+       SELECT (SELECT id FROM harvest_sources), 'f' || g, 'f' || g, 1, g, 'photo', $1
+       FROM generate_series($2::int + 1, $3::int - 1) g`,
+      [state, from, from + n],
+    );
+    if (ago !== null)
+      await pool.query(
+        `UPDATE harvest_items SET decided_at = now() - $1::interval
+         WHERE mtime_ns >= $2 AND mtime_ns < $3`,
+        [ago, from, from + n],
+      );
+  }
+
+  test('every tile reads idle or empty on an empty database, in grey', async () => {
+    expect(await Promise.all(NOW.map(text))).toEqual([
+      'idle',
+      'idle',
+      'empty',
+      'idle',
+      'idle',
+      'idle',
+    ]);
+  });
+
+  test('scan: folders and photos while scanning, the reason while paused, done after', async () => {
+    const id = await run('scanning', {
+      folder: 'scanning',
+      counters: { dirs: 74821, photos: 622804 },
+    });
+    expect(await text('① Scan')).toBe('scanning · 74,821 folders · 622,804 photos');
+    await pgh.pool.query(
+      `UPDATE harvest_runs SET state = 'paused', paused_reason = 'source unplugged' WHERE id = $1`,
+      [id],
+    );
+    expect(await text('① Scan')).toBe(
+      'paused (source unplugged) · 74,821 folders · 622,804 photos',
+    );
+    await pgh.pool.query(`UPDATE harvest_runs SET state = 'sending', paused_reason = NULL`);
+    await pgh.pool.query(`UPDATE harvest_run_folders SET state = 'sending'`);
+    expect(await text('① Scan')).toBe('done · 622,804 photos found');
+  });
+
+  test('check & copy: % done, left, rate over the last 10 min and the time left', async () => {
+    await run('sending', { counters: { sent: 100, known: 200, dups: 0 } });
+    await items('PLANNED', 300, null);
+    await items('SENT', 100, '9 minutes 30 seconds', 300);
+    await items('KNOWN', 200, '30 seconds', 400);
+    await items('KNOWN', 50, '2 hours', 600); // outside the window: not in the rate
+    // 300 over the 9.5 minutes since the oldest one: 31.6/min (31 if the test runs slowly)
+    expect(await text('② Check & copy')).toMatch(/^working · 50% · 300 left · 3[12]\/min · ~10m$/);
+  });
+
+  test('check & copy: the rate counts from the first decision when the window is not full yet', async () => {
+    await run('sending', { counters: { known: 120 } });
+    await items('PLANNED', 7140, null);
+    await items('KNOWN', 120, '30 seconds', 7140); // a window under a minute counts as one
+    expect(await text('② Check & copy')).toBe('working · 1% · 7,140 left · 120/min · ~1h 0m');
+  });
+
+  test('check & copy while scanning: what is left so far, no time left (the total grows)', async () => {
+    await run('scanning', { folder: 'scanning' });
+    await items('PLANNED', 40, null);
+    expect(await text('② Check & copy')).toBe('waiting · 40 left');
+    await items('SENT', 20, '30 seconds', 40);
+    expect(await text('② Check & copy')).toBe('working while scanning · 40 left so far · 20/min');
+  });
+
+  test('check & copy: waiting for the scan, paused with its reason, dry run', async () => {
+    const id = await run('scanning', { folder: 'scanning' });
+    expect(await text('② Check & copy')).toBe('waiting for the scan to find photos');
+    await items('PLANNED', 3, null);
+    await pgh.pool.query(
+      `UPDATE harvest_runs SET state = 'paused', paused_reason = 'disk 81.0 %' WHERE id = $1`,
+      [id],
+    );
+    expect(await text('② Check & copy')).toBe('paused (disk 81.0 %) · 3 left');
+    await pgh.pool.query(`UPDATE harvest_runs SET dry_run = true`);
+    expect(await text('② Check & copy')).toBe('dry run (nothing is copied)');
+  });
+
+  test("check & copy counts only PLANNED items under the run's folder", async () => {
+    const { pool } = pgh;
+    await run('sending');
+    await pool.query(`UPDATE harvest_folders SET rel_path = 'DCIM'`);
+    const src = (await pool.query<{ id: string }>(`SELECT id FROM harvest_sources`)).rows[0]!.id;
+    for (const [rel, key] of [
+      ['DCIM/a.jpg', 'dcim/a.jpg'],
+      ['dcim/B.jpg', 'dcim/b.jpg'], // another case spelling of the folder: in
+      ['DCIMX/c.jpg', 'dcimx/c.jpg'], // a sibling sharing the prefix: out
+      ['Other/d.jpg', 'other/d.jpg'],
+    ])
+      await pool.query(
+        `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+         VALUES ($1, $2, $3, 1, 1, 'photo', 'PLANNED')`,
+        [src, rel, key],
+      );
+    expect(await text('② Check & copy')).toBe('waiting · 2 left');
+  });
+
+  test('drop zone: files and size, or empty', async () => {
+    await pgh.pool.query(`UPDATE scan_stats SET pending_files = 1240, pending_bytes = 4194304`);
+    expect(await text('③ Drop zone')).toBe('queued · 1,240 files · 4096 kB');
+  });
+
+  test('pipeline stages: working with a rate, waiting with a backlog, idle', async () => {
+    const { pool } = pgh;
+    const h = (n: number) => String(n).padStart(64, '0');
+    for (let i = 0; i < 10; i++)
+      await pool.query(
+        `INSERT INTO contents (sha256, ext, kind, size_bytes, state, hashed_at)
+         VALUES ($1, 'jpg', 'still', 1, $2, $3)`,
+        [h(i), i < 4 ? 'INGESTED' : 'HASHED', i < 4 ? null : new Date()],
+      );
+    // 6 decoded in the last 5 minutes -> 2/min (rounded up); 4 still waiting
+    expect(await text('⑤ Decode')).toBe('working · 4 waiting · 2/min');
+    expect(await text('⑥ Cluster')).toBe('waiting · 6 queued'); // 6 HASHED, none clustered
+    await pool.query(
+      `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, state)
+       VALUES ('a.jpg', 'a.jpg', 1, 1, 'DISCOVERED'), ('b.jpg', 'b.jpg', 1, 2, 'INGESTED')`,
+    );
+    expect(await text('④ Ingest')).toBe('working · 1 waiting · 1/min');
+    await pool.query(`DELETE FROM files WHERE state = 'INGESTED'`); // nothing finished lately
+    expect(await text('④ Ingest')).toBe('waiting · 1 queued');
+  });
+
+  test('tiles colour by their first word: green working, orange waiting/paused, grey idle', () => {
+    const color = (title: string, value: string) => {
+      const p = loadDashboard().panels.find((x) => x.title === title) as unknown as {
+        fieldConfig: {
+          defaults: { mappings: { options: { pattern: string; result: { color: string } } }[] };
+        };
+      };
+      const m = p.fieldConfig.defaults.mappings.find((x) =>
+        new RegExp(x.options.pattern).test(value),
+      );
+      return m?.options.result.color ?? 'green';
+    };
+    for (const t of NOW) {
+      expect(color(t, 'working · 3 left')).toBe('green');
+      expect(color(t, 'scanning · 1 folders · 2 photos')).toBe('green');
+      expect(color(t, 'queued · 1 files · 1 kB')).toBe('green');
+      expect(color(t, 'waiting · 3 left')).toBe('orange');
+      expect(color(t, 'paused (disk 81.0 %) · 3 left')).toBe('orange');
+      for (const grey of [
+        'idle',
+        'empty',
+        'done · 3 photos found',
+        'skipped (sending approved photos)',
+      ])
+        expect(color(t, grey)).toBe('#8e8e8e');
+    }
+  });
+
+  test('Harvest / min: decisions per minute by outcome', async () => {
+    await items('SENT', 2, '1 minute');
+    await items('KNOWN', 3, '1 minute', 2);
+    await items('DUP', 1, '1 minute', 5);
+    await items('KNOWN', 4, '2 hours', 6); // older than the chart
+    await items('PLANNED', 1, null, 10);
+    const r = await pgh.pool.query<{ metric: string; value: string }>(
+      targetByTitle('Harvest / min').rawSql,
+    );
+    const by = Object.fromEntries(r.rows.map((x) => [x.metric, Number(x.value)]));
+    expect(by).toEqual({ copied: 2, 'already in vault': 3, duplicate: 1 });
+  });
+
+  test('layout: the Now strip on top, then Harvest, then Pipeline; no panels overlap', () => {
+    const panels = loadDashboard().panels as unknown as (Panel & {
+      gridPos: { x: number; y: number; w: number; h: number };
+    })[];
+    const rows = panels.filter((p) => p.type === 'row').map((p) => [p.title, p.gridPos.y]);
+    expect(rows).toEqual([
+      ['Now: each step, in order', 0],
+      ['Harvest', 4],
+      ['Pipeline', 17],
+    ]);
+    for (const t of NOW) expect(panels.find((p) => p.title === t)!.gridPos.y).toBe(1);
+    const cells = new Set<string>();
+    for (const p of panels) {
+      const g = p.gridPos;
+      expect(g.x + g.w).toBeLessThanOrEqual(24);
+      for (let x = g.x; x < g.x + g.w; x++)
+        for (let y = g.y; y < g.y + g.h; y++) {
+          const k = `${x},${y}`;
+          expect(cells.has(k), `${p.title} overlaps at ${k}`).toBe(false);
+          cells.add(k);
+        }
+    }
+  });
 });

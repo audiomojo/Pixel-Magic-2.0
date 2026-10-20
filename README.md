@@ -32,6 +32,10 @@ Every tunable there is forwarded to the workers; one left unset uses its default
 
 The dashboard is at <http://localhost:3000> (or `GRAFANA_PORT`), viewable without a login;
 the `admin` login is only needed to edit.
+Its top strip shows each step in order (① scan, ② check & copy, ③ drop zone, ④ ingest,
+⑤ decode, ⑥ cluster): green while that step is working, orange while it waits or is paused,
+grey when idle. ② gives the harvest's % done, photos left, rate and time left; it can be green
+while the drop zone is empty, when the photos it checks are already in the vault.
 
 Drop real files, not symlinks or aliases: links in the drop zone are never followed or
 ingested (each scan logs a warning while any are there).

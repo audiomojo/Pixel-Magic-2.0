@@ -253,7 +253,7 @@ async function settle(
       : '';
   const { rows } = await pool.query<{ n: number }>(
     `WITH u AS (
-       UPDATE harvest_items SET ${set}
+       UPDATE harvest_items SET ${set}, decided_at = clock_timestamp()
        WHERE id = $1 AND state = 'PLANNED' ${extra}
        RETURNING size_bytes
      ), c AS (
