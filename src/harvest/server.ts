@@ -16,7 +16,8 @@ import { GuardedFs, sourcePath } from './paths.js';
 import { createRun, finishRunRows, startNextQueued } from './runs.js';
 import {
   detectSources,
-  registerSources,
+  registerDetected,
+  type UnidentifiedVolume,
   type DetectOptions,
   type SourceRow,
   type SystemProbe,
@@ -179,24 +180,29 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   const statfsTimeoutMs = d.statfsTimeoutMs ?? 2000;
 
   // ---- drives -------------------------------------------------------------------------
-  let sourcesCache: { at: number; rows: SourceRow[] } | undefined;
-  let detecting: Promise<SourceRow[]> | undefined;
-  async function getSources(force = false): Promise<SourceRow[]> {
-    if (!force && sourcesCache && Date.now() - sourcesCache.at < ttl) return sourcesCache.rows;
+  interface Detection {
+    rows: SourceRow[];
+    unidentified: UnidentifiedVolume[];
+  }
+  let sourcesCache: ({ at: number } & Detection) | undefined;
+  let detecting: Promise<Detection> | undefined;
+  async function detect(force = false): Promise<Detection> {
+    if (!force && sourcesCache && Date.now() - sourcesCache.at < ttl) return sourcesCache;
     detecting ??= (async () => {
       try {
-        const rows = await registerSources(
+        const found = await registerDetected(
           pool,
           await detectSources(sys, settings.dataDir, d.detectOpts),
         );
-        sourcesCache = { at: Date.now(), rows };
-        return rows;
+        sourcesCache = { at: Date.now(), ...found };
+        return found;
       } finally {
         detecting = undefined;
       }
     })();
     return detecting;
   }
+  const getSources = async (force = false): Promise<SourceRow[]> => (await detect(force)).rows;
 
   /**
    * Used and total bytes of a mounted drive, cached for the sources TTL. statfs on a hung SMB
@@ -322,9 +328,11 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         queue: [],
         reviewCount: 0,
         gate: null,
+        unidentified: [],
       };
     }
-    const sources = await sourceViews(await getSources());
+    const found = await detect();
+    const sources = await sourceViews(found.rows);
     const [activeRun] = await runViews(`state IN ${ACTIVE_STATES}`, [], 'ORDER BY id LIMIT 1');
     const queue = await runViews("state = 'queued'", [], 'ORDER BY id');
     const review = await pool.query<{ n: string }>(
@@ -337,6 +345,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       queue,
       reviewCount: Number(review.rows[0]!.n),
       gate: activeRun ? await gateStatus() : null,
+      unidentified: found.unidentified,
     };
   }
 
@@ -773,7 +782,8 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       if ((m = path.match(/^\/api\/thumb\/([^/]+)$/))) return thumb(m[1]!, res);
     } else {
       if (path === '/api/sources/refresh') {
-        return ok({ sources: await sourceViews(await getSources(true)) });
+        const found = await detect(true);
+        return ok({ sources: await sourceViews(found.rows), unidentified: found.unidentified });
       }
       if (path === '/api/runs') return ok(await postRuns(body));
       if ((m = path.match(/^\/api\/runs\/([^/]+)\/(pause|resume|cancel)$/))) {

@@ -79,9 +79,12 @@ export function folderStatus(folder, ancestors = []) {
   return 'never';
 }
 
-/** A folder is ticked by default only if it was never harvested. */
-export function defaultTicked(folder) {
-  return !folder.lastHarvestedAt;
+/**
+ * Whether a folder counts as not yet harvested: never harvested itself and not covered by a
+ * harvested ancestor (`ancestors` as for folderStatus).
+ */
+export function defaultTicked(folder, ancestors = []) {
+  return !folder.lastHarvestedAt && !ancestors.some((a) => a && day(a.lastHarvestedAt));
 }
 
 /** A paused run whose reason starts with "stalled" is shown in red. */

@@ -7,6 +7,7 @@ import { startPg, type PgHandle } from '../helpers/pg.js';
 import {
   detectSources,
   parseMount,
+  registerDetected,
   registerSources,
   resolveMount,
   type DetectedSource,
@@ -318,4 +319,11 @@ test('probe failure with two local rows at the same mount path is ambiguous: ski
     expect.objectContaining({ matches: 2 }),
     expect.stringContaining('ambiguous'),
   );
+});
+
+test('registerDetected returns a probe-failed volume with no matching row as unidentified, without a row', async () => {
+  const bad = fake('/dev/disk9s1 on /Volumes/Mystery (exfat, local)', () => Promise.resolve(null));
+  const { rows, unidentified } = await registerDetected(pgh.pool, await detectSources(bad, NOPE));
+  expect(rows).toEqual([]);
+  expect(unidentified).toEqual([{ mountPath: '/Volumes/Mystery', labelBase: 'Mystery' }]);
 });

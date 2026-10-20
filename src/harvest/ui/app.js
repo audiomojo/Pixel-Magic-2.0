@@ -82,9 +82,13 @@ async function refreshState() {
   } catch (e) {
     stateError = e.message;
   }
-  paintChrome();
-  if (route.name === 'sources') paintSources();
-  if (route.name === 'source') paintSourceHeader();
+  try {
+    paintChrome();
+    if (route.name === 'sources') paintSources();
+    if (route.name === 'source') paintSourceHeader();
+  } catch (e) {
+    console.error('paint failed', e);
+  }
 }
 
 let timer;
@@ -92,14 +96,20 @@ function schedule() {
   clearTimeout(timer);
   if (document.hidden) return;
   timer = setTimeout(async () => {
-    await refreshState();
-    schedule();
+    try {
+      await refreshState();
+    } finally {
+      schedule();
+    }
   }, POLL_MS);
 }
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) return clearTimeout(timer);
-  await refreshState();
-  schedule();
+  try {
+    await refreshState();
+  } finally {
+    schedule();
+  }
 });
 
 // ---------------------------------------------------------------- banner, nav badge
@@ -325,12 +335,19 @@ async function removeQueued(id) {
 
 // ---------------------------------------------------------------- router
 const main = () => $('main');
+let sourcesFrame = null; // the sources view's fixed parts, rebuilt only on navigation
 function parseHash() {
   const parts = location.hash
     .replace(/^#\/?/, '')
     .split('/')
     .filter(Boolean)
-    .map(decodeURIComponent);
+    .map((p) => {
+      try {
+        return decodeURIComponent(p);
+      } catch {
+        return p;
+      }
+    });
   const [a, b, ...rest] = parts;
   if (a === 'source' && b) return { name: 'source', id: b };
   if (a === 'review')
@@ -354,6 +371,7 @@ function navigate() {
     else a.removeAttribute('aria-current');
   }
   document.title = 'Harvest';
+  sourcesFrame = null;
   main().replaceChildren();
   ({
     sources: paintSources,
@@ -367,40 +385,62 @@ function navigate() {
 window.addEventListener('hashchange', navigate);
 
 // ---------------------------------------------------------------- 1. sources
-async function refreshDrives(btn) {
+async function refreshDrives(btn, msg) {
   btn.disabled = true;
+  msg.replaceChildren();
   try {
     await post('/api/sources/refresh');
     await refreshState();
   } catch (e) {
-    main().prepend(message(e.message, true));
+    msg.replaceChildren(message(e.message, true));
   } finally {
     btn.disabled = false;
   }
+}
+
+/** The text of one source card, so the list is repainted only when something visible changed. */
+function sourceCard(s) {
+  return {
+    id: s.id,
+    mounted: s.mounted,
+    name: sourceName(s),
+    kind: s.kind,
+    line: `${s.mounted ? `used ${bytes(s.usedBytes)} of ${bytes(s.totalBytes)}` : `last seen ${ago(s.lastSeenAt)}`} · last harvest ${ago(s.lastHarvestedAt)} · ${count(s.sentCount)} sent`,
+    review: s.reviewCount > 0 ? `${count(s.reviewCount)} to review` : '',
+  };
 }
 
 function paintSources() {
   if (route.name !== 'sources') return;
   const m = main();
   if (!state) return m.replaceChildren(h('p', { className: 'muted' }, 'Loading…'));
-  const rows = [...state.sources].sort(
-    (a, b) => Number(b.mounted) - Number(a.mounted) || sourceName(a).localeCompare(sourceName(b)),
-  );
-  const refresh = m.querySelector('#refresh');
-  const btn =
-    refresh ||
-    h(
+  if (!sourcesFrame) {
+    const msg = h('div');
+    const btn = h(
       'button',
       {
-        id: 'refresh',
         className: 'btn',
         type: 'button',
-        onclick: (e) => refreshDrives(e.currentTarget),
+        onclick: () => refreshDrives(btn, msg),
       },
       'Refresh drives',
     );
-  m.replaceChildren(
-    h('div', { className: 'row between' }, h('h2', {}, 'Sources'), btn),
+    sourcesFrame = { msg, list: h('div'), key: '' };
+    m.replaceChildren(
+      h('div', { className: 'row between' }, h('h2', {}, 'Sources'), btn),
+      msg,
+      sourcesFrame.list,
+    );
+  }
+  const rows = [...state.sources].sort(
+    (a, b) => Number(b.mounted) - Number(a.mounted) || sourceName(a).localeCompare(sourceName(b)),
+  );
+  const cards = rows.map(sourceCard);
+  const unidentified = state.unidentified || [];
+  const key = JSON.stringify([cards, unidentified, state.reviewCount]);
+  if (key === sourcesFrame.key) return;
+  sourcesFrame.key = key;
+  sourcesFrame.list.replaceChildren(
     state.reviewCount > 0
       ? h(
           'p',
@@ -412,36 +452,38 @@ function paintSources() {
           ),
         )
       : '',
-    rows.length === 0
+    rows.length === 0 && unidentified.length === 0
       ? h(
           'p',
           { className: 'muted' },
           'No sources found. Plug in a drive and press Refresh drives.',
         )
       : '',
-    ...rows.map((s) => {
-      const title = s.mounted
-        ? h('a', { href: `#/source/${s.id}` }, sourceName(s))
-        : h('span', {}, `${sourceName(s)} (not mounted)`);
+    ...cards.map((c) => {
+      const title = c.mounted
+        ? h('a', { href: `#/source/${c.id}` }, c.name)
+        : h('span', {}, `${c.name} (not mounted)`);
       return h(
         'div',
-        { className: s.mounted ? 'card' : 'card off' },
+        { className: c.mounted ? 'card' : 'card off' },
         h(
           'div',
           { className: 'row between' },
           h('strong', {}, title),
-          h('span', { className: 'muted' }, s.kind),
+          h('span', { className: 'muted' }, c.kind),
         ),
-        h(
-          'div',
-          { className: 'muted' },
-          `${s.mounted ? `used ${bytes(s.usedBytes)} of ${bytes(s.totalBytes)}` : `last seen ${ago(s.lastSeenAt)}`} · last harvest ${ago(s.lastHarvestedAt)} · ${count(s.sentCount)} sent`,
-        ),
-        s.reviewCount > 0
-          ? h('div', {}, h('a', { href: '#/review' }, `${count(s.reviewCount)} to review`))
-          : '',
+        h('div', { className: 'muted' }, c.line),
+        c.review ? h('div', {}, h('a', { href: '#/review' }, c.review)) : '',
       );
     }),
+    ...unidentified.map((u) =>
+      h(
+        'div',
+        { className: 'card off' },
+        h('strong', {}, u.labelBase),
+        h('div', { className: 'muted' }, "Couldn't identify this drive. Press Refresh drives."),
+      ),
+    ),
   );
 }
 
@@ -470,6 +512,7 @@ function paintSourceHeader() {
   if (!head) return;
   if (!state) return;
   if (!s) {
+    src.headKey = 'unknown';
     head.replaceChildren(
       h('p', { className: 'bad' }, 'Unknown source.'),
       h('a', { href: '#/' }, 'Back to sources'),
@@ -478,6 +521,9 @@ function paintSourceHeader() {
   }
   if (!src.treeStarted && s.mounted) startTree();
   const mounted = s.mounted;
+  const key = JSON.stringify([sourceName(s), s.kind, mounted, s.usedBytes, s.totalBytes]);
+  if (key === src.headKey) return;
+  src.headKey = key;
   head.replaceChildren(
     h('p', {}, h('a', { href: '#/' }, '← Sources')),
     h('h2', {}, sourceName(s)),
@@ -491,7 +537,6 @@ function paintSourceHeader() {
   );
   if (!mounted) {
     $('src-tree').replaceChildren();
-    $('src-msg').replaceChildren();
     src.treeStarted = false;
   }
 }
@@ -530,7 +575,7 @@ function startTree() {
 }
 
 /** A tree row. */
-function nodeFor(entry, isRoot) {
+function nodeFor(entry, isRoot, chain = []) {
   const input = h('input', {
     type: 'checkbox',
     onchange: () => {
@@ -562,7 +607,7 @@ function nodeFor(entry, isRoot) {
     ),
   );
   li._status = status;
-  src.rows.set(entry.relPath, { input, entry, li, isRoot });
+  src.rows.set(entry.relPath, { input, entry, li, isRoot, chain });
   return li;
 }
 
@@ -577,8 +622,15 @@ async function toggle(li, relPath, twisty) {
   }
   twisty.setAttribute('aria-expanded', 'true');
   twisty.textContent = '▾';
-  if (sub) sub.hidden = false;
-  else await expand(li, relPath);
+  if (sub && !sub.dataset.failed) sub.hidden = false;
+  else {
+    if (sub) sub.remove(); // a failed load: try again
+    const ok = await expand(li, relPath);
+    if (!ok) {
+      twisty.setAttribute('aria-expanded', 'false');
+      twisty.textContent = '▸';
+    }
+  }
 }
 
 /** Loads one level below relPath and shows it under li. */
@@ -592,12 +644,10 @@ async function expand(li, relPath) {
       `/api/sources/${encodeURIComponent(src.id)}/tree?path=${encodeURIComponent(relPath)}`,
     );
   } catch (e) {
-    ul.replaceChildren(h('li', { className: 'bad' }, e.message));
-    if (relPath !== '') {
-      // Let the user try again by collapsing and expanding.
-      ul.remove();
-    }
-    return;
+    // The error row stays; expanding again retries.
+    ul.dataset.failed = '1';
+    ul.replaceChildren(h('li', { className: 'bad', role: 'alert' }, e.message));
+    return false;
   }
   const label = sourceName(s);
   const covers = data.coveredBy
@@ -621,12 +671,14 @@ async function expand(li, relPath) {
       const child = nodeFor(
         { name: e.name, relPath: e.relPath, lastHarvestedAt: e.lastHarvestedAt },
         false,
+        chain,
       );
       child._status.textContent = folderStatus(e, chain);
       return child;
     }),
   );
   syncTicks();
+  return true;
 }
 
 /** A ticked folder includes everything below it: its descendants show ticked and locked. */
@@ -660,7 +712,8 @@ function selection() {
 
 function tickNew() {
   for (const [p, row] of src.rows) {
-    if (defaultTicked(row.entry)) src.ticked.add(p);
+    // Never the whole-source row: that would re-harvest everything.
+    if (!row.isRoot && defaultTicked(row.entry, row.chain)) src.ticked.add(p);
   }
   syncTicks();
 }
@@ -700,8 +753,10 @@ async function openReview() {
   m.replaceChildren(h('h2', {}, 'Possible photos'), h('p', { className: 'muted' }, 'Loading…'));
   try {
     const { groups } = await api('/api/review');
+    if (route.name !== 'review') return;
     paintReviewGroups(groups);
   } catch (e) {
+    if (route.name !== 'review') return;
     m.replaceChildren(h('h2', {}, 'Possible photos'), message(e.message, true));
   }
 }
@@ -723,7 +778,8 @@ function paintReviewGroups(groups) {
     const card = h('div', { className: 'card' });
     const msg = h('div');
     const act = (action) => async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget; // null after the first await
+      btn.disabled = true;
       try {
         const r = await post('/api/review', { sourceId: g.sourceId, path: g.path, action });
         card.replaceChildren(
@@ -733,7 +789,7 @@ function paintReviewGroups(groups) {
         );
         refreshState();
       } catch (err) {
-        e.currentTarget.disabled = false;
+        btn.disabled = false;
         msg.replaceChildren(message(err.message, true));
       }
     };
@@ -778,12 +834,15 @@ async function openReviewFiles() {
       `/api/review?sourceId=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`,
     ));
   } catch (e) {
+    if (route.name !== 'review-files') return;
     return m.replaceChildren(back, message(e.message, true));
   }
   if (route.name !== 'review-files') return;
   const grid = h('div', { className: 'grid' });
   const msg = h('div');
   const decide = (item, fig, action) => async () => {
+    const buttons = fig.querySelectorAll('button');
+    for (const b of buttons) b.disabled = true;
     try {
       const r = await post('/api/review', { itemIds: [item.id], action });
       fig.remove();
@@ -794,6 +853,7 @@ async function openReviewFiles() {
       );
       refreshState();
     } catch (e) {
+      for (const b of buttons) b.disabled = false;
       msg.replaceChildren(message(e.message, true));
     }
   };

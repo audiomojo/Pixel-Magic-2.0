@@ -212,11 +212,26 @@ interface DbRow {
   last_seen_at: Date | null;
 }
 
+/** A mounted local volume whose probe failed and that matches no known source: shown, not selectable. */
+export interface UnidentifiedVolume {
+  mountPath: string;
+  labelBase: string;
+}
+
 /** Upserts by identity (an existing label is kept), suffixes a colliding new label, returns every source. */
 export async function registerSources(
   pool: pg.Pool,
   detected: DetectedSource[],
 ): Promise<SourceRow[]> {
+  return (await registerDetected(pool, detected)).rows;
+}
+
+/** registerSources plus the volumes that could not be identified (no row is created for those). */
+export async function registerDetected(
+  pool: pg.Pool,
+  detected: DetectedSource[],
+): Promise<{ rows: SourceRow[]; unidentified: UnidentifiedVolume[] }> {
+  const unidentified: UnidentifiedVolume[] = [];
   for (const d of detected) {
     if (!d.probeFailed && isReservedLabel(d.labelBase))
       throw new Error(`reserved source label: ${d.labelBase}`);
@@ -241,6 +256,7 @@ export async function registerSources(
               ? 'harvest: diskutil failed for unknown volume, skipped'
               : 'harvest: diskutil failed and the mount path is ambiguous, skipped',
           );
+          unidentified.push({ mountPath: d0.mountPath, labelBase: d0.labelBase });
           continue;
         }
         d = { ...d0, identity: known.rows[0]!.identity };
@@ -271,15 +287,18 @@ export async function registerSources(
     );
     await client.query('COMMIT');
     const now = new Set(resolved.map((d) => d.identity));
-    return rows.map((r) => ({
-      id: r.id,
-      identity: r.identity,
-      label: r.label,
-      kind: r.kind,
-      lastMountPath: r.last_mount_path,
-      lastSeenAt: r.last_seen_at,
-      mounted: now.has(r.identity),
-    }));
+    return {
+      rows: rows.map((r) => ({
+        id: r.id,
+        identity: r.identity,
+        label: r.label,
+        kind: r.kind,
+        lastMountPath: r.last_mount_path,
+        lastSeenAt: r.last_seen_at,
+        mounted: now.has(r.identity),
+      })),
+      unidentified,
+    };
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     throw e;

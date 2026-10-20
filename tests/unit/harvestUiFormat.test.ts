@@ -107,6 +107,12 @@ describe('defaultTicked', () => {
     expect(defaultTicked({ lastHarvestedAt: null })).toBe(true);
     expect(defaultTicked({ lastHarvestedAt: '2026-10-20T08:00:00Z' })).toBe(false);
   });
+  it('is false for a folder covered by a harvested ancestor', () => {
+    const done = { name: 'Mac/', lastHarvestedAt: '2026-10-20T08:00:00Z' };
+    expect(defaultTicked({}, [done])).toBe(false);
+    expect(defaultTicked({}, [{ name: 'Mac/', lastHarvestedAt: null }])).toBe(true);
+    expect(defaultTicked({}, [])).toBe(true);
+  });
 });
 
 describe('isStalled', () => {

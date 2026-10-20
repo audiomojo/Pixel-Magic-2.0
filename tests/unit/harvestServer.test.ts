@@ -314,6 +314,29 @@ describe('state, sources', () => {
     expect(s.gate).toMatchObject({ diskPct: 40, diskLimit: 80, backlog: 0, backlogLimit: 20000 });
   });
 
+  test('a mounted local drive whose probe failed is listed as unidentified, with no row', async () => {
+    let root = '';
+    let mystery = '';
+    const sys: SystemProbe = {
+      mountOutput: () =>
+        Promise.resolve(
+          `/dev/disk9s1 on ${root} (exfat, local, nodev)\n/dev/disk8s1 on ${mystery} (exfat, local, nodev)\n`,
+        ),
+      diskutilInfo: (dev) =>
+        Promise.resolve(dev === '/dev/disk9s1' ? { VolumeUUID: 'U-1', VolumeName: 'Drive' } : null),
+      statfs: () => Promise.resolve({ blocks: 1000n, bavail: 600n, bsize: 4096n }),
+    };
+    const e2 = await setup({ deps: { sys } });
+    root = e2.root;
+    mystery = join(dirname(root), 'Mystery');
+    await mkdir(mystery);
+    const s = (await e2.get('/api/state')).json;
+    expect(s.sources.map((x: { label: string }) => x.label)).toEqual(['Drive']);
+    expect(s.unidentified).toEqual([{ mountPath: mystery, labelBase: 'Mystery' }]);
+    const r = await e2.post('/api/sources/refresh', {});
+    expect(r.json.unidentified).toHaveLength(1);
+  });
+
   test('state reports an idle system and a down Temporal', async () => {
     const e = await setup();
     e.temporal.value = false;
