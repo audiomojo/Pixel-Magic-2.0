@@ -74,6 +74,15 @@ Files whose bytes are already in the vault are not copied.
     make harvest-start       # load it again
     make harvester           # run in the foreground; needs `make harvest-stop` first
 
+**Grant the harvester access to your drives** (once, and again after a Node upgrade): macOS
+only lets a process read external drives and network shares when it has permission. In
+**System Settings → Privacy & Security → Full Disk Access**, press **+** and add the `node`
+binary the harvester runs (or allow it under **Files and Folders → Removable Volumes** and
+**Network Volumes**). Its path is the "node" line of `make harvest-status`, or `which node` for
+a foreground `make harvester`; in the file picker press ⌘⇧G and paste the path. Without it a
+run pauses with "cannot read <drive>/<folder>: permission denied" and marks nothing as
+harvested: grant the access, then press **Resume**.
+
 The page is at <http://127.0.0.1:3020> (this Mac only). Pick a drive, tick folders (or the
 whole drive) and press **Start harvest**, or **Dry run** to see what would be sent first. A
 folder you harvested before shows its date; a rescan sends only what is new. Files with unusual

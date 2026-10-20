@@ -214,6 +214,18 @@ test('status on an empty database', async () => {
   expect(got().out).toContain('heartbeat: never');
 });
 
+test('status names the node binary to grant Full Disk Access (installed, else this one)', async () => {
+  await pgh.truncate();
+  let got = capture();
+  expect(await run(['status'], { ...deps(), pool: pgh.pool })).toBe(0);
+  expect(got().out).toContain('node: /opt/node/bin/node (not installed)');
+  vi.restoreAllMocks();
+  expect(await run(['install'], { ...deps(), node: '/usr/local/bin/node&x' })).toBe(0);
+  got = capture();
+  expect(await run(['status'], { ...deps(), pool: pgh.pool })).toBe(0);
+  expect(got().out).toContain('node: /usr/local/bin/node&x (grant it Full Disk Access)');
+});
+
 test('status shows the active run, counts, gate and heartbeat', async () => {
   await pgh.truncate();
   const { pool } = pgh;

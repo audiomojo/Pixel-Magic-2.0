@@ -159,7 +159,12 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
               await show('scanning');
               break;
             }
-            await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
+            if (res.outcome === 'UNREADABLE') {
+              // Nothing could be read (no Full Disk Access, say): wait for the user to resume.
+              await waitPaused('scanning', res.reason ?? 'cannot read the folder');
+            } else {
+              await waitPaused('scanning', res.reason ?? 'source unplugged', SOURCE_RECHECK);
+            }
           }
         }
         if (run.dryRun) {

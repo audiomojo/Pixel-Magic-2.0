@@ -5,8 +5,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 import { createHarvestActivities, type HarvestDeps } from '../../src/harvest/activities.js';
 import { loadHarvestSettings } from '../../src/harvest/config.js';
 import { readMake } from '../../src/harvest/exifMake.js';
-import { createRun, runFolders } from '../../src/harvest/runs.js';
-import { byName, rawRelPath, upsertBatch, type ScanFolderResult } from '../../src/harvest/scan.js';
+import { createRun, finishRunRows, runFolders } from '../../src/harvest/runs.js';
+import {
+  byName,
+  rawRelPath,
+  resolveComponent,
+  upsertBatch,
+  type ScanFolderResult,
+} from '../../src/harvest/scan.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { DataLayout } from '../../src/fsops.js';
 import { jpegWithMake } from '../helpers/exifFixtures.js';
@@ -134,6 +140,21 @@ const items = async () =>
     )
   ).rows;
 
+const rootOk = async (runId: string): Promise<boolean> =>
+  (
+    await pgh.pool.query<{ ok: boolean }>(
+      'SELECT root_ok AS ok FROM harvest_run_folders WHERE run_id = $1',
+      [runId],
+    )
+  ).rows[0]!.ok;
+/** Which folders have a harvest recorded. */
+const history = async () =>
+  (
+    await pgh.pool.query<{ rel_path: string; harvested: boolean }>(
+      `SELECT rel_path, last_harvested_at IS NOT NULL AS harvested FROM harvest_folders
+       ORDER BY rel_path`,
+    )
+  ).rows;
 const counters = async (runId: string) =>
   (
     await pgh.pool.query<CounterRow>(
@@ -369,17 +390,82 @@ describe('scanFolder', () => {
     }
   });
 
-  test('an unreadable ancestor of the folder is counted, not fatal', async () => {
+  test('an unreadable ancestor of the folder is UNREADABLE (F-2): the run pauses', async () => {
     if (isRoot) return;
     const env = await setup({ 'locked/sub/a.cr2': 500 });
     const locked = join(env.root, 'locked');
     await chmod(locked, 0o000);
     try {
-      const { res } = await env.scan('locked/sub');
-      expect(res).toMatchObject({ outcome: 'DONE', photos: 0, errors: 1 });
+      const { runId, res } = await env.scan('locked/sub');
+      expect(res).toMatchObject({
+        outcome: 'UNREADABLE',
+        reason: 'cannot read Drive/locked: permission denied',
+        photos: 0,
+      });
+      expect(await rootOk(runId)).toBe(false);
     } finally {
       await chmod(locked, 0o755);
     }
+  });
+
+  test('an unreadable folder root is UNREADABLE, commits nothing and writes no history', async () => {
+    if (isRoot) return;
+    const env = await setup({ 'locked/a.cr2': 500, 'ok/b.cr2': 500 });
+    const locked = join(env.root, 'locked');
+    await chmod(locked, 0o000);
+    try {
+      const { runId, res } = await env.scan('locked');
+      expect(res).toMatchObject({
+        outcome: 'UNREADABLE',
+        reason: 'cannot read Drive/locked: permission denied',
+        dirs: 0,
+        errors: 0,
+      });
+      expect(await counters(runId)).toMatchObject({ state: 'scanning', scan_cursor: null });
+      await finishRunRows(pgh.pool, runId, 'done');
+      expect(await history()).toEqual([{ rel_path: 'locked', harvested: false }]);
+    } finally {
+      await chmod(locked, 0o755);
+    }
+  });
+
+  test('an unreadable source root (no Full Disk Access) is UNREADABLE', async () => {
+    if (isRoot) return;
+    const env = await setup({ 'a/x.cr2': 500 });
+    await chmod(env.root, 0o000);
+    try {
+      const { res } = await env.scan('');
+      expect(res).toMatchObject({
+        outcome: 'UNREADABLE',
+        reason: 'cannot read Drive: permission denied',
+      });
+    } finally {
+      await chmod(env.root, 0o755);
+    }
+    // Readable again (the user granted access and resumed): the same folder scans.
+    const { res } = await env.scan('');
+    expect(res).toMatchObject({ outcome: 'DONE', photos: 1 });
+  });
+
+  test('a missing folder keeps T5-c (one error, done) but writes no folder history', async () => {
+    const env = await setup({ 'a/x.cr2': 500 });
+    const runId = await createRun(
+      pgh.pool,
+      [
+        { sourceId: env.sourceId, relPath: 'a' },
+        { sourceId: env.sourceId, relPath: 'gone' },
+      ],
+      false,
+    );
+    const { scanFolder } = createHarvestActivities(env.deps);
+    for (const f of await runFolders(pgh.pool, runId)) {
+      expect((await runActivity(scanFolder, [runId, f.folderId])).outcome).toBe('DONE');
+    }
+    await finishRunRows(pgh.pool, runId, 'done');
+    expect(await history()).toEqual([
+      { rel_path: 'a', harvested: true },
+      { rel_path: 'gone', harvested: false },
+    ]);
   });
 
   test('symlinks are not followed and not candidates', async () => {
@@ -619,6 +705,46 @@ describe('scanFolder', () => {
     const bad = (await items()).find((r) => r.rel_path_raw);
     expect(bad!.rel_path_raw).toEqual(Buffer.concat([Buffer.from('d/'), tail]));
     expect(bad!.rel_path).toContain('�');
+  });
+});
+
+describe('folder components (F-2)', () => {
+  const ent = (name: string, isDir = true) => ({
+    name,
+    raw: name.normalize('NFC') === name ? null : Buffer.from(name),
+    isDir,
+    isFile: !isDir,
+  });
+  const enoent = () => Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+  test('an NFC component that does not open is matched against the on-disk (NFD) name', async () => {
+    const nfd = 'Fotos Caf\u0065\u0301';
+    const listed: unknown[] = [];
+    const got = await resolveComponent('/m', 'Fotos Caf\u00e9', {
+      lstat: enoent,
+      listDir: (p) => {
+        listed.push(p);
+        return Promise.resolve([ent('other'), ent(nfd)]);
+      },
+    });
+    expect(listed).toEqual(['/m']);
+    expect(got).toMatchObject({ name: nfd, raw: Buffer.from(nfd), isDir: true });
+  });
+
+  test('a component that opens directly is used as is; a file or no match is not found', async () => {
+    const dir = { isDirectory: () => true };
+    const file = { isDirectory: () => false };
+    const io = (st: { isDirectory(): boolean } | null, ents: ReturnType<typeof ent>[] = []) => ({
+      lstat: () => (st ? Promise.resolve(st) : enoent()),
+      listDir: () => Promise.resolve(ents),
+    });
+    expect(await resolveComponent('/m', 'a', io(dir))).toMatchObject({ name: 'a', raw: null });
+    expect(await resolveComponent('/m', 'a', io(file))).toBeNull();
+    expect(await resolveComponent('/m', 'a', io(null, [ent('b'), ent('a', false)]))).toBeNull();
+    const denied = Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    await expect(
+      resolveComponent('/m', 'a', { lstat: () => Promise.reject(denied), listDir: enoent }),
+    ).rejects.toBe(denied);
   });
 });
 

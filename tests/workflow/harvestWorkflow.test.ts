@@ -507,3 +507,26 @@ test('DONE with an approval starts a new pass from the first folder', async () =
   expect(await h.result()).toBe('done');
   expect(f.sendStates[1]).toEqual({ cursor: null, consecutive: 0 });
 });
+
+test('UNREADABLE during the scan pauses with the reason until resume, then rescans the folder', async () => {
+  let n = 0;
+  const f = fakes({
+    scan: (_r, folder) =>
+      folder === 'f1' && n++ === 0
+        ? {
+            ...SCAN_DONE,
+            outcome: 'UNREADABLE',
+            reason: 'cannot read Drive/DCIM: permission denied',
+          }
+        : SCAN_DONE,
+  });
+  const h = await begin(f);
+  await until(f, (c) => c.includes('state paused: cannot read Drive/DCIM: permission denied'));
+  await env.sleep('10m'); // no timer: it waits for the user, not the 60 s source re-check
+  await new Promise((r) => setTimeout(r, 300));
+  expect(count(f, 'scanFolder f1')).toBe(1);
+  await h.signal('resume');
+  expect(await h.result()).toBe('done');
+  expect(count(f, 'scanFolder f1')).toBe(2);
+  expect(f.calls.slice(-2)).toEqual(['finishRun done', 'startNextQueued']);
+});

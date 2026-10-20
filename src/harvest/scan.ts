@@ -18,13 +18,18 @@ import { pathKey, sameMtime } from './paths.js';
 import { resolveMount } from './sources.js';
 
 export interface ScanFolderResult {
-  outcome: 'DONE' | 'SOURCE_GONE';
+  /**
+   * `UNREADABLE` (F-2): the folder's root, an ancestor or the source root cannot be read for a
+   * permission reason (EPERM/EACCES, typically no Full Disk Access): nothing was read, and the
+   * workflow pauses the run with `reason` until the user resumes.
+   */
+  outcome: 'DONE' | 'SOURCE_GONE' | 'UNREADABLE';
   dirs: number;
   photos: number;
   maybes: number;
   junk: Record<string, number>;
   errors: number;
-  /** For SOURCE_GONE: `<label> unplugged`, the run's pause reason. */
+  /** For SOURCE_GONE `<label> unplugged`, for UNREADABLE `cannot read <label>/<path>: …`. */
   reason?: string;
 }
 
@@ -34,6 +39,8 @@ const STAT_CONCURRENCY = 16;
 const GONE_CODES = new Set(['ENOENT', 'EIO', 'ENOTCONN', 'ENXIO', 'ETIMEDOUT']);
 
 const isGone = (e: unknown): boolean => GONE_CODES.has((e as NodeJS.ErrnoException).code ?? '');
+const DENIED_CODES = new Set(['EPERM', 'EACCES']);
+const isDenied = (e: unknown): boolean => DENIED_CODES.has((e as NodeJS.ErrnoException).code ?? '');
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 type FsPath = string | Buffer;
@@ -89,6 +96,34 @@ export const byName = (a: Entry, b: Entry): number =>
 function childPath(parent: FsPath, e: Entry): FsPath {
   if (typeof parent === 'string' && !e.raw) return join(parent, e.name);
   return Buffer.concat([Buffer.from(parent), Buffer.from('/'), e.raw ?? Buffer.from(e.name)]);
+}
+
+/** The filesystem calls resolveComponent makes (tests fake a normalization-sensitive share). */
+export interface ResolveIo {
+  lstat(path: FsPath): Promise<{ isDirectory(): boolean }>;
+  listDir(path: FsPath): Promise<Entry[]>;
+}
+
+/**
+ * The on-disk entry of a selected folder's component `name` (NFC) inside `parent`: the name
+ * itself when it opens as a directory, else (on a normalization-sensitive share, where the NFD
+ * name on disk does not open by its NFC spelling) the directory entry whose NFC form is `name`.
+ * Null when there is none. Errors other than ENOENT (permission, I/O) propagate.
+ */
+export async function resolveComponent(
+  parent: FsPath,
+  name: string,
+  io: ResolveIo,
+): Promise<Entry | null> {
+  const direct: Entry = { name, raw: null, isDir: true, isFile: false };
+  try {
+    return (await io.lstat(childPath(parent, direct))).isDirectory() ? direct : null;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+  return (
+    (await io.listDir(parent)).find((e) => e.isDir && e.name.normalize('NFC') === name) ?? null
+  );
 }
 
 /** The on-disk bytes of a source-relative path, or null when every component is NFC UTF-8. */
@@ -267,6 +302,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       errors: string | bigint;
     }>(
       `UPDATE harvest_run_folders SET state = 'scanning',
+         root_ok = CASE WHEN scan_cursor IS NULL THEN true ELSE root_ok END,
          dirs = CASE WHEN scan_cursor IS NULL THEN 0 ELSE dirs END,
          photos = CASE WHEN scan_cursor IS NULL THEN 0 ELSE photos END,
          maybes = CASE WHEN scan_cursor IS NULL THEN 0 ELSE maybes END,
@@ -302,7 +338,6 @@ export function makeScanFolder(deps: HarvestDeps) {
       deps.detectOpts,
     );
     if (mount === null) return result('SOURCE_GONE');
-    const rootAbs = folderComps.length ? join(mount, ...folderComps) : mount;
 
     // The mount root's device id at the start: a replacement directory left at the mount point
     // after an unplug has another one, so "exists" alone does not mean "still mounted".
@@ -317,35 +352,66 @@ export function makeScanFolder(deps: HarvestDeps) {
         () => false,
       );
 
-    /** Ends the folder without walking (pruned ancestor, missing folder): state done. */
-    const finishNow = async (): Promise<ScanFolderResult> => {
+    /**
+     * Ends the folder without walking: state done. `rootOk` false (a missing or unreadable
+     * root): nothing was read, so finishRun writes no folder history for it (F-2).
+     */
+    const finishNow = async (rootOk = true): Promise<ScanFolderResult> => {
       await pool.query(
         `UPDATE harvest_run_folders
-         SET state = 'done', scan_cursor = $3, errors = $4, junk = $5::jsonb
+         SET state = 'done', scan_cursor = $3, errors = $4, junk = $5::jsonb, root_ok = $6
          WHERE run_id = $1 AND folder_id = $2`,
-        [runId, folderId, folder.rel_path, total.errors, JSON.stringify(total.junk)],
+        [runId, folderId, folder.rel_path, total.errors, JSON.stringify(total.junk), rootOk],
       );
       return result('DONE');
     };
+    /** Nothing can be read (permission): the run pauses; the folder is not done (F-2). */
+    const unreadable = async (rel: string): Promise<ScanFolderResult> => {
+      await pool.query(
+        'UPDATE harvest_run_folders SET root_ok = false WHERE run_id = $1 AND folder_id = $2',
+        [runId, folderId],
+      );
+      const what = rel === '' ? folder.label : `${folder.label}/${rel}`;
+      log.warn(`harvest scan: cannot read ${what}: permission denied`);
+      return { ...result('UNREADABLE'), reason: `cannot read ${what}: permission denied` };
+    };
+    /** The folder (or an ancestor) is not there on a live drive: one error, done (T5-c). */
+    const notFound = (what: string, e?: unknown): Promise<ScanFolderResult> => {
+      if (cursor === null) total.errors++; // counted once, not again when a retry resumes
+      log.warn(`harvest scan: folder not found ${what}${e ? `: ${errText(e)}` : ''}`);
+      return finishNow(false);
+    };
 
-    // DirContext from the source root down to the folder's parent; visit derives the folder's
-    // own. An error here is counted once (not again when a retry resumes).
+    // Each component of the folder, resolved against the names on disk (an NFD name may not
+    // open by its NFC spelling), and the DirContext from the source root down to the folder's
+    // parent; visit derives the folder's own.
     let ctx: DirContext = ROOT_CONTEXT;
-    let dir = mount;
+    let rootAbs: FsPath = mount;
+    let rootRaw: Buffer | null = null;
+    const io: ResolveIo = { lstat: (p) => lstat(p), listDir };
     for (const [i, name] of folderComps.entries()) {
       if (!keepDir(ctx, name)) return finishNow();
-      if (i === folderComps.length - 1) break;
-      dir = join(dir, name);
-      let own: Entry[];
+      const parentRel = joinRel(folderComps.slice(0, i));
+      const rel = joinRel(folderComps.slice(0, i + 1));
+      let ent: Entry | null;
       try {
-        own = await listDir(dir);
+        ent = await resolveComponent(rootAbs, name, io);
       } catch (e) {
         if (isGone(e) && !(await mountAlive())) return result('SOURCE_GONE');
-        if (cursor === null) total.errors++;
-        log.warn(
-          `harvest scan: ${isGone(e) ? 'folder not found' : 'cannot read'} ${dir}: ${errText(e)}`,
-        );
-        return finishNow(); // nothing below an unreadable ancestor is reachable
+        if (isDenied(e)) return unreadable(parentRel);
+        return notFound(rel, e);
+      }
+      if (ent === null) return notFound(rel);
+      rootRaw = rawRelPath(parentRel, rootRaw, ent);
+      rootAbs = childPath(rootAbs, ent);
+      if (i === folderComps.length - 1) break;
+      let own: Entry[];
+      try {
+        own = await listDir(rootAbs);
+      } catch (e) {
+        if (isGone(e) && !(await mountAlive())) return result('SOURCE_GONE');
+        if (isDenied(e)) return unreadable(rel);
+        return notFound(rel, e); // nothing below an unreadable ancestor is reachable
       }
       ctx = childContext(ctx, name, own);
     }
@@ -359,22 +425,22 @@ export function makeScanFolder(deps: HarvestDeps) {
     const signal = Context.current().cancellationSignal;
 
     /** Lists, classifies and upserts one directory; returns its sorted, kept subdirectories. */
-    const visit = async (fr: Frame): Promise<Entry[] | 'gone'> => {
+    const visit = async (fr: Frame): Promise<Entry[] | 'gone' | 'unreadable'> => {
       // Already committed by a previous attempt: the cursor or an ancestor of it.
       const before = cursor !== null && isPrefix(fr.comps, cursor);
+      const isRoot = fr.comps.length === folderComps.length;
       let entries: Entry[];
       try {
         entries = await listDir(fr.abs);
       } catch (e) {
         if (isGone(e) && !(await mountAlive())) return 'gone';
+        // The folder's own root unreadable for a permission reason: nothing can be read.
+        if (isRoot && isDenied(e)) return 'unreadable';
         if (before) return [];
         total.errors++;
-        const what =
-          isGone(e) && fr.comps.length === folderComps.length
-            ? 'folder not found'
-            : 'cannot read directory';
+        const what = isGone(e) && isRoot ? 'folder not found' : 'cannot read directory';
         log.warn(`harvest scan: ${what} ${joinRel(fr.comps)}: ${errText(e)}`);
-        await commit(fr, []);
+        await commit(fr, [], isRoot ? false : undefined);
         return [];
       }
       const dirCtx = fr.ctx ?? childContext(fr.parentCtx!, fr.comps[fr.comps.length - 1]!, entries);
@@ -460,8 +526,8 @@ export function makeScanFolder(deps: HarvestDeps) {
       }
     };
 
-    /** One transaction: the directory's upserts plus counters and cursor. */
-    const commit = async (fr: Frame, cands: Candidate[]): Promise<void> => {
+    /** One transaction: the directory's upserts plus counters and cursor (and `rootOk`). */
+    const commit = async (fr: Frame, cands: Candidate[], rootOk?: boolean): Promise<void> => {
       const rel = joinRel(fr.comps);
       await withTx(pool, async (c) => {
         for (let i = 0; i < cands.length; i += BATCH) {
@@ -469,7 +535,8 @@ export function makeScanFolder(deps: HarvestDeps) {
         }
         await c.query(
           `UPDATE harvest_run_folders
-           SET dirs = $3, photos = $4, maybes = $5, junk = $6::jsonb, errors = $7, scan_cursor = $8
+           SET dirs = $3, photos = $4, maybes = $5, junk = $6::jsonb, errors = $7, scan_cursor = $8,
+               root_ok = COALESCE($9::boolean, root_ok)
            WHERE run_id = $1 AND folder_id = $2`,
           [
             runId,
@@ -480,6 +547,7 @@ export function makeScanFolder(deps: HarvestDeps) {
             JSON.stringify(total.junk),
             total.errors,
             rel,
+            rootOk ?? null,
           ],
         );
       });
@@ -490,7 +558,7 @@ export function makeScanFolder(deps: HarvestDeps) {
     try {
       const stack: Frame[] = [
         folderComps.length
-          ? { comps: folderComps, abs: rootAbs, raw: null, parentCtx: ctx }
+          ? { comps: folderComps, abs: rootAbs, raw: rootRaw, parentCtx: ctx }
           : { comps: folderComps, abs: rootAbs, raw: null, ctx },
       ];
       while (stack.length) {
@@ -498,6 +566,7 @@ export function makeScanFolder(deps: HarvestDeps) {
         const fr = stack.pop()!;
         const subs = await visit(fr);
         if (subs === 'gone') return result('SOURCE_GONE');
+        if (subs === 'unreadable') return await unreadable(folder.rel_path);
         for (let i = subs.length - 1; i >= 0; i--) {
           const e = subs[i]!;
           stack.push({

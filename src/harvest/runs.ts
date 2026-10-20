@@ -179,9 +179,11 @@ export async function setRunState(
 }
 
 /**
- * Ends a run (one transaction): its state, `finished_at` and error; for `done` (not a dry run)
- * also (unless a dry or send-only run) each folder's history — `last_harvested_at`, `last_run_id` and `last_counts` from the
- * run's counters. Returns false if the run had already finished (a retry changes nothing).
+ * Ends a run (one transaction): its state, `finished_at` and error; for `done` (unless a dry or
+ * send-only run) also each folder's history — `last_harvested_at`, `last_run_id` and
+ * `last_counts` from the run's counters — except for folders whose root the scan could not read
+ * (`root_ok` false: not found, unreadable; F-2). Returns false if the run had already finished
+ * (a retry changes nothing).
  */
 export async function finishRunRows(
   pool: pg.Pool,
@@ -209,7 +211,7 @@ export async function finishRunRows(
                'errors', rf.errors, 'sent', rf.sent, 'known', rf.known, 'dups', rf.dups,
                'bytes_sent', rf.bytes_sent)
          FROM harvest_run_folders rf
-         WHERE rf.run_id = $1 AND rf.folder_id = f.id`,
+         WHERE rf.run_id = $1 AND rf.folder_id = f.id AND rf.root_ok`,
         [runId],
       );
     }

@@ -3,6 +3,7 @@
 // LaunchAgents directory. `launchctl` is called through an injectable runner.
 import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -163,7 +164,20 @@ async function start(deps: CliDeps): Promise<number> {
   return 0;
 }
 
-async function status(pool: Pick<pg.Pool, 'query'>): Promise<number> {
+/**
+ * The node binary the agent runs (the first ProgramArguments entry of the installed plist), or
+ * this process's when none is installed: the one to grant Full Disk Access (README).
+ */
+async function agentNode(d: CliDeps): Promise<{ node: string; installed: boolean }> {
+  const agentsDir = d.agentsDir ?? join(homedir(), 'Library', 'LaunchAgents');
+  const xml = await readFile(join(agentsDir, `${LABEL}.plist`), 'utf8').catch(() => null);
+  const m = xml && /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/.exec(xml);
+  if (!m) return { node: d.node ?? process.execPath, installed: false };
+  const node = m[1]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return { node, installed: true };
+}
+
+async function status(pool: Pick<pg.Pool, 'query'>, d: CliDeps): Promise<number> {
   const run = await pool.query<{ id: string; state: string; paused_reason: string | null }>(
     `SELECT id::text, state, paused_reason FROM harvest_runs
      WHERE state IN ('scanning','sending','paused') ORDER BY id LIMIT 1`,
@@ -187,6 +201,8 @@ async function status(pool: Pick<pg.Pool, 'query'>): Promise<number> {
   );
   const age = hb.rows[0]?.age;
   out(age == null ? 'heartbeat: never' : `heartbeat: ${age} s ago`);
+  const a = await agentNode(d);
+  out(`node: ${a.node} (${a.installed ? 'grant it Full Disk Access' : 'not installed'})`);
   return 0;
 }
 
@@ -203,10 +219,10 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
       case 'start':
         return await start(deps);
       case 'status': {
-        if (deps.pool) return await status(deps.pool);
+        if (deps.pool) return await status(deps.pool, deps);
         const pool = createPool(loadHarvestSettings().databaseUrl, 2);
         try {
-          return await status(pool);
+          return await status(pool, deps);
         } finally {
           await pool.end();
         }
