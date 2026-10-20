@@ -58,7 +58,7 @@ function fake(
         if (id === 'disk5s1' || id === 'disk7s1')
           return Promise.resolve({ BusProtocol: 'Disk Image', VolumeName: 'Untapped' });
         const u = UUIDS[id];
-        return Promise.resolve(u ? { BusProtocol: 'USB', VolumeUUID: u } : null);
+        return Promise.resolve(u ? { BusProtocol: 'USB', VolumeUUID: u } : { BusProtocol: 'USB' });
       }),
     statfs: () => Promise.resolve({ blocks: 1n, bavail: 1n, bsize: 1n }),
   };
@@ -118,7 +118,11 @@ test('diskutil failure keeps the volume', async () => {
     NOPE,
   );
   expect(d.map((s) => s.labelBase)).toContain('Expansion');
-  expect(d.find((s) => s.labelBase === 'Expansion')!.identity).toBe('local-name:Expansion');
+  // A failed probe never mints a name-based identity.
+  expect(d.find((s) => s.labelBase === 'Expansion')).toMatchObject({
+    identity: '',
+    probeFailed: true,
+  });
   const n = await detectSources(
     fake(MOUNT, () => Promise.resolve(null)),
     NOPE,
@@ -149,13 +153,27 @@ test('DATA_DIR containment is also found by device+inode (real directories)', as
     const out = `/dev/disk20s1 on ${mp} (exfat, local)\n/dev/disk21s1 on ${other} (exfat, local)`;
     const dataDir = join(mp, 'data', 'sub');
     const names = async (d: string) =>
-      (await detectSources(fake(out), d, `${root}/`)).map((s) => s.labelBase);
+      (await detectSources(fake(out), d, { volumes: `${root}/` })).map((s) => s.labelBase);
     expect(await names(dataDir)).toEqual(['Other']);
     expect(await names(join(link, 'data'))).toEqual(['Other']);
     expect(await names(join(other, 'x'))).toEqual(['Vol']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a stale mount whose fs calls hang is skipped within the timeout', async () => {
+  const out =
+    '/dev/disk20s1 on /Volumes/Stale (exfat, local)\n/dev/disk21s1 on /Volumes/Fine (exfat, local)';
+  const hang = new Promise<never>(() => {});
+  const slow = {
+    realpath: (p: string) => (p.includes('Stale') ? hang : Promise.resolve(p)),
+    stat: () => Promise.reject(new Error('ENOENT')),
+  };
+  const t0 = Date.now();
+  const d = await detectSources(fake(out), NOPE, { fsTimeoutMs: 50, fs: slow });
+  expect(d.map((s) => s.labelBase)).toEqual(['Fine']);
+  expect(Date.now() - t0).toBeLessThan(2000);
 });
 
 let pgh: PgHandle;
@@ -236,4 +254,39 @@ test('resolveMount returns the current mount path via identity, or null', async 
   expect(await resolveMount(pgh.pool, fake(), id, NOPE)).toBe('/Volumes/Plex-1');
   expect(await resolveMount(pgh.pool, fake(''), id, NOPE)).toBeNull();
   expect(await resolveMount(pgh.pool, fake(), '999', NOPE)).toBeNull();
+});
+
+test('probe failure on a known volume reuses its row; unknown volume is skipped; no UUID gives local-name', async () => {
+  const uuidOut = '/dev/disk8s2 on /Volumes/Expansion (exfat, local)';
+  const good = fake(uuidOut, () => Promise.resolve({ VolumeUUID: 'U-1', VolumeName: 'Expansion' }));
+  const a = await registerSources(pgh.pool, await detectSources(good, NOPE));
+  expect(a[0]!.identity).toBe('local:U-1');
+
+  const bad = fake(uuidOut, () => Promise.resolve(null));
+  const detected = await detectSources(bad, NOPE);
+  expect(detected[0]).toMatchObject({ probeFailed: true, identity: '' });
+  const b = await registerSources(pgh.pool, detected);
+  expect(b).toHaveLength(1);
+  expect(b[0]).toMatchObject({
+    id: a[0]!.id,
+    label: 'Expansion',
+    identity: 'local:U-1',
+    mounted: true,
+  });
+  expect(await resolveMount(pgh.pool, bad, a[0]!.id, NOPE)).toBe('/Volumes/Expansion');
+
+  const unknown = fake('/dev/disk9s1 on /Volumes/Other (exfat, local)', () =>
+    Promise.resolve(null),
+  );
+  const c = await registerSources(pgh.pool, await detectSources(unknown, NOPE));
+  expect(c).toHaveLength(1);
+  expect(c[0]!.mounted).toBe(false);
+  expect(c.map((r) => r.label)).toEqual(['Expansion']);
+
+  const noUuid = fake('/dev/disk9s1 on /Volumes/Plain (msdos, local)', () =>
+    Promise.resolve({ BusProtocol: 'USB', VolumeName: 'Plain' }),
+  );
+  const d = await detectSources(noUuid, NOPE);
+  expect(d[0]).toMatchObject({ identity: 'local-name:Plain' });
+  expect(d[0]!.probeFailed).toBeUndefined();
 });

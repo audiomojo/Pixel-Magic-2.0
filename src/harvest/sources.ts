@@ -1,4 +1,4 @@
-import { realpath, stat } from 'node:fs/promises';
+import * as fsp from 'node:fs/promises';
 import { basename, dirname, resolve, sep } from 'node:path';
 import type pg from 'pg';
 
@@ -43,6 +43,8 @@ export interface DetectedSource {
   labelBase: string;
   kind: 'network' | 'local';
   mountPath: string;
+  /** diskutil failed for this local volume: `identity` is '' and registerSources resolves it by mount path. */
+  probeFailed?: boolean;
 }
 
 const NETWORK_FS = new Set(['smbfs', 'afpfs', 'nfs', 'webdav']);
@@ -76,18 +78,41 @@ function parseShare(device: string): { server: string; share: string } | null {
   return { server, share };
 }
 
+export interface FsProbe {
+  realpath(path: string): Promise<string>;
+  stat(path: string, opts: { bigint: true }): Promise<{ dev: bigint; ino: bigint }>;
+}
+
+export interface DetectOptions {
+  /** Mount prefix; tests point it at tmp dirs. */
+  volumes?: string;
+  /** Bound on the fs calls made against one mount root (a stale SMB mount can hang them). */
+  fsTimeoutMs?: number;
+  fs?: FsProbe;
+}
+
+class FsTimeout extends Error {}
+
+function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new FsTimeout()), ms);
+  });
+  return Promise.race([work, limit]).finally(() => clearTimeout(timer));
+}
+
 /** True when `dataDir` lies inside the volume mounted at `root` (device+inode, then casefolded path). */
-async function containsDataDir(root: string, dataDir: string): Promise<boolean> {
-  const rootReal = await realpath(root).catch(() => root);
-  const dataReal = await realpath(dataDir).catch(() => resolve(dataDir));
+async function containsDataDir(root: string, dataDir: string, fs: FsProbe): Promise<boolean> {
+  const rootReal = await fs.realpath(root).catch(() => root);
+  const dataReal = await fs.realpath(dataDir).catch(() => resolve(dataDir));
   const rk = rootReal.toLowerCase();
   const dk = dataReal.toLowerCase();
   if (dk === rk || dk.startsWith(rk.endsWith(sep) ? rk : rk + sep)) return true;
-  const rs = await stat(root, { bigint: true }).catch(() => null);
+  const rs = await fs.stat(root, { bigint: true }).catch(() => null);
   if (!rs) return false;
   let cur = dataReal;
   for (;;) {
-    const s = await stat(cur, { bigint: true }).catch(() => null);
+    const s = await fs.stat(cur, { bigint: true }).catch(() => null);
     if (s && s.dev === rs.dev && s.ino === rs.ino) return true;
     const parent = dirname(cur);
     if (parent === cur) return false;
@@ -99,8 +124,11 @@ async function containsDataDir(root: string, dataDir: string): Promise<boolean> 
 export async function detectSources(
   sys: SystemProbe,
   dataDir: string,
-  volumes = '/Volumes/',
+  opts: DetectOptions = {},
 ): Promise<DetectedSource[]> {
+  const volumes = opts.volumes ?? '/Volumes/';
+  const fsTimeoutMs = opts.fsTimeoutMs ?? 5000;
+  const fs: FsProbe = opts.fs ?? fsp;
   const found: DetectedSource[] = [];
   for (const m of parseMount(await sys.mountOutput())) {
     if (!m.mountPoint.startsWith(volumes)) continue;
@@ -126,19 +154,36 @@ export async function detectSources(
         continue;
       const info = await sys.diskutilInfo(m.device).catch(() => null);
       if (info?.['BusProtocol'] === 'Disk Image') continue;
-      const name = basename(m.mountPoint);
-      const uuid = info?.['VolumeUUID'];
-      const vname =
-        typeof info?.['VolumeName'] === 'string' && info['VolumeName'] ? info['VolumeName'] : name;
-      src = {
-        identity: typeof uuid === 'string' && uuid ? `local:${uuid}` : `local-name:${vname}`,
-        labelBase: vname,
-        kind: 'local',
-        mountPath: m.mountPoint,
-      };
+      if (!info) {
+        // Never mint a name-based identity from a failed probe: it would fork a UUID drive's history.
+        src = {
+          identity: '',
+          labelBase: basename(m.mountPoint),
+          kind: 'local',
+          mountPath: m.mountPoint,
+          probeFailed: true,
+        };
+      } else {
+        const name = basename(m.mountPoint);
+        const uuid = info['VolumeUUID'];
+        const vname =
+          typeof info['VolumeName'] === 'string' && info['VolumeName'] ? info['VolumeName'] : name;
+        src = {
+          identity: typeof uuid === 'string' && uuid ? `local:${uuid}` : `local-name:${vname}`,
+          labelBase: vname,
+          kind: 'local',
+          mountPath: m.mountPoint,
+        };
+      }
     }
     if (isReservedLabel(src.labelBase)) continue;
-    if (await containsDataDir(m.mountPoint, dataDir)) continue;
+    try {
+      if (await bounded(containsDataDir(m.mountPoint, dataDir, fs), fsTimeoutMs)) continue;
+    } catch (e) {
+      if (!(e instanceof FsTimeout)) throw e;
+      console.warn(`harvest: ${m.mountPoint} did not answer within ${fsTimeoutMs} ms, skipped`);
+      continue;
+    }
     found.push(src);
   }
   return found;
@@ -169,13 +214,29 @@ export async function registerSources(
   detected: DetectedSource[],
 ): Promise<SourceRow[]> {
   for (const d of detected) {
-    if (isReservedLabel(d.labelBase)) throw new Error(`reserved source label: ${d.labelBase}`);
+    if (!d.probeFailed && isReservedLabel(d.labelBase))
+      throw new Error(`reserved source label: ${d.labelBase}`);
   }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query("SELECT pg_advisory_xact_lock(hashtext('harvest_sources'))");
-    for (const d of detected) {
+    const resolved: DetectedSource[] = [];
+    for (const d0 of detected) {
+      let d = d0;
+      if (d0.probeFailed) {
+        // The probe failed: keep the identity of the local row last seen at this mount point.
+        const known = await client.query<{ identity: string }>(
+          "SELECT identity FROM harvest_sources WHERE kind = 'local' AND last_mount_path = $1",
+          [d0.mountPath],
+        );
+        if (known.rows.length !== 1) {
+          console.warn(`harvest: diskutil failed for unknown volume ${d0.mountPath}, skipped`);
+          continue;
+        }
+        d = { ...d0, identity: known.rows[0]!.identity };
+      }
+      resolved.push(d);
       const upd = await client.query(
         `UPDATE harvest_sources SET last_mount_path = $2, last_seen_at = clock_timestamp()
          WHERE identity = $1`,
@@ -200,7 +261,7 @@ export async function registerSources(
        FROM harvest_sources ORDER BY id`,
     );
     await client.query('COMMIT');
-    const now = new Set(detected.map((d) => d.identity));
+    const now = new Set(resolved.map((d) => d.identity));
     return rows.map((r) => ({
       id: r.id,
       identity: r.identity,
@@ -224,13 +285,16 @@ export async function resolveMount(
   sys: SystemProbe,
   sourceId: string,
   dataDir: string,
+  detectOpts: DetectOptions = {},
 ): Promise<string | null> {
-  const { rows } = await pool.query<{ identity: string }>(
-    'SELECT identity FROM harvest_sources WHERE id = $1',
+  const { rows } = await pool.query<{ identity: string; last_mount_path: string | null }>(
+    'SELECT identity, last_mount_path FROM harvest_sources WHERE id = $1',
     [sourceId],
   );
-  const identity = rows[0]?.identity;
-  if (!identity) return null;
-  const hit = (await detectSources(sys, dataDir)).find((d) => d.identity === identity);
+  const row = rows[0];
+  if (!row) return null;
+  const hit = (await detectSources(sys, dataDir, detectOpts)).find((d) =>
+    d.probeFailed ? d.mountPath === row.last_mount_path : d.identity === row.identity,
+  );
   return hit?.mountPath ?? null;
 }
