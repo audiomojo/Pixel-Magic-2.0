@@ -153,7 +153,6 @@ async function main(): Promise<void> {
       pool,
       settings,
       sys: realSystem,
-      layout,
       control,
       staticDir: here('../../src/harvest/ui'),
       temporalHealthy,
@@ -179,6 +178,7 @@ async function main(): Promise<void> {
     await heartbeat().catch((err: unknown) => logger.warn({ err }, 'harvest: heartbeat failed'));
     timers.push(every(30_000, 'heartbeat', heartbeat));
     timers.push(every(60_000, 'linkFiles', () => linkFiles(pool)));
+    const logFile = join(settings.dataDir, 'logs', 'harvester.log');
     timers.push(
       every(60_000, 'log rotation', async () => {
         if (logDestination && (await rotateIfLarge(logFile, LOG_MAX_BYTES, LOG_KEEP))) {
@@ -187,7 +187,6 @@ async function main(): Promise<void> {
       }),
     );
 
-    const logFile = join(settings.dataDir, 'logs', 'harvester.log');
     logger.info(
       { dataDir: settings.dataDir, port: settings.uiPort, queue: HARVEST_TASK_QUEUE },
       'harvester started',

@@ -12,6 +12,7 @@ import { createPool } from '../db.js';
 import { loadHarvestSettings } from './config.js';
 import { LABEL, renderPlist } from './launchd.js';
 import { GuardedFs } from './paths.js';
+import { ACTIVE_STATES_SQL } from './runs.js';
 import {
   defaultRuntimeDir,
   installRuntime,
@@ -21,7 +22,7 @@ import {
   type RuntimeCheck,
 } from './runtime.js';
 
-export const LAUNCHCTL = '/bin/launchctl';
+const LAUNCHCTL = '/bin/launchctl';
 
 export type LaunchctlRunner = (args: string[]) => Promise<{ code: number; stderr: string }>;
 
@@ -77,6 +78,10 @@ const fail = (line: string) => process.stderr.write(line + '\n');
 const notLoaded = (r: { code: number; stderr: string }) =>
   r.code === 3 || r.code === 113 || /no such process|could not find|not loaded/i.test(r.stderr);
 
+const defaultAgentsDir = () => join(homedir(), 'Library', 'LaunchAgents');
+const plistPath = (agentsDir: string) => join(agentsDir, `${LABEL}.plist`);
+const domain = (uid: number) => `gui/${String(uid)}`;
+
 /** src/harvest or dist/harvest: two levels up is the repository root. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -84,7 +89,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export function withDefaults(d: CliDeps): Required<Omit<CliDeps, 'pool'>> {
   return {
     launchctl: d.launchctl ?? makeLaunchctl(),
-    agentsDir: d.agentsDir ?? join(homedir(), 'Library', 'LaunchAgents'),
+    agentsDir: d.agentsDir ?? defaultAgentsDir(),
     uid: d.uid ?? process.getuid!(),
     node: d.node ?? process.execPath,
     runtimeDir: d.runtimeDir ?? defaultRuntimeDir(),
@@ -100,31 +105,36 @@ const BOOTSTRAP_DELAY_MS = 1000;
 
 /**
  * `launchctl bootstrap`, retried on "Input/output error" (exit 5: a bootout may still be tearing
- * down). "Already loaded" counts as success. Returns an error message, or null when loaded.
+ * down). "Already loaded" counts as success. Returns whether the agent is loaded (prints why not).
  */
-async function bootstrap(
-  d: ReturnType<typeof withDefaults>,
-  target: string,
-): Promise<string | null> {
+async function bootstrap(d: ReturnType<typeof withDefaults>, target: string): Promise<boolean> {
   let r = { code: 0, stderr: '' };
   for (let i = 0; i < BOOTSTRAP_TRIES; i++) {
     if (i > 0) await d.sleep(BOOTSTRAP_DELAY_MS);
-    r = await d.launchctl(['bootstrap', `gui/${String(d.uid)}`, target]);
-    if (r.code === 0 || /already (loaded|bootstrapped)/i.test(r.stderr)) return null;
+    r = await d.launchctl(['bootstrap', domain(d.uid), target]);
+    if (r.code === 0 || /already (loaded|bootstrapped)/i.test(r.stderr)) return true;
     if (r.code !== 5 && !/input\/output error/i.test(r.stderr)) break;
   }
-  return r.stderr.trim();
+  fail(`launchctl bootstrap failed: ${r.stderr.trim()}`);
+  return false;
+}
+
+/** `launchctl bootout`; an agent that was not loaded counts as success. Prints a failure. */
+async function bootout(d: ReturnType<typeof withDefaults>): Promise<boolean> {
+  const r = await d.launchctl(['bootout', `${domain(d.uid)}/${LABEL}`]);
+  if (r.code === 0 || notLoaded(r)) return true;
+  fail(`launchctl bootout failed: ${r.stderr.trim()}`);
+  return false;
 }
 
 async function install(deps: CliDeps): Promise<number> {
   const d = withDefaults(deps);
   const { launchctl, agentsDir: dir, uid, repo, logDir } = d;
-  const target = join(dir, `${LABEL}.plist`);
-  const domain = `gui/${String(uid)}`;
+  const target = plistPath(dir);
 
   await new GuardedFs([logDir]).mkdirp(logDir);
   // Unload first, so the old process is gone before its runtime is replaced.
-  await launchctl(['bootout', `${domain}/${LABEL}`]);
+  await launchctl(['bootout', `${domain(uid)}/${LABEL}`]);
   const runtime = await installRuntime(d.node, d.runtimeDir, d.checkRuntime);
   const node = runtime.path;
   const agents = new GuardedFs([dir]);
@@ -141,11 +151,7 @@ async function install(deps: CliDeps): Promise<number> {
   }
 
   // Idempotent: the bootout above unloaded whatever was loaded (failure = nothing was).
-  const err = await bootstrap(d, target);
-  if (err !== null) {
-    fail(`launchctl bootstrap failed: ${err}`);
-    return 1;
-  }
+  if (!(await bootstrap(d, target))) return 1;
   out(`installed ${target}; the harvester starts now and at every login`);
   out(
     `runtime: ${node}${runtime.changed ? ' (new or updated: grant it drive access, see README)' : ' (unchanged)'}`,
@@ -154,15 +160,11 @@ async function install(deps: CliDeps): Promise<number> {
 }
 
 async function uninstall(deps: CliDeps): Promise<number> {
-  const { launchctl, agentsDir: dir, uid, runtimeDir } = withDefaults(deps);
-  const r = await launchctl(['bootout', `gui/${String(uid)}/${LABEL}`]);
-  if (r.code !== 0 && !notLoaded(r)) {
-    fail(`launchctl bootout failed: ${r.stderr.trim()}`);
-    return 1;
-  }
-  await removeRuntime(runtimeDir);
-  await new GuardedFs([dir])
-    .unlink(join(dir, `${LABEL}.plist`))
+  const d = withDefaults(deps);
+  if (!(await bootout(d))) return 1;
+  await removeRuntime(d.runtimeDir);
+  await new GuardedFs([d.agentsDir])
+    .unlink(plistPath(d.agentsDir))
     .catch((e: NodeJS.ErrnoException) => {
       if (e.code !== 'ENOENT') throw e;
     });
@@ -172,12 +174,7 @@ async function uninstall(deps: CliDeps): Promise<number> {
 
 /** Unloads the agent but keeps the plist (so `start` can load it again). */
 async function stop(deps: CliDeps): Promise<number> {
-  const { launchctl, uid } = withDefaults(deps);
-  const r = await launchctl(['bootout', `gui/${String(uid)}/${LABEL}`]);
-  if (r.code !== 0 && !notLoaded(r)) {
-    fail(`launchctl bootout failed: ${r.stderr.trim()}`);
-    return 1;
-  }
+  if (!(await bootout(withDefaults(deps)))) return 1;
   out('stopped the harvester agent (start it again with make harvest-start)');
   return 0;
 }
@@ -185,16 +182,12 @@ async function stop(deps: CliDeps): Promise<number> {
 /** Loads the plist that `install` wrote. */
 async function start(deps: CliDeps): Promise<number> {
   const d = withDefaults(deps);
-  const target = join(d.agentsDir, `${LABEL}.plist`);
+  const target = plistPath(d.agentsDir);
   if (!(await new GuardedFs([d.agentsDir]).exists(target))) {
     fail('not installed: run make harvest-install first');
     return 1;
   }
-  const err = await bootstrap(d, target);
-  if (err !== null) {
-    fail(`launchctl bootstrap failed: ${err}`);
-    return 1;
-  }
+  if (!(await bootstrap(d, target))) return 1;
   out('started the harvester agent');
   return 0;
 }
@@ -203,11 +196,13 @@ async function start(deps: CliDeps): Promise<number> {
  * The binary the agent runs (the first ProgramArguments entry of the installed plist), or this
  * process's when none is installed: the one to grant drive access (README).
  */
-async function agentNode(d: CliDeps): Promise<{ node: string; installed: boolean }> {
-  const agentsDir = d.agentsDir ?? join(homedir(), 'Library', 'LaunchAgents');
-  const xml = await readFile(join(agentsDir, `${LABEL}.plist`), 'utf8').catch(() => null);
+async function agentNode(
+  agentsDir: string,
+  thisNode: string,
+): Promise<{ node: string; installed: boolean }> {
+  const xml = await readFile(plistPath(agentsDir), 'utf8').catch(() => null);
   const m = xml && /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/.exec(xml);
-  if (!m) return { node: d.node ?? process.execPath, installed: false };
+  if (!m) return { node: thisNode, installed: false };
   const node = m[1]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   return { node, installed: true };
 }
@@ -215,7 +210,7 @@ async function agentNode(d: CliDeps): Promise<{ node: string; installed: boolean
 async function status(pool: Pick<pg.Pool, 'query'>, d: CliDeps): Promise<number> {
   const run = await pool.query<{ id: string; state: string; paused_reason: string | null }>(
     `SELECT id::text, state, paused_reason FROM harvest_runs
-     WHERE state IN ('scanning','sending','paused') ORDER BY id LIMIT 1`,
+     WHERE state IN ${ACTIVE_STATES_SQL} ORDER BY id LIMIT 1`,
   );
   const r = run.rows[0];
   if (r) {
@@ -236,7 +231,9 @@ async function status(pool: Pick<pg.Pool, 'query'>, d: CliDeps): Promise<number>
   );
   const age = hb.rows[0]?.age;
   out(age == null ? 'heartbeat: never' : `heartbeat: ${age} s ago`);
-  const a = await agentNode(d);
+  // Not withDefaults: that would load the harvest settings and need a uid.
+  const thisNode = d.node ?? process.execPath;
+  const a = await agentNode(d.agentsDir ?? defaultAgentsDir(), thisNode);
   if (!a.installed) {
     out(`node: ${a.node} (not installed)`);
     return 0;
@@ -245,10 +242,7 @@ async function status(pool: Pick<pg.Pool, 'query'>, d: CliDeps): Promise<number>
     `node: ${a.node} (grant it Removable Volumes and Network Volumes access, not Full Disk Access)`,
   );
   const dir = d.runtimeDir ?? defaultRuntimeDir();
-  if (
-    a.node === join(dir, RUNTIME_NAME) &&
-    !(await runtimeMatches(d.node ?? process.execPath, dir))
-  )
+  if (a.node === join(dir, RUNTIME_NAME) && !(await runtimeMatches(thisNode, dir)))
     out('runtime: out of date with this Node; run make harvest-install (then grant access again)');
   return 0;
 }

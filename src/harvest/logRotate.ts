@@ -7,14 +7,14 @@ import { GuardedFs } from './paths.js';
 /**
  * If `path` is larger than `maxBytes`, shifts `path.1` … `path.<keep-1>` up by one (dropping
  * `path.<keep>`) and renames `path` to `path.1`. Returns whether it rotated. The caller reopens
- * its destination afterwards. `fs` defaults to a guard on the log's own directory.
+ * its destination afterwards.
  */
 export async function rotateIfLarge(
   path: string,
   maxBytes: number,
   keep: number,
-  fs: GuardedFs = new GuardedFs([dirname(path)]),
 ): Promise<boolean> {
+  const fs = new GuardedFs([dirname(path)]);
   const size = await stat(path).then(
     (s) => s.size,
     () => 0,

@@ -7,13 +7,18 @@ import type { AddressInfo } from 'node:net';
 import { extname, join, sep } from 'node:path';
 import type pg from 'pg';
 import { z } from 'zod';
-import type { DataLayout } from '../fsops.js';
 import { logger } from '../logger.js';
 import type { RunControl } from './activities.js';
-import { childContext, keepDir, ROOT_CONTEXT } from './classify.js';
+import { childContext, keepDir, ROOT_CONTEXT, type DirContext } from './classify.js';
 import type { HarvestSettings } from './config.js';
 import { GuardedFs, sourcePath } from './paths.js';
-import { addRunItems, createRun, finishRunRows, startNextQueued } from './runs.js';
+import {
+  ACTIVE_STATES_SQL,
+  addRunItems,
+  createRun,
+  finishRunRows,
+  startNextQueued,
+} from './runs.js';
 import {
   detectSources,
   registerDetected,
@@ -28,13 +33,12 @@ export interface HarvestServerDeps {
   pool: pg.Pool;
   settings: HarvestSettings;
   sys: SystemProbe;
-  layout: DataLayout;
   control: RunControl;
   /** Directory of the static page (`src/harvest/ui`). */
   staticDir: string;
   /** A lightweight Temporal call succeeded (the host passes a real one; tests fake it). */
   temporalHealthy: () => Promise<boolean>;
-  /** Passed to detectSources / resolveMount; tests point `volumes` at a temp directory. */
+  /** Passed to detectSources; tests point `volumes` at a temp directory. */
   detectOpts?: DetectOptions;
   /** How long a drive detection is reused by GET /api/state (default 10 s). */
   sourcesTtlMs?: number;
@@ -47,10 +51,15 @@ export interface HarvestServerDeps {
 }
 
 const BODY_LIMIT = 1024 * 1024;
-const ACTIVE_STATES = "('scanning', 'sending', 'paused')";
+/** A database id in a path or body. */
+const ID_RE = /^\d{1,15}$/;
+
+const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+const isMissing = (e: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes(errCode(e) ?? '');
+const isDenied = (e: unknown): boolean => ['EPERM', 'EACCES'].includes(errCode(e) ?? '');
 
 /** What the page shows when macOS refuses a listing (README: granting drive access). */
-export const PERMISSION_HINT =
+const PERMISSION_HINT =
   'macOS does not let the harvester read this drive (permission denied). In System Settings → ' +
   'Privacy & Security → Files & Folders, turn on Removable Volumes (or Network Volumes) for ' +
   'pixel-magic-harvester, then run make harvest-stop and make harvest-start.';
@@ -77,7 +86,7 @@ const MIME: Record<string, string> = {
 };
 
 /** A folder path inside a source: NFC, no leading '/', no '..', no NUL; '' is the whole source. */
-export function normaliseRelPath(raw: string): string {
+function normaliseRelPath(raw: string): string {
   const rel = raw.normalize('NFC');
   if (rel.startsWith('/') || rel.includes('\0')) throw new HttpError(400, `invalid path: ${raw}`);
   const parts: string[] = [];
@@ -97,9 +106,7 @@ const relPathSchema = z.string().transform((s, ctx) => {
     return z.NEVER;
   }
 });
-const idSchema = z
-  .union([z.string().regex(/^\d{1,15}$/), z.number().int().min(0)])
-  .transform(String);
+const idSchema = z.union([z.string().regex(ID_RE), z.number().int().min(0)]).transform(String);
 
 const runsBody = z.object({
   folders: z.array(z.object({ sourceId: idSchema, relPath: relPathSchema })).min(1),
@@ -115,7 +122,8 @@ const reviewBody = z.union([
 
 const parentDir = (rel: string): string =>
   rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
-const PARENT_SQL = "regexp_replace(rel_path, '/?[^/]*$', '')";
+/** SQL for the parent folder of a rel_path column. */
+const parentSql = (col: string): string => `regexp_replace(${col}, '/?[^/]*$', '')`;
 
 type Json = Record<string, unknown>;
 
@@ -339,7 +347,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     }
     const found = await detect();
     const sources = await sourceViews(found.rows);
-    const [activeRun] = await runViews(`state IN ${ACTIVE_STATES}`, [], 'ORDER BY id LIMIT 1');
+    const [activeRun] = await runViews(`state IN ${ACTIVE_STATES_SQL}`, [], 'ORDER BY id LIMIT 1');
     const queue = await runViews("state = 'queued'", [], 'ORDER BY id');
     const review = await pool.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM harvest_items WHERE state = 'REVIEW'",
@@ -356,7 +364,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   }
 
   async function requireRun(id: string): Promise<{ id: string; state: string }> {
-    const { rows } = /^\d{1,15}$/.test(id)
+    const { rows } = ID_RE.test(id)
       ? await pool.query<{ id: string; state: string }>(
           'SELECT id::text AS id, state FROM harvest_runs WHERE id = $1',
           [id],
@@ -366,9 +374,9 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     return rows[0];
   }
 
-  const viaTemporal = async (what: string, work: () => Promise<unknown>): Promise<void> => {
+  const viaTemporal = async <T>(what: string, work: () => Promise<T>): Promise<T> => {
     try {
-      await work();
+      return await work();
     } catch (e) {
       throw new HttpError(502, `${what} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -376,11 +384,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
 
   async function postRuns(body: unknown): Promise<Json> {
     const b = parse(runsBody, body);
-    const seen = new Set<string>();
-    const folders = b.folders.filter((f) => {
-      const k = `${f.sourceId}\0${f.relPath}`;
-      return seen.has(k) ? false : (seen.add(k), true);
-    });
+    const folders = [...new Map(b.folders.map((f) => [`${f.sourceId}\0${f.relPath}`, f])).values()];
     const ids = [...new Set(folders.map((f) => f.sourceId))];
     const known = await pool.query('SELECT 1 FROM harvest_sources WHERE id = ANY($1::bigint[])', [
       ids,
@@ -414,11 +418,8 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         await finishRunRows(pool, id, 'cancelled');
         await control.cancel(id).catch(() => {});
       } else {
-        const outcome: { v?: 'requested' | 'gone' } = {};
-        await viaTemporal('cancel', async () => {
-          outcome.v = await control.cancel(id);
-        });
-        if (outcome.v === 'gone') {
+        const outcome = await viaTemporal('cancel', () => control.cancel(id));
+        if (outcome === 'gone') {
           // No workflow left to finish the row (it ended without doing so): finish it here, so
           // the queue is not stuck behind it.
           await finishRunRows(pool, id, 'cancelled');
@@ -445,7 +446,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
 
   /** The source's current mount from the TTL-cached detection (no per-request mount/diskutil). */
   async function mountOf(sourceId: string): Promise<string | null> {
-    if (!/^\d{1,15}$/.test(sourceId)) throw new HttpError(404, `no such source: ${sourceId}`);
+    if (!ID_RE.test(sourceId)) throw new HttpError(404, `no such source: ${sourceId}`);
     let row = (await getSources()).find((r) => r.id === sourceId);
     row ??= (await getSources(true)).find((r) => r.id === sourceId);
     if (!row) throw new HttpError(404, `no such source: ${sourceId}`);
@@ -455,9 +456,10 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   /**
    * Walks `rel` below `mount`: every component must be kept by the pruning rules (a hidden or
    * pruned ancestor like .Trashes is refused) and must not be a symlink (it could lead out of
-   * the source). Returns the final directory context, or 'missing' if a component does not exist.
+   * the source). Returns the folder's directory context, or 'missing' if a component does not
+   * exist.
    */
-  async function checkFolder(mount: string | null, rel: string): Promise<'ok' | 'missing'> {
+  async function checkFolder(mount: string | null, rel: string): Promise<DirContext | 'missing'> {
     let ctx = ROOT_CONTEXT;
     let cur = mount;
     for (const part of rel === '' ? [] : rel.split('/')) {
@@ -466,15 +468,15 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       if (cur === null) continue;
       cur = join(cur, part);
       const st = await timeout(lstat(cur), treeTimeoutMs, 'checking the folder').catch(
-        (e: NodeJS.ErrnoException) => {
-          if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null;
+        (e: unknown) => {
+          if (isMissing(e)) return null;
           throw e;
         },
       );
       if (st === null) return 'missing';
       if (st.isSymbolicLink()) throw new HttpError(404, `no such folder: ${rel}`);
     }
-    return 'ok';
+    return ctx;
   }
 
   // ---- tree ---------------------------------------------------------------------------
@@ -482,19 +484,14 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     const path = normaliseRelPath(rawPath);
     const mount = await mountOf(sourceId);
     if (mount === null) throw new HttpError(409, 'source is not mounted');
-    if ((await checkFolder(mount, path)) === 'missing') {
-      throw new HttpError(404, `no such folder: ${path}`);
-    }
-    let ctx = ROOT_CONTEXT;
-    for (const part of path === '' ? [] : path.split('/')) ctx = childContext(ctx, part, []);
+    const ctx = await checkFolder(mount, path);
+    if (ctx === 'missing') throw new HttpError(404, `no such folder: ${path}`);
     let entries;
     try {
       entries = await timeout(listDir(join(mount, path)), treeTimeoutMs, 'listing the folder');
     } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'ENOTDIR')
-        throw new HttpError(404, `no such folder: ${path}`);
-      if (code === 'EPERM' || code === 'EACCES') throw new HttpError(403, PERMISSION_HINT);
+      if (isMissing(e)) throw new HttpError(404, `no such folder: ${path}`);
+      if (isDenied(e)) throw new HttpError(403, PERMISSION_HINT);
       throw e;
     }
     const names = entries
@@ -506,15 +503,8 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         return x < y ? -1 : x > y ? 1 : a < b ? -1 : a > b ? 1 : 0;
       });
     const child = (n: string): string => (path === '' ? n : `${path}/${n}`);
-    const ancestors: string[] = [''];
-    path
-      .split('/')
-      .filter(Boolean)
-      .reduce((acc, p) => {
-        const next = acc === '' ? p : `${acc}/${p}`;
-        ancestors.push(next);
-        return next;
-      }, '');
+    const parts = path === '' ? [] : path.split('/');
+    const ancestors = ['', ...parts.map((_, i) => parts.slice(0, i + 1).join('/'))];
     const hist = await pool.query<{ rel_path: string; at: Date | null; counts: unknown }>(
       `SELECT rel_path, last_harvested_at AS at, last_counts AS counts FROM harvest_folders
        WHERE source_id = $1 AND rel_path = ANY($2::text[])`,
@@ -550,7 +540,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
         n: string;
         bytes: string;
       }>(
-        `SELECT i.source_id::text AS source_id, s.label, ${PARENT_SQL.replace('rel_path', 'i.rel_path')} AS path,
+        `SELECT i.source_id::text AS source_id, s.label, ${parentSql('i.rel_path')} AS path,
                 count(*)::text AS n, sum(i.size_bytes)::text AS bytes
          FROM harvest_items i JOIN harvest_sources s ON s.id = i.source_id
          WHERE i.state = 'REVIEW' GROUP BY 1, 2, 3 ORDER BY s.label, 3`,
@@ -574,7 +564,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       mtime_ns: string;
     }>(
       `SELECT id::text AS id, rel_path, size_bytes::text, mtime_ns::text FROM harvest_items
-       WHERE state = 'REVIEW' AND source_id = $1 AND ${PARENT_SQL} = $2 ORDER BY rel_path, id`,
+       WHERE state = 'REVIEW' AND source_id = $1 AND ${parentSql('rel_path')} = $2 ORDER BY rel_path, id`,
       [sourceId, path],
     );
     const label =
@@ -612,8 +602,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       await timeout(listDir(mount), treeTimeoutMs, 'listing the drive');
       return null;
     } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
-      if (code !== 'EPERM' && code !== 'EACCES') return null;
+      if (!isDenied(e)) return null;
       return { tile: `can't read ${label}: permission denied`, detail: PERMISSION_HINT };
     }
   }
@@ -627,10 +616,10 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     const { rows } =
       'itemIds' in b
         ? await pool.query<Approved>(`${sql} AND id = ANY($1::bigint[]) ${ret}`, [b.itemIds])
-        : await pool.query<Approved>(`${sql} AND source_id = $1 AND ${PARENT_SQL} = $2 ${ret}`, [
-            b.sourceId,
-            b.path,
-          ]);
+        : await pool.query<Approved>(
+            `${sql} AND source_id = $1 AND ${parentSql('rel_path')} = $2 ${ret}`,
+            [b.sourceId, b.path],
+          );
     if (b.action === 'skip' || rows.length === 0) return { changed: rows.length };
     const ids = rows.map((r) => r.id);
     // Approved. A live (not dry) run whose folders cover every approved item sends them when
@@ -638,7 +627,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     // send-only run over the items' folders (no scan) is queued with exactly these items.
     const active = await pool.query<{ id: string; dry_run: boolean; send_only: boolean }>(
       `SELECT id::text AS id, dry_run, send_only FROM harvest_runs
-       WHERE state IN ${ACTIVE_STATES} ORDER BY id LIMIT 1`,
+       WHERE state IN ${ACTIVE_STATES_SQL} ORDER BY id LIMIT 1`,
     );
     const act = active.rows[0];
     if (act && !act.dry_run) {
@@ -731,7 +720,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   }
 
   async function thumb(id: string, res: http.ServerResponse): Promise<void> {
-    if (!/^\d{1,15}$/.test(id)) throw new HttpError(404, 'no such item');
+    if (!ID_RE.test(id)) throw new HttpError(404, 'no such item');
     let p = inflight.get(id);
     if (!p) {
       p = thumbBytes(id).finally(() => inflight.delete(id));

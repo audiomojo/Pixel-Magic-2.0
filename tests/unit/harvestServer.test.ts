@@ -140,7 +140,6 @@ async function setup(
     pool: pgh.pool,
     settings,
     sys,
-    layout,
     control,
     staticDir,
     temporalHealthy: () => Promise.resolve(temporal.value),
