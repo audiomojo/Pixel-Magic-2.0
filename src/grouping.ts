@@ -1,7 +1,6 @@
-import { captureConflict, type CaptureKey, type Facts } from './classify.js';
+import { captureConflict, type CaptureKey, type Facts, type Verdict } from './classify.js';
 
 export type GroupKind = 'copy' | 'similar';
-export type Verdict = 'copy' | 'similar';
 
 /** The group changes caused by one `Grouper.add`, for the caller to persist. */
 export interface Assignment {
@@ -96,7 +95,7 @@ export class Grouper {
    * O(contents) instead of one full index scan per key-less content.
    */
   constructor(
-    private readonly newId: (kind: GroupKind) => number,
+    private readonly newId: () => number,
     private readonly edgesOf: (sha256: string) => Iterable<string> = () => [],
   ) {}
 
@@ -137,7 +136,7 @@ export class Grouper {
       return [this.findCopy(id), verdict, sha] as const;
     });
 
-    const gid = this.newId('copy');
+    const gid = this.newId();
     this.claim(f.sha256, gid);
     const keyless = f.captured === null && f.burstUuid === null;
     const copyMatches = resolved.filter(([, v]) => v === 'copy').map(([, , m]) => m);
@@ -318,7 +317,7 @@ export class Grouper {
       if (s !== null) sets.add(this.findSim(s));
     }
     if (sets.size === 0) {
-      const sid = this.newId('similar');
+      const sid = this.newId();
       this.similar.set(sid, { parent: sid, size: 0 });
       asg.created.push([sid, 'similar']);
       sets.add(sid);

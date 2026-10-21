@@ -1,7 +1,6 @@
 import { ExifTool } from 'exiftool-vendored';
 
 export interface Metadata {
-  fileType: string;
   /** exiftool `MIMEType`: the only source of `contents.mime`. */
   mime: string;
   ext: string;
@@ -87,7 +86,6 @@ export function parseMetadata(tags: Record<string, unknown>): Metadata {
         : 'other';
   const duration = tags['QuickTime:Duration'];
   return {
-    fileType,
     mime,
     ext: rawExt === 'jpeg' ? 'jpg' : rawExt,
     kind,

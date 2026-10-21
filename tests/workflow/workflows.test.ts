@@ -61,12 +61,11 @@ const INGESTED_STILL: IngestResult = {
   sha256: SHA,
   ext: 'heic',
   state: 'INGESTED',
-  isNew: true,
   kind: 'still',
 };
 const INGESTED_MOTION: IngestResult = { ...INGESTED_STILL, ext: 'mov', kind: 'motion' };
 // Task 6: COPY owns no content, so its kind is null.
-const COPY: IngestResult = { ...INGESTED_STILL, state: 'COPY', isNew: false, kind: null };
+const COPY: IngestResult = { ...INGESTED_STILL, state: 'COPY', kind: null };
 const DECODED: DecodeResult = {
   facts: { width: 4, height: 3, phash: '1', dhash: '2', mime: 'image/heic' },
   quarantineReason: null,

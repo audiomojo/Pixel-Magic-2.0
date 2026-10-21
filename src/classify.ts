@@ -1,5 +1,8 @@
 import { hamming } from './hashing.js';
 
+/** How two look-alike contents relate: a copy of one picture, or merely similar. */
+export type Verdict = 'copy' | 'similar';
+
 /** Capture instant at whole-second precision (`s`, Unix seconds) plus the EXIF sub-second string. */
 export type CaptureKey = { s: number; sub: string | null };
 
@@ -52,7 +55,7 @@ const differentEncoding = (a: Facts, b: Facts): boolean =>
  * Spec §6.3 table, first match wins, for a pair that already `looksAlike`.
  * Only a provable re-encoding of the same shot is a copy; anything uncertain is similar.
  */
-export function classify(a: Facts, b: Facts, t: Thresholds): 'copy' | 'similar' {
+export function classify(a: Facts, b: Facts, t: Thresholds): Verdict {
   if (a.burstUuid !== null && a.burstUuid === b.burstUuid) return 'similar';
   const ca = a.captured;
   const cb = b.captured;

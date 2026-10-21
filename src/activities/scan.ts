@@ -9,7 +9,7 @@ import {
   WorkflowIdConflictPolicy,
   WorkflowIdReusePolicy,
 } from '@temporalio/client';
-import { isIgnored } from '../fsops.js';
+import { errCode, isEnoent, isIgnored, unlessEnoent } from '../fsops.js';
 import { fileWorkflowId } from '../ids.js';
 import type { FileRef, ScanResult } from '../types.js';
 import type { FileWorkflow } from '../workflows.js';
@@ -31,12 +31,9 @@ const isLitter = (name: string): boolean => name === '.DS_Store' || name.startsW
 /** rel_path → (size, mtime_ns) of every non-ignored regular file under the drop zone. */
 type Snapshot = Map<string, { size: bigint; mtimeNs: bigint }>;
 
-const isEnoent = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOENT';
-const isNotEmpty = (e: unknown): boolean =>
-  ['ENOTEMPTY', 'EEXIST'].includes((e as NodeJS.ErrnoException).code ?? '');
+const isNotEmpty = (e: unknown): boolean => ['ENOTEMPTY', 'EEXIST'].includes(errCode(e) ?? '');
 /** The path is gone: removed, or a parent directory was replaced by a file. */
-const isGone = (e: unknown): boolean =>
-  isEnoent(e) || (e as NodeJS.ErrnoException).code === 'ENOTDIR';
+const isGone = (e: unknown): boolean => isEnoent(e) || errCode(e) === 'ENOTDIR';
 
 async function statOrNull(path: string) {
   try {
@@ -129,10 +126,7 @@ export function makeScan(deps: Deps) {
       try {
         const entries = await readdir(dir, { withFileTypes: true });
         if (!entries.every((e) => e.isFile() && isLitter(e.name))) continue;
-        for (const e of entries)
-          await unlink(join(dir, e.name)).catch((err: unknown) => {
-            if (!isEnoent(err)) throw err;
-          });
+        for (const e of entries) await unlessEnoent(unlink(join(dir, e.name)));
         await rmdir(dir);
         removed++;
       } catch (e) {

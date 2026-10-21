@@ -56,7 +56,6 @@ const STILL = {
   sha256: SHA,
   ext: 'jpg',
   state: 'INGESTED',
-  isNew: true,
   kind: 'still',
 };
 const REF = { relPath: 'a.jpg', size: '1', mtimeNs: '1' };
@@ -212,7 +211,6 @@ test('a COPY outcome removes the confirmed duplicate, then ends', async () => {
     ...STILL,
     fileId: '42',
     state: 'COPY',
-    isNew: false,
     kind: null,
   });
   expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
@@ -221,14 +219,14 @@ test('a COPY outcome removes the confirmed duplicate, then ends', async () => {
 });
 
 test('a mismatch is the outcome, not an error: the COPY workflow still ends normally', async () => {
-  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', isNew: false, kind: null });
+  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', kind: null });
   h.impl['reclaimCopy'] = () => 'MISMATCH';
   expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
 });
 
 test('a history from before removal existed replays without the reclaim step', async () => {
   h.patches['reclaim-copy'] = false;
-  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', isNew: false, kind: null });
+  h.impl['ingestFile'] = () => ({ ...STILL, state: 'COPY', kind: null });
   expect(await wf.FileWorkflow(REF as never)).toBe('COPY');
   expect(names()).toEqual(['ingestFile']);
 });

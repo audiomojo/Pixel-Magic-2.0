@@ -498,11 +498,11 @@ function inMemory(facts: readonly Facts[]) {
   const g = new Grouper(() => ++id);
   const idx = new HashIndex();
   for (const f of facts) {
-    const asg = g.add(
+    g.add(
       f,
       idx.matches(f, T).map((m) => [m.sha256, classify(f, m, T)] as const),
     );
-    idx.append([f], [asg.copyGroup]);
+    idx.append([f]);
   }
   return { copy: g.copyPartition(), similar: g.similarPartition() };
 }

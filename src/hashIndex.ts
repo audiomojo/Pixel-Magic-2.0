@@ -1,11 +1,7 @@
 import type { Facts, Thresholds } from './classify.js';
-import { popcount32 } from './hashing.js';
+import { hi, lo, popcount32 } from './hashing.js';
 
 const INITIAL_CAPACITY = 1024;
-const MASK32 = 0xffff_ffffn;
-
-const hi = (h: bigint): number => Number((h >> 32n) & MASK32);
-const lo = (h: bigint): number => Number(h & MASK32);
 
 /**
  * The cluster worker's in-memory look-alike index (spec §6.3): every stored pHash and dHash as
@@ -17,8 +13,6 @@ export class HashIndex {
   private pLo = new Uint32Array(INITIAL_CAPACITY);
   private dHi = new Uint32Array(INITIAL_CAPACITY);
   private dLo = new Uint32Array(INITIAL_CAPACITY);
-  /** Copy group id of each row when it was appended (ids < 2^53). */
-  private groups = new Float64Array(INITIAL_CAPACITY);
   private facts: Facts[] = [];
 
   get size(): number {
@@ -30,9 +24,7 @@ export class HashIndex {
     this.facts = [];
   }
 
-  append(rows: readonly Facts[], groups: readonly number[]): void {
-    if (rows.length !== groups.length)
-      throw new Error(`HashIndex.append: ${rows.length} rows but ${groups.length} groups`);
+  append(rows: readonly Facts[]): void {
     this.reserve(this.n + rows.length);
     rows.forEach((f, i) => {
       const at = this.n + i;
@@ -40,7 +32,6 @@ export class HashIndex {
       this.pLo[at] = lo(f.phash);
       this.dHi[at] = hi(f.dhash);
       this.dLo[at] = lo(f.dhash);
-      this.groups[at] = groups[i]!;
       this.facts[at] = f;
     });
     this.n += rows.length;
@@ -65,16 +56,14 @@ export class HashIndex {
     let cap = this.pHi.length;
     if (need <= cap) return;
     while (cap < need) cap *= 2;
-    const grow = <A extends Uint32Array | Float64Array>(a: A, make: (n: number) => A): A => {
-      const b = make(cap);
+    const grow = (a: Uint32Array<ArrayBuffer>): Uint32Array<ArrayBuffer> => {
+      const b = new Uint32Array(cap);
       b.set(a.subarray(0, this.n));
       return b;
     };
-    const u32 = (n: number) => new Uint32Array(n);
-    this.pHi = grow(this.pHi, u32);
-    this.pLo = grow(this.pLo, u32);
-    this.dHi = grow(this.dHi, u32);
-    this.dLo = grow(this.dLo, u32);
-    this.groups = grow(this.groups, (n) => new Float64Array(n));
+    this.pHi = grow(this.pHi);
+    this.pLo = grow(this.pLo);
+    this.dHi = grow(this.dHi);
+    this.dLo = grow(this.dLo);
   }
 }

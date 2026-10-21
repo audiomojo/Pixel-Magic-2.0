@@ -14,10 +14,11 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname, join, relative, sep } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
-import { fsyncDir } from '../fsops.js';
+import { errCode, fsyncDir, isEnoent, unlessEnoent } from '../fsops.js';
 import { planStaging, type Entry, type StageContent, type StageFile } from '../stagingPlan.js';
 import type { BuildResult } from '../types.js';
 import type { Deps } from './index.js';
+import { RUNNING_FILE_WORKFLOWS } from './scan.js';
 
 const GEN = /^\.gen-(\d+)$/;
 /** `removeGen`'s private directory inside a generation directory being removed. */
@@ -41,8 +42,7 @@ interface Snapshot {
   sinceLastS: number | null;
 }
 
-const isEnoent = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOENT';
-const isNotEmpty = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOTEMPTY';
+const isNotEmpty = (e: unknown): boolean => errCode(e) === 'ENOTEMPTY';
 
 /** `path`, or `path.1`, `path.2`, … : the first name nothing occupies (a rescue never overwrites). */
 async function freeName(path: string): Promise<string> {
@@ -104,10 +104,7 @@ export function makeStaging(deps: Deps) {
 
   async function runningFileWorkflows(): Promise<number> {
     if (!deps.temporal) return 0;
-    const r = await deps.temporal.workflow.count(
-      `WorkflowType = 'FileWorkflow' AND ExecutionStatus = 'Running'`,
-    );
-    return r.count;
+    return (await deps.temporal.workflow.count(RUNNING_FILE_WORKFLOWS)).count;
   }
 
   async function loadFacts(
@@ -347,9 +344,7 @@ export function makeStaging(deps: Deps) {
     );
     const live = await currentGen();
     for (const g of await gensOnDisk()) if (!recorded.has(g) && g !== live) await removeGen(g);
-    await unlink(tmpLink).catch((e: unknown) => {
-      if (!isEnoent(e)) throw e;
-    });
+    await unlessEnoent(unlink(tmpLink));
 
     const gen = Math.max(0, snap.lastGen ?? 0, live ?? 0, ...(await gensOnDisk())) + 1;
     const entries = planStaging(facts.contents, facts.files, settings.liveMaxDurationS);

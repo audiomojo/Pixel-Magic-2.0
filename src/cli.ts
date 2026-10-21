@@ -101,7 +101,7 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
   const sample = sampleArg === undefined ? undefined : Number(sampleArg);
   const ok =
     extra.length === 0 &&
-    (force ? command === 'stage' : true) &&
+    (!force || command === 'stage') &&
     (sampleArg === undefined ||
       (command === 'verify-vault' && Number.isInteger(sample) && sample! > 0));
   const commands = ['stage', 'retry-failed', 'verify-vault', 'doctor', 'copies', 'sweep-copies'];

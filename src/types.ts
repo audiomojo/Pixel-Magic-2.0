@@ -10,15 +10,22 @@ export interface IngestResult {
   sha256: string | null;
   ext: string | null;
   state: 'INGESTED' | 'COPY' | 'QUARANTINED';
-  /** This file owns the vault inode (it inserted, or may insert, the `contents` row). */
-  isNew: boolean;
   /** The owned content's kind; null for COPY (owns no content) and QUARANTINED. */
   kind: 'still' | 'motion' | 'other' | null;
 }
 
 /** `decode_content`'s outcome. Hashes are unsigned decimal strings (bigints can't cross Temporal JSON). */
+/** `ImageFacts` as it crosses JSON (the decode pool's IPC, Temporal): hashes as unsigned decimal strings. */
+export interface WireFacts {
+  width: number;
+  height: number;
+  phash: string;
+  dhash: string;
+  mime: string;
+}
+
 export interface DecodeResult {
-  facts: { width: number; height: number; phash: string; dhash: string; mime: string } | null;
+  facts: WireFacts | null;
   quarantineReason: string | null;
 }
 

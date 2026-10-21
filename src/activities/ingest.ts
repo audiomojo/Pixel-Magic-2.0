@@ -3,7 +3,16 @@ import { basename, dirname, join } from 'node:path';
 import { Context, heartbeat } from '@temporalio/activity';
 import type pg from 'pg';
 import { withTx } from '../db.js';
-import { fsyncDir, linkIntoVault, sameFile, sha256File, vaultRel } from '../fsops.js';
+import {
+  errCode,
+  fsyncDir,
+  isEnoent,
+  linkIntoVault,
+  sameFile,
+  sha256File,
+  unlessEnoent,
+  vaultRel,
+} from '../fsops.js';
 import type { Metadata } from '../metadata.js';
 import type { FileRef, IngestResult } from '../types.js';
 import type { Deps } from './index.js';
@@ -18,7 +27,7 @@ export class MissingBytesError extends Error {
   override name = 'MissingBytesError';
 }
 
-/** The claimed file changed while it was hashed (a writer still has it open). Retryable. */
+/** A file changed while it was hashed (a writer still has it open). Retryable. */
 export class ChangedWhileHashingError extends Error {
   override name = 'ChangedWhileHashingError';
 }
@@ -30,17 +39,7 @@ interface Row {
   ext: string | null;
 }
 
-const code = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
-const isEnoent = (e: unknown): boolean => code(e) === 'ENOENT';
-
-async function statOrNull(path: string) {
-  try {
-    return await stat(path);
-  } catch (e) {
-    if (isEnoent(e)) return null;
-    throw e;
-  }
-}
+const statOrNull = (path: string) => unlessEnoent(stat(path));
 
 /**
  * The detected extension, else `bin`. Never the dropped name's: identical bytes must map to one
@@ -52,12 +51,12 @@ function extOf(meta: Metadata): string {
 
 export function makeIngestFile(deps: Deps) {
   const { pool, layout, metadata } = deps;
-  const checkpoint = async (name: string) => {
-    await deps.checkpoint?.(name);
-  };
   const claimedPath = (id: string) => join(layout.claimed, id);
   const copiesPath = (id: string, ext: string) => join(layout.vaultCopies, `${id}.${ext}`);
   const vaultPath = (sha: string, ext: string) => join(layout.root, vaultRel(sha, ext));
+  /** Where a hashed row's bytes are kept: its .copies file for a COPY, else the vault file. */
+  const keptPath = (id: string, state: string, sha: string, ext: string) =>
+    state === 'COPY' ? copiesPath(id, ext) : vaultPath(sha, ext);
 
   /** `UPDATE files … WHERE id AND state IN (allowed)`; throws StaleAttemptError if no row moved. */
   async function guarded(
@@ -84,10 +83,27 @@ export function makeIngestFile(deps: Deps) {
     if ((k.mode & 0o777) !== 0o444) await chmod(keep, 0o444);
   }
 
+  /** An unhashed row ends QUARANTINED with `reason`: nothing of it was ever vaulted. */
+  async function quarantineUnhashed(
+    id: string,
+    reason: string,
+    allowed: string[],
+  ): Promise<IngestResult> {
+    await guarded(
+      pool,
+      id,
+      `state = 'QUARANTINED', last_error = $3`,
+      allowed,
+      [reason],
+      'sha256 IS NULL',
+    );
+    return { fileId: id, sha256: null, ext: null, state: 'QUARANTINED', kind: null };
+  }
+
   async function commitCopy(row: Row, sha: string, ext: string): Promise<IngestResult> {
     await guarded(pool, row.id, `state = 'COPY'`, ['CLAIMED']);
     await finish(row.id, copiesPath(row.id, ext), sha);
-    return { fileId: row.id, sha256: sha, ext, state: 'COPY', isNew: false, kind: null };
+    return { fileId: row.id, sha256: sha, ext, state: 'COPY', kind: null };
   }
 
   /** Step 6 for the vault owner: contents (idempotent) and the guarded INGESTED, in one transaction. */
@@ -121,7 +137,7 @@ export function makeIngestFile(deps: Deps) {
       await guarded(c, row.id, `state = 'INGESTED'`, ['CLAIMED']);
     });
     await finish(row.id, vaultPath(sha, ext), sha);
-    return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', isNew: true, kind: meta.kind };
+    return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', kind: meta.kind };
   }
 
   /** R1: a run whose row is already final returns the stored outcome (after re-running the tail of steps 6–7). */
@@ -143,17 +159,12 @@ export function makeIngestFile(deps: Deps) {
       return null;
     const id = String(row.id);
     if (row.sha256 && row.ext)
-      await finish(
-        id,
-        row.state === 'COPY' ? copiesPath(id, row.ext) : vaultPath(row.sha256, row.ext),
-        row.sha256,
-      );
+      await finish(id, keptPath(id, row.state, row.sha256, row.ext), row.sha256);
     return {
       fileId: id,
       sha256: row.sha256,
       ext: row.ext,
       state: row.state,
-      isNew: row.state === 'INGESTED',
       kind: row.state === 'INGESTED' ? row.kind : null,
     };
   }
@@ -187,7 +198,7 @@ export function makeIngestFile(deps: Deps) {
     );
     const row = r.rows[0];
     if (row?.sha256 && row.ext) {
-      const keep = row.state === 'COPY' ? copiesPath(id, row.ext) : vaultPath(row.sha256, row.ext);
+      const keep = keptPath(id, row.state, row.sha256, row.ext);
       if (await sameFile(claimed, keep, row.sha256, () => heartbeat())) return;
     }
     const dest = join(layout.dropzone, ref.relPath);
@@ -195,7 +206,7 @@ export function makeIngestFile(deps: Deps) {
     try {
       await link(claimed, dest);
     } catch (e) {
-      if (code(e) === 'EEXIST')
+      if (errCode(e) === 'EEXIST')
         throw new Error(
           `${claimed} holds a later drop of ${ref.relPath} but that path is occupied; left in place`,
           { cause: e },
@@ -214,15 +225,7 @@ export function makeIngestFile(deps: Deps) {
   async function recoverUnclaimed(ref: FileRef, row: Row): Promise<IngestResult> {
     if (!row.sha256) {
       // Only an unhashed, unclaimed row can vanish: CLAIMED always carries a hash.
-      await guarded(
-        pool,
-        row.id,
-        `state = 'QUARANTINED', last_error = 'vanished'`,
-        ['DISCOVERED'],
-        [],
-        'sha256 IS NULL',
-      );
-      return QUARANTINED_UNHASHED(row.id);
+      return quarantineUnhashed(row.id, 'vanished', ['DISCOVERED']);
     }
     if (row.ext) {
       const vault = vaultPath(row.sha256, row.ext);
@@ -235,15 +238,6 @@ export function makeIngestFile(deps: Deps) {
     );
   }
 
-  const QUARANTINED_UNHASHED = (id: string): IngestResult => ({
-    fileId: id,
-    sha256: null,
-    ext: null,
-    state: 'QUARANTINED',
-    isNew: false,
-    kind: null,
-  });
-
   return async function ingestFile(ref: FileRef): Promise<IngestResult> {
     const runId = Context.current().info.workflowExecution?.runId;
     if (!runId) throw new Error('ingestFile needs a workflow run id (its idempotency key)');
@@ -253,7 +247,7 @@ export function makeIngestFile(deps: Deps) {
     // Step 1: the row for this drop, keyed among non-final rows.
     const row = await upsert(ref, runId);
     const claimed = claimedPath(row.id);
-    await checkpoint('upsert');
+    await deps.checkpoint?.('upsert');
 
     // Step 2: claim. An existing claimed file is never overwritten (a re-drop at the same path
     // waits for the next scan), and a copy already parked in .copies is committed as such.
@@ -271,7 +265,7 @@ export function makeIngestFile(deps: Deps) {
         if (!(await statOrNull(claimed))) return recoverUnclaimed(ref, row);
       }
     }
-    await checkpoint('claim');
+    await deps.checkpoint?.('claim');
 
     // The scan's stability check may be minutes old: claim only the file the scan saw. A file
     // still being written (a slow or repeated copy) goes back to the drop zone for a later scan,
@@ -283,21 +277,13 @@ export function makeIngestFile(deps: Deps) {
       (before.size !== BigInt(ref.size) || before.mtimeNs !== BigInt(ref.mtimeNs))
     ) {
       await putBack(ref, row.id);
-      await guarded(
-        pool,
-        row.id,
-        `state = 'QUARANTINED', last_error = 'changed_before_claim'`,
-        ['DISCOVERED', 'CLAIMED'],
-        [],
-        'sha256 IS NULL',
-      );
-      return QUARANTINED_UNHASHED(row.id);
+      return quarantineUnhashed(row.id, 'changed_before_claim', ['DISCOVERED', 'CLAIMED']);
     }
 
     // Step 3: hash, heartbeating per 1 MiB chunk. Commit CLAIMED + sha256.
     const size = before.size;
     const sha = await sha256File(claimed, () => heartbeat());
-    await checkpoint('hashed');
+    await deps.checkpoint?.('hashed');
     const after = await stat(claimed, { bigint: true });
     if (after.size !== before.size || after.mtimeNs !== before.mtimeNs) {
       // The hash covers bytes that are no longer the file's: never vault them under it.
@@ -329,11 +315,11 @@ export function makeIngestFile(deps: Deps) {
     const outcome = await linkIntoVault(claimed, vaultPath(sha, ext), sha, {
       onChunk: () => heartbeat(),
     });
-    await checkpoint('link');
+    await deps.checkpoint?.('link');
     if (outcome === 'EXISTS_OTHER') {
       await rename(claimed, copiesPath(row.id, ext));
       await fsyncDir(layout.vaultCopies); // the rename is durable before COPY is committed
-      await checkpoint('copies_rename');
+      await deps.checkpoint?.('copies_rename');
       return commitCopy(row, sha, ext);
     }
     // Steps 6–7.

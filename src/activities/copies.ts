@@ -4,14 +4,10 @@
 import { lstat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
-import { fsyncDir, sha256File, vaultRel } from '../fsops.js';
+import { fsyncDir, sha256File, unlessEnoent, vaultRel } from '../fsops.js';
 import type { ReclaimOutcome, SweepResult } from '../types.js';
 import type { Deps } from './index.js';
-
-/** A file changed between its hash and the unlink (someone writes to it). Retryable. */
-export class ChangedWhileHashingError extends Error {
-  override name = 'ChangedWhileHashingError';
-}
+import { ChangedWhileHashingError } from './ingest.js';
 
 interface CopyRow {
   id: bigint;
@@ -24,16 +20,7 @@ interface CopyRow {
 }
 
 const ROW_COLUMNS = 'id, state, sha256, ext, size_bytes, copy_removed_at, copy_mismatch';
-const isEnoent = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === 'ENOENT';
-
-async function lstatOrNull(path: string) {
-  try {
-    return await lstat(path, { bigint: true });
-  } catch (e) {
-    if (isEnoent(e)) return null;
-    throw e;
-  }
-}
+const lstatOrNull = (path: string) => unlessEnoent(lstat(path, { bigint: true }));
 
 type Stats = NonNullable<Awaited<ReturnType<typeof lstatOrNull>>>;
 /**
@@ -45,9 +32,6 @@ const same = (a: Stats, b: Stats): boolean => a.size === b.size && a.mtimeNs ===
 
 export function makeCopies(deps: Deps) {
   const { pool, layout } = deps;
-  const checkpoint = async (name: string) => {
-    await deps.checkpoint?.(name);
-  };
   const beat = () => heartbeat();
 
   /** Marks the row removed (`bytes` reclaimed); guarded, so a concurrent mark is a no-op. */
@@ -71,12 +55,17 @@ export function makeCopies(deps: Deps) {
     return 'MISMATCH';
   }
 
-  /** Hashes `path` and checks it did not change meanwhile (same size and mtime). */
+  /** Throws ChangedWhileHashingError unless `path` is still `before` (same size and mtime). */
+  async function assertUnchanged(path: string, before: Stats): Promise<void> {
+    const now = await lstatOrNull(path);
+    if (!now || !same(before, now))
+      throw new ChangedWhileHashingError(`${layout.rel(path)} changed while hashing`);
+  }
+
+  /** Hashes `path` and checks it did not change meanwhile. */
   async function freshHash(path: string, before: Stats): Promise<string> {
     const h = await sha256File(path, beat);
-    const after = await lstatOrNull(path);
-    if (!after || !same(before, after))
-      throw new ChangedWhileHashingError(`${layout.rel(path)} changed while hashing`);
+    await assertUnchanged(path, before);
     return h;
   }
 
@@ -107,25 +96,15 @@ export function makeCopies(deps: Deps) {
     if (!v || !v.isFile()) return flag(id, `vault file ${layout.rel(vault)} missing`);
 
     const [hc, hv] = await Promise.all([freshHash(copy, c), freshHash(vault, v)]);
-    await checkpoint('reclaim_hashed');
+    await deps.checkpoint?.('reclaim_hashed');
     if (hc !== sha || hv !== sha)
       return flag(id, `.copies sha ${hc}, vault sha ${hv}, expected ${sha}`);
     // Both still the files that were hashed, right before the unlink.
-    for (const [path, before] of [
-      [copy, c],
-      [vault, v],
-    ] as const) {
-      const now = await lstatOrNull(path);
-      if (!now || !same(before, now))
-        throw new ChangedWhileHashingError(`${layout.rel(path)} changed while hashing`);
-    }
-    try {
-      await unlink(copy);
-    } catch (e) {
-      if (!isEnoent(e)) throw e; // a concurrent reclaim of this row got there first
-    }
+    await assertUnchanged(copy, c);
+    await assertUnchanged(vault, v);
+    await unlessEnoent(unlink(copy)); // ENOENT: a concurrent reclaim of this row got there first
     await fsyncDir(layout.vaultCopies); // the unlink is durable before the row says so
-    await checkpoint('reclaim_unlinked');
+    await deps.checkpoint?.('reclaim_unlinked');
     return markRemoved(id, c.size);
   }
 

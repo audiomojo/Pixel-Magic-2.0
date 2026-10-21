@@ -4,7 +4,9 @@ import { join } from 'node:path';
 import { ExifTool } from 'exiftool-vendored';
 import heicDecode from 'heic-decode';
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
+import { unlessEnoent } from './fsops.js';
 import { dhashFromGray, phashFromGray } from './hashing.js';
+import type { WireFacts } from './types.js';
 
 export interface ImageFacts {
   width: number;
@@ -13,15 +15,6 @@ export interface ImageFacts {
   dhash: bigint;
   mime: string;
 }
-
-/** `ImageFacts` as it crosses the decode pool's JSON IPC: hashes as unsigned decimal strings. */
-export type WireFacts = {
-  width: number;
-  height: number;
-  phash: string;
-  dhash: string;
-  mime: string;
-};
 
 export type QuarantineReason = 'decode_error' | 'truncated' | 'decompression_bomb' | 'unsupported';
 
@@ -293,12 +286,5 @@ const isDim = (v: unknown): v is number => typeof v === 'number' && Number.isInt
 const NO_PREVIEW = /\b0 output files? created/i;
 
 /** True only for ENOENT; any other stat failure propagates (transient). */
-async function isMissing(path: string): Promise<boolean> {
-  try {
-    await stat(path);
-    return false;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw err;
-  }
-}
+const isMissing = async (path: string): Promise<boolean> =>
+  (await unlessEnoent(stat(path))) === null;

@@ -3,6 +3,19 @@ import { link, mkdir, open, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative } from 'node:path';
 
+export const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+export const isEnoent = (e: unknown): boolean => errCode(e) === 'ENOENT';
+
+/** `p`'s value, or null when it rejected with ENOENT (any other error propagates). */
+export async function unlessEnoent<T>(p: Promise<T>): Promise<T | null> {
+  try {
+    return await p;
+  } catch (e) {
+    if (isEnoent(e)) return null;
+    throw e;
+  }
+}
+
 export class SameDeviceError extends Error {
   constructor(message: string) {
     super(message);
@@ -73,15 +86,6 @@ export async function sha256File(path: string | Buffer, onChunk?: () => void): P
   return h.digest('hex');
 }
 
-async function statOrNull(path: string) {
-  try {
-    return await stat(path, { bigint: true });
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw e;
-  }
-}
-
 /**
  * Whether `a` and `b` are names of one file. Equal `(dev, ino)` decides. Docker Desktop's
  * virtiofs renumbers an inode when its cache evicts it, though, so two names of one file can
@@ -95,7 +99,10 @@ export async function sameFile(
   sha256: string | null,
   onChunk?: () => void,
 ): Promise<boolean> {
-  const [x, y] = await Promise.all([statOrNull(a), statOrNull(b)]);
+  const [x, y] = await Promise.all([
+    unlessEnoent(stat(a, { bigint: true })),
+    unlessEnoent(stat(b, { bigint: true })),
+  ]);
   if (!x || !y) return false;
   if (x.dev === y.dev && x.ino === y.ino) return true;
   if (sha256 === null || x.nlink < 2n || y.nlink < 2n) return false;

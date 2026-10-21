@@ -82,6 +82,7 @@ export function bestCopyKey(c: StageContent, hasLive: boolean): BestCopyKey {
 /** Code-unit order: locale-free, identical on every machine. */
 const cmpStr = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 const cmpDesc = (a: number | bigint, b: number | bigint): number => (a > b ? -1 : a < b ? 1 : 0);
+const cmpAsc = (a: number | bigint, b: number | bigint): number => cmpDesc(b, a);
 
 /** Negative when `a` is the better copy: every element descending, except the final sha ascending. */
 export function compareBestCopy(a: BestCopyKey, b: BestCopyKey): number {
@@ -93,8 +94,9 @@ export function compareBestCopy(a: BestCopyKey, b: BestCopyKey): number {
 }
 
 /** Naming-file order `(relPath, mtimeNs, fileId)`: `fileId` (arrival order) only breaks true ties. */
-const cmpFile = (a: StageFile, b: StageFile): number =>
-  cmpStr(a.relPath, b.relPath) || cmpDesc(b.mtimeNs, a.mtimeNs) || cmpDesc(b.fileId, a.fileId);
+const cmpFile = (a: Named, b: Named): number =>
+  cmpStr(a.relPath, b.relPath) || cmpAsc(a.mtimeNs, b.mtimeNs) || cmpAsc(a.fileId, b.fileId);
+type Named = Pick<StageFile, 'relPath' | 'mtimeNs' | 'fileId'>;
 
 const lastSlash = (p: string): number => p.lastIndexOf('/');
 const dirOf = (relPath: string): string => relPath.slice(0, Math.max(0, lastSlash(relPath)));
@@ -105,7 +107,7 @@ const dotAt = (name: string): number => {
 const stemOf = (name: string): string => (dotAt(name) < 0 ? name : name.slice(0, dotAt(name)));
 const extOf = (name: string): string => (dotAt(name) < 0 ? '' : name.slice(dotAt(name)));
 
-/** Groups byte-holding files by content, each list sorted by `(relPath, fileId)`. */
+/** Groups byte-holding files by content, each list in naming-file order (cmpFile). */
 function filesByContent(files: readonly StageFile[]): Map<string, StageFile[]> {
   const out = new Map<string, StageFile[]>();
   for (const f of files) {
@@ -199,11 +201,7 @@ interface Request {
 }
 
 /** Collision order `(sha256, relPath)`, then the naming-file tie-breaks, so a content's naming file is its first claimant. */
-const cmpRequest = (a: Request, b: Request): number =>
-  cmpStr(a.sha, b.sha) ||
-  cmpStr(a.relPath, b.relPath) ||
-  cmpDesc(b.mtimeNs, a.mtimeNs) ||
-  cmpDesc(b.fileId, a.fileId);
+const cmpRequest = (a: Request, b: Request): number => cmpStr(a.sha, b.sha) || cmpFile(a, b);
 
 /** Collision-free names: dests compare NFC + case-insensitively (APFS), whatever the host. */
 class Namer {
@@ -212,8 +210,7 @@ class Namer {
 
   /** Places `r` (callers go in `(sha256, relPath)` order); returns its final dest. */
   place(r: Request): string {
-    const i = dotAt(r.name);
-    const [stem, ext] = i < 0 ? [r.name, ''] : [r.name.slice(0, i), r.name.slice(i)];
+    const [stem, ext] = [stemOf(r.name), extOf(r.name)];
     for (let n = 0; ; n++) {
       const name =
         n === 0 ? r.name : `${stem}_${sha8(r.sha)}${n === 1 ? '' : `_${String(n)}`}${ext}`;

@@ -103,7 +103,7 @@ async function count(table: string, where = 'true'): Promise<number> {
 
 test('new file lands in vault, read-only, drop zone and claimed empty', async () => {
   const r = await runActivity(acts.ingestFile, [await drop('IMG 1.jpg', JPEG_A)], { runId: 'r1' });
-  expect([r.state, r.isNew, r.kind]).toEqual(['INGESTED', true, 'still']);
+  expect([r.state, r.kind]).toEqual(['INGESTED', 'still']);
   const v = join(layout.root, vaultRel(r.sha256!, 'jpg'));
   expect((await stat(v)).mode & 0o777).toBe(0o444);
   expect(await readdir(layout.claimed)).toEqual([]);
@@ -113,7 +113,7 @@ test('new file lands in vault, read-only, drop zone and claimed empty', async ()
 test('byte-identical second file is COPY', async () => {
   const a = await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
   const b = await runActivity(acts.ingestFile, [await drop('b.jpg', JPEG_A)], { runId: 'r2' });
-  expect([b.state, b.isNew, b.sha256]).toEqual(['COPY', false, a.sha256]);
+  expect([b.state, b.sha256]).toEqual(['COPY', a.sha256]);
   expect(existsSync(join(layout.vaultCopies, `${b.fileId}.jpg`))).toBe(true);
 });
 
@@ -142,7 +142,7 @@ test.each(['claim', 'link', 'copies_rename'])(
       runActivity(createActivities(crashAt(point)).ingestFile, [ref], { runId: 'r1' }),
     ).rejects.toThrow(SimulatedCrash);
     const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
-    expect([r.state, r.isNew, r.sha256]).toEqual(['COPY', false, first.sha256]);
+    expect([r.state, r.sha256]).toEqual(['COPY', first.sha256]);
     expect(await readdir(layout.vaultCopies)).toEqual([`${r.fileId}.jpg`]);
     expect((await stat(join(layout.vaultCopies, `${r.fileId}.jpg`))).mode & 0o777).toBe(0o444);
     expect(await readdir(layout.dropzone)).toEqual([]);
@@ -194,10 +194,10 @@ test('vault owner is INGESTED even when a byte copy commits first', async () => 
     runActivity(createActivities(crashAt('link')).ingestFile, [ra], { runId: 'r1' }),
   ).rejects.toThrow(SimulatedCrash);
   const b = await runActivity(acts.ingestFile, [rb], { runId: 'r2' });
-  expect([b.state, b.isNew]).toEqual(['COPY', false]);
+  expect(b.state).toBe('COPY');
   expect(await count('contents')).toBe(0);
   const a = await runActivity(acts.ingestFile, [ra], { runId: 'r1' });
-  expect([a.state, a.isNew]).toEqual(['INGESTED', true]);
+  expect(a.state).toBe('INGESTED');
   expect(await count('contents')).toBe(1);
   expect(existsSync(join(layout.vaultCopies, `${b.fileId}.jpg`))).toBe(true);
 });
@@ -229,7 +229,7 @@ test('hashed file with claimed gone but vault present commits INGESTED', async (
   ).rejects.toThrow(SimulatedCrash);
   for (const f of await readdir(layout.claimed)) await rm(join(layout.claimed, f)); // test-only anomaly
   const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
-  expect([r.state, r.isNew, r.kind]).toEqual(['INGESTED', true, 'still']);
+  expect([r.state, r.kind]).toEqual(['INGESTED', 'still']);
   expect(await count('contents')).toBe(1);
 });
 
@@ -323,13 +323,7 @@ test('identical undetectable bytes under different names dedup to one vault inod
   const b = await runActivity(acts.ingestFile, [await drop('y.def', Buffer.alloc(64))], {
     runId: 'r2',
   });
-  expect([a.state, a.isNew, b.state, b.isNew, b.sha256]).toEqual([
-    'INGESTED',
-    true,
-    'COPY',
-    false,
-    a.sha256,
-  ]);
+  expect([a.state, b.state, b.sha256]).toEqual(['INGESTED', 'COPY', a.sha256]);
   expect(await count('contents')).toBe(1);
 });
 
@@ -554,7 +548,7 @@ test('a file changed between scan and claim is put back and quarantined, never v
   const grown = Buffer.concat([JPEG_A, Buffer.from('still being written')]);
   await writeFile(join(layout.dropzone, 'a.jpg'), grown); // the copy was still running
   const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
-  expect([r.state, r.sha256, r.isNew]).toEqual(['QUARANTINED', null, false]);
+  expect([r.state, r.sha256]).toEqual(['QUARANTINED', null]);
   expect(await readFile(join(layout.dropzone, 'a.jpg'))).toEqual(grown);
   expect(await readdir(layout.claimed)).toEqual([]);
   expect(await vaultFiles()).toEqual([]);

@@ -1,5 +1,9 @@
 const MASK32 = 0xffff_ffffn;
 
+/** The high and low 32-bit halves of an unsigned 64-bit hash. */
+export const hi = (h: bigint): number => Number((h >> 32n) & MASK32);
+export const lo = (h: bigint): number => Number(h & MASK32);
+
 /** Population count of a 32-bit unsigned integer (SWAR). */
 export function popcount32(x: number): number {
   x = x - ((x >>> 1) & 0x5555_5555);
@@ -10,7 +14,7 @@ export function popcount32(x: number): number {
 /** Hamming distance between two unsigned 64-bit hashes (popcount over the two 32-bit halves). */
 export function hamming(a: bigint, b: bigint): number {
   const x = a ^ b;
-  return popcount32(Number(x & MASK32)) + popcount32(Number((x >> 32n) & MASK32));
+  return popcount32(lo(x)) + popcount32(hi(x));
 }
 
 /** Unsigned 64-bit hash → signed int64 (the Postgres `bigint` representation). */

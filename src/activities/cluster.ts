@@ -106,7 +106,6 @@ export function rebuildCache(
   };
   const grouper = new Grouper(newId, edgesOf);
   const list: Facts[] = [];
-  const copyGroups: number[] = [];
   rows.forEach((r, i) => {
     const f = toFacts(r);
     if (r.copy_group_id === null)
@@ -124,10 +123,9 @@ export function rebuildCache(
     });
     facts.set(f.sha256, f);
     list.push(f);
-    copyGroups.push(copyGroup);
     if ((i + 1) % RELOAD_BEAT_EVERY === 0) onRows?.(i + 1);
   });
-  index.append(list, copyGroups);
+  index.append(list);
   return { grouper, index, facts, edgesOf };
 }
 
@@ -243,7 +241,7 @@ export function makeClusterContent(deps: Deps) {
       });
       if (out.added) {
         const { f, cache: c, version } = out.added;
-        c.index.append([f], [out.group]);
+        c.index.append([f]);
         c.facts.set(f.sha256, f);
         c.version = version;
       }
