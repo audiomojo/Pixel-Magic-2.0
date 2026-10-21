@@ -140,18 +140,23 @@ describe('backlog', () => {
 describe('stall', () => {
   const shut = () => deps(900n);
   const STALLED = { open: false, reason: STALLED_REASON };
+  /** Shut (the disk or the backlog), but not stalled. */
+  const shutNotStalled = (g: Awaited<ReturnType<typeof checkGate>>) => {
+    expect(g.open).toBe(false);
+    expect(g).not.toEqual(STALLED);
+  };
 
   test('not stalled when the run has not been paused for the disk', async () => {
     const run = await newRun();
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
     await pause(run, 'paused by you', minutesAgo(60));
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
   });
 
   test('not stalled before 10 minutes', async () => {
     const run = await newRun();
     await pause(run, 'disk 90.1 %', minutesAgo(9));
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
   });
 
   test('stalled after 10 minutes with nothing in flight', async () => {
@@ -170,14 +175,14 @@ describe('stall', () => {
     await pgh.pool.query("UPDATE harvest_runs SET paused_reason = 'disk 90.1 %' WHERE id = $1", [
       run,
     ]);
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
   });
 
   test('a backlog reason is never stalled', async () => {
     const run = await newRun();
     await pause(run, 'backlog 20,000', minutesAgo(60));
     await setPending(20000);
-    expect(await checkGate(deps(0n), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(deps(0n), run, 1n, NOW));
   });
 
   const addFile = (state: string, extra = '') =>
@@ -196,7 +201,7 @@ describe('stall', () => {
     const run = await newRun();
     await pause(run, 'disk 90.1 %', minutesAgo(60));
     await arrange();
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
   });
 
   test('reclaimed or mismatched COPY rows do not prevent the stall', async () => {
@@ -220,7 +225,7 @@ describe('stall', () => {
        VALUES ($1, 'f', 'f', 10, 1, 'photo', 'SENT', $2)`,
       [rows[0]!.id, minutesAgo(1)],
     );
-    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
+    shutNotStalled(await checkGate(shut(), run, 1n, NOW));
   });
 });
 

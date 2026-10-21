@@ -14,7 +14,6 @@ export interface IngestResult {
   kind: 'still' | 'motion' | 'other' | null;
 }
 
-/** `decode_content`'s outcome. Hashes are unsigned decimal strings (bigints can't cross Temporal JSON). */
 /** `ImageFacts` as it crosses JSON (the decode pool's IPC, Temporal): hashes as unsigned decimal strings. */
 export interface WireFacts {
   width: number;
@@ -24,6 +23,7 @@ export interface WireFacts {
   mime: string;
 }
 
+/** `decode_content`'s outcome. Hashes are unsigned decimal strings (bigints can't cross Temporal JSON). */
 export interface DecodeResult {
   facts: WireFacts | null;
   quarantineReason: string | null;

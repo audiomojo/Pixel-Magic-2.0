@@ -610,6 +610,8 @@ async function toggle(li, relPath, twisty) {
 /** Loads one level below relPath and shows it under li. */
 async function expand(li, relPath) {
   const s = currentSource();
+  // This row's own status line, held now: another source may be open when the reply arrives.
+  const statusEl = src.rows.get(relPath).statusEl;
   const ul = h('ul', {}, h('li', { className: 'muted' }, 'Loading…'));
   li.append(ul);
   let data;
@@ -627,7 +629,7 @@ async function expand(li, relPath) {
   // The listed path's own status (root row only; sub-rows got theirs from their parent's listing).
   if (relPath === '') {
     const own = cov && cov.relPath === '' ? { lastHarvestedAt: cov.lastHarvestedAt } : {};
-    src.rows.get('').statusEl.textContent = folderStatus(own, []);
+    statusEl.textContent = folderStatus(own, []);
   }
   const chain = cov
     ? [
