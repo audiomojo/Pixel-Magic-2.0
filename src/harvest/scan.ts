@@ -8,32 +8,36 @@ import type { HarvestDeps } from './activities.js';
 import {
   childContext,
   classify,
+  isJudged,
   keepDir,
   ROOT_CONTEXT,
   type DirContext,
   type Verdict,
 } from './classify.js';
 import { readMake } from './exifMake.js';
-import { pathKey, sameMtime } from './paths.js';
-import { resolveMount } from './sources.js';
+import { pathKey, sameMtime, type SourcePath } from './paths.js';
+import { liveMount } from './sources.js';
 
-export interface ScanFolderResult {
+interface Counters {
+  dirs: number;
+  photos: number;
+  maybes: number;
+  junk: Record<string, number>;
+  errors: number;
+}
+
+export interface ScanFolderResult extends Counters {
   /**
    * `UNREADABLE` (F-2): the folder's root, an ancestor or the source root cannot be read for a
    * permission reason (EPERM/EACCES, typically no Full Disk Access): nothing was read, and the
    * workflow pauses the run with `reason` until the user resumes.
    */
   outcome: 'DONE' | 'SOURCE_GONE' | 'UNREADABLE';
-  dirs: number;
-  photos: number;
-  maybes: number;
-  junk: Record<string, number>;
-  errors: number;
   /** For SOURCE_GONE `<label> unplugged`, for UNREADABLE `cannot read <label>/<path>: …`. */
   reason?: string;
 }
 
-export const SCAN_HEARTBEAT_MS = 5000;
+const SCAN_HEARTBEAT_MS = 5000;
 const BATCH = 500;
 const STAT_CONCURRENCY = 16;
 const GONE_CODES = new Set(['ENOENT', 'EIO', 'ENOTCONN', 'ENXIO', 'ETIMEDOUT']);
@@ -42,8 +46,6 @@ const isGone = (e: unknown): boolean => GONE_CODES.has((e as NodeJS.ErrnoExcepti
 const DENIED_CODES = new Set(['EPERM', 'EACCES']);
 const isDenied = (e: unknown): boolean => DENIED_CODES.has((e as NodeJS.ErrnoException).code ?? '');
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
-type FsPath = string | Buffer;
 
 interface Entry {
   name: string;
@@ -62,7 +64,7 @@ const rawOf = (name: string): Buffer | null =>
  * accents onto exFAT/SMB/NTFS, which may not match the NFC spelling), keeps its bytes (`raw`):
  * the stored rel_path is NFC, and the source is reopened through those bytes.
  */
-export async function listDir(abs: FsPath): Promise<Entry[]> {
+export async function listDir(abs: SourcePath): Promise<Entry[]> {
   const ents = await readdir(abs, { withFileTypes: true });
   if (!ents.some((e) => e.name.includes('�'))) {
     return ents.map((e) => toEntry(e.name, rawOf(e.name), e));
@@ -93,15 +95,15 @@ export const byName = (a: Entry, b: Entry): number =>
             : 0;
 
 /** `parent` + '/' + a child name, as a path Node can open (a Buffer when bytes are raw). */
-function childPath(parent: FsPath, e: Entry): FsPath {
+function childPath(parent: SourcePath, e: Entry): SourcePath {
   if (typeof parent === 'string' && !e.raw) return join(parent, e.name);
   return Buffer.concat([Buffer.from(parent), Buffer.from('/'), e.raw ?? Buffer.from(e.name)]);
 }
 
 /** The filesystem calls resolveComponent makes (tests fake a normalization-sensitive share). */
 export interface ResolveIo {
-  lstat(path: FsPath): Promise<{ isDirectory(): boolean }>;
-  listDir(path: FsPath): Promise<Entry[]>;
+  lstat(path: SourcePath): Promise<{ isDirectory(): boolean }>;
+  listDir(path: SourcePath): Promise<Entry[]>;
 }
 
 /**
@@ -111,7 +113,7 @@ export interface ResolveIo {
  * Null when there is none. Errors other than ENOENT (permission, I/O) propagate.
  */
 export async function resolveComponent(
-  parent: FsPath,
+  parent: SourcePath,
   name: string,
   io: ResolveIo,
 ): Promise<Entry | null> {
@@ -147,19 +149,11 @@ const isPrefix = (a: string[], b: string[]): boolean => a.every((c, i) => b[i] =
 
 interface Frame {
   comps: string[];
-  abs: FsPath;
+  abs: SourcePath;
   raw: Buffer | null;
   /** Context of the directory itself (the folder root has it up front). */
   ctx?: DirContext;
   parentCtx?: DirContext;
-}
-
-interface Counters {
-  dirs: number;
-  photos: number;
-  maybes: number;
-  junk: Record<string, number>;
-  errors: number;
 }
 
 export interface Candidate {
@@ -330,27 +324,11 @@ export function makeScanFolder(deps: HarvestDeps) {
       ...(outcome === 'SOURCE_GONE' ? { reason: `${folder.label} unplugged` } : {}),
     });
 
-    const mount = await resolveMount(
-      pool,
-      deps.sys,
-      folder.source_id,
-      settings.dataDir,
-      deps.detectOpts,
-    );
-    if (mount === null) return result('SOURCE_GONE');
-
-    // The mount root's device id at the start: a replacement directory left at the mount point
-    // after an unplug has another one, so "exists" alone does not mean "still mounted".
-    const mountDev = await lstat(mount, { bigint: true }).then(
-      (m) => m.dev,
-      () => null,
-    );
-    if (mountDev === null) return result('SOURCE_GONE');
-    const mountAlive = (): Promise<boolean> =>
-      lstat(mount, { bigint: true }).then(
-        (m) => m.dev === mountDev,
-        () => false,
-      );
+    const live = await liveMount(deps, folder.source_id);
+    if (live === null) return result('SOURCE_GONE');
+    const mount = live.path;
+    /** A "gone" error on a drive that is no longer mounted: the source was unplugged. */
+    const unplugged = async (e: unknown): Promise<boolean> => isGone(e) && !(await live.alive());
 
     /**
      * Ends the folder without walking: state done. `rootOk` false (a missing or unreadable
@@ -382,11 +360,22 @@ export function makeScanFolder(deps: HarvestDeps) {
       return finishNow(false);
     };
 
+    /** A component (or its listing) failed: unplugged, unreadable at `deniedAt`, or not found. */
+    const componentFailed = async (
+      e: unknown,
+      deniedAt: string,
+      rel: string,
+    ): Promise<ScanFolderResult> => {
+      if (await unplugged(e)) return result('SOURCE_GONE');
+      if (isDenied(e)) return unreadable(deniedAt);
+      return notFound(rel, e);
+    };
+
     // Each component of the folder, resolved against the names on disk (an NFD name may not
     // open by its NFC spelling), and the DirContext from the source root down to the folder's
     // parent; visit derives the folder's own.
     let ctx: DirContext = ROOT_CONTEXT;
-    let rootAbs: FsPath = mount;
+    let rootAbs: SourcePath = mount;
     let rootRaw: Buffer | null = null;
     const io: ResolveIo = { lstat: (p) => lstat(p), listDir };
     for (const [i, name] of folderComps.entries()) {
@@ -397,9 +386,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       try {
         ent = await resolveComponent(rootAbs, name, io);
       } catch (e) {
-        if (isGone(e) && !(await mountAlive())) return result('SOURCE_GONE');
-        if (isDenied(e)) return unreadable(parentRel);
-        return notFound(rel, e);
+        return componentFailed(e, parentRel, rel);
       }
       if (ent === null) return notFound(rel);
       rootRaw = rawRelPath(parentRel, rootRaw, ent);
@@ -409,9 +396,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       try {
         own = await listDir(rootAbs);
       } catch (e) {
-        if (isGone(e) && !(await mountAlive())) return result('SOURCE_GONE');
-        if (isDenied(e)) return unreadable(rel);
-        return notFound(rel, e); // nothing below an unreadable ancestor is reachable
+        return componentFailed(e, rel, rel); // nothing below an unreadable ancestor is reachable
       }
       ctx = childContext(ctx, name, own);
     }
@@ -433,7 +418,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       try {
         entries = await listDir(fr.abs);
       } catch (e) {
-        if (isGone(e) && !(await mountAlive())) return 'gone';
+        if (await unplugged(e)) return 'gone';
         // The folder's own root unreadable for a permission reason: nothing can be read.
         if (isRoot && isDenied(e)) return 'unreadable';
         if (before) return [];
@@ -493,10 +478,7 @@ export function makeScanFolder(deps: HarvestDeps) {
       { error: string } | { gone: true } | { verdict: Verdict; cand: Candidate | null } | null
     > => {
       // Names that are not candidates are dropped before the stat: a drive holds far more of them.
-      const probe = await classify({ name: e.name, size: Infinity }, dirCtx, 0, () =>
-        Promise.resolve(null),
-      );
-      if (probe.kind === 'ignored') return null;
+      if (!isJudged(e.name)) return null;
       const rel = joinRel(fr.comps, e.name);
       const abs = childPath(fr.abs, e);
       try {
@@ -521,7 +503,7 @@ export function makeScanFolder(deps: HarvestDeps) {
           },
         };
       } catch (err) {
-        if (isGone(err) && !(await mountAlive())) return { gone: true };
+        if (await unplugged(err)) return { gone: true };
         return { error: `cannot read ${rel}: ${errText(err)}` };
       }
     };

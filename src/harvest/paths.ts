@@ -51,8 +51,6 @@ export interface FsOps {
   open(path: string, flags: string, mode: number): Promise<fsp.FileHandle>;
   /** Read-only open (O_RDONLY): the only way a source file is opened. */
   openRead(path: SourcePath): Promise<fsp.FileHandle>;
-  chmod(path: string, mode: number): Promise<void>;
-  utimes(path: string, atime: number, mtime: number): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
   link(existing: string, newPath: string): Promise<void>;
@@ -88,8 +86,6 @@ export const realFsOps: FsOps = {
   mkdir: (p, o) => fsp.mkdir(p, o),
   open: (p, f, m) => fsp.open(p, f, m),
   openRead: openReadOnly,
-  chmod: (p, m) => fsp.chmod(p, m),
-  utimes: (p, a, m) => fsp.utimes(p, a, m),
   rename: (a, b) => fsp.rename(a, b),
   unlink: (p) => fsp.unlink(p),
   link: (a, b) => fsp.link(a, b),
@@ -107,11 +103,11 @@ export class GuardedFs {
 
   constructor(
     private readonly allowedRoots: string[],
-    protected readonly ops: FsOps = realFsOps,
+    private readonly ops: FsOps = realFsOps,
   ) {}
 
   /** Real path of the nearest existing ancestor + the not-yet-existing tail. */
-  protected async realTarget(path: string): Promise<string> {
+  private async realTarget(path: string): Promise<string> {
     if (path.split(/[\\/]/).includes('..')) throw new OutsideAllowedRootError(path);
     const abs = resolve(path);
     const tail: string[] = [];
@@ -138,7 +134,7 @@ export class GuardedFs {
   }
 
   /** Resolves `path` and returns it (real, tail appended) if under an allowed root. */
-  protected async check(path: string): Promise<string> {
+  private async check(path: string): Promise<string> {
     const real = await this.realTarget(path);
     for (const r of await this.rootList()) {
       if (real === r || real.startsWith(r.endsWith(sep) ? r : r + sep)) return real;
@@ -155,22 +151,6 @@ export class GuardedFs {
     return this.ops.open(await this.check(path), 'wx', 0o644);
   }
 
-  async chmod(path: string, mode: number): Promise<void> {
-    await this.ops.chmod(await this.check(path), mode);
-  }
-
-  /**
-   * Sets atime and mtime to about `mtimeNs`. Node's utimes takes double seconds, so the result
-   * can differ by < 1 µs: returns the mtime actually on disk (read back), which is what an exact
-   * `mtime_ns` join against the pipeline's `files` row needs.
-   */
-  async utimesNs(path: string, mtimeNs: bigint): Promise<bigint> {
-    const real = await this.check(path);
-    const s = Number(mtimeNs) / 1e9;
-    await this.ops.utimes(real, s, s);
-    return this.ops.mtimeNs(real);
-  }
-
   async rename(from: string, to: string): Promise<void> {
     const f = await this.check(from);
     await this.ops.rename(f, await this.check(to));
@@ -183,8 +163,8 @@ export class GuardedFs {
   /**
    * Copies `src` (opened O_RDONLY only, never written; a Buffer for on-disk name bytes) into a
    * new file `dest` (exclusive create, mode 0600, guarded) with a streamed byte copy. On the
-   * open write handle it then sets `mode` and the mtime (`mtimeNs`, about: see utimesNs) and
-   * fsyncs, so a published copy is complete on disk. `onChunk` is called with the bytes written
+   * open write handle it then sets `mode` and the mtime (`mtimeNs`; Node's utimes takes double
+   * seconds, so the result can differ by < 1 µs) and fsyncs, so a published copy is complete on disk. `onChunk` is called with the bytes written
    * so far after each 1 MiB (it may throw to abort). Returns the mtime actually on disk.
    * On failure `dest` may be left behind: the caller removes it.
    */

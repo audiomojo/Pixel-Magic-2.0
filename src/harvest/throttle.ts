@@ -1,11 +1,11 @@
 import type { HarvestDeps } from './activities.js';
 import { STALLED_REASON } from './constants.js';
 
-export type Gate = { open: true } | { open: false; reason: string; stalled: boolean };
+/** A shut gate's reason is STALLED_REASON when waiting cannot free the disk (spec §7.5). */
+export type Gate = { open: true } | { open: false; reason: string };
 
 const STALL_AFTER_MS = 10 * 60_000;
 const SENT_WINDOW_MS = 60 * 60_000;
-export { STALLED_REASON };
 
 function formatBytes(n: number): string {
   if (n < 1000) return `${n} B`;
@@ -37,9 +37,9 @@ export async function checkGate(
     if (used * 100n > BigInt(settings.maxDiskPct) * blocks) {
       const pct = ((Number(used) / Number(blocks)) * 100).toFixed(1);
       if (await isStalled(deps, runId, now)) {
-        return { open: false, reason: STALLED_REASON, stalled: true };
+        return { open: false, reason: STALLED_REASON };
       }
-      return { open: false, reason: `disk ${pct} %`, stalled: false };
+      return { open: false, reason: `disk ${pct} %` };
     }
   }
 
@@ -54,10 +54,10 @@ export async function checkGate(
   const pendingBytes = Number(rows[0]?.bytes ?? 0);
   const backlog = Math.max(pendingFiles, Number(rows[0]?.sent ?? 0));
   if (backlog >= settings.maxPendingFiles) {
-    return { open: false, reason: `backlog ${backlog.toLocaleString('en-US')}`, stalled: false };
+    return { open: false, reason: `backlog ${backlog.toLocaleString('en-US')}` };
   }
   if (settings.maxPendingBytes !== null && pendingBytes >= settings.maxPendingBytes) {
-    return { open: false, reason: `backlog ${formatBytes(pendingBytes)}`, stalled: false };
+    return { open: false, reason: `backlog ${formatBytes(pendingBytes)}` };
   }
   return { open: true };
 }

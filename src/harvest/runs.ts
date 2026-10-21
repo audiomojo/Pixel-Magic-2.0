@@ -159,14 +159,16 @@ export async function setFolderState(
 
 export type RunState =
   'queued' | 'scanning' | 'sending' | 'paused' | 'done' | 'cancelled' | 'failed';
+/** SQL list of the states of the active run (at most one at a time). */
+export const ACTIVE_STATES_SQL = "('scanning', 'sending', 'paused')";
 
 /**
  * Reason class: the word before the first space; `stalled…` belongs to the disk class (a disk
  * pause that waited long enough to be called stalled is still the same pause).
  */
-const REASON_CLASS = `CASE WHEN split_part(%s, ' ', 1) IN ('stalled', 'stalled:') THEN 'disk'
-                           ELSE split_part(%s, ' ', 1) END`;
-const reasonClass = (expr: string) => REASON_CLASS.replaceAll('%s', expr);
+const reasonClass = (expr: string) =>
+  `CASE WHEN split_part(${expr}, ' ', 1) IN ('stalled', 'stalled:') THEN 'disk'
+        ELSE split_part(${expr}, ' ', 1) END`;
 
 /**
  * Sets a run's state and pause reason. `paused_since` is kept while the new reason is in the
@@ -236,7 +238,7 @@ export async function finishRunRows(
   });
 }
 
-/** What the workflow needs to plan a run: the dry-run flag and its folders in order. */
+/** What the workflow needs to plan a run: the dry-run and send-only flags and its folders in order. */
 export async function loadRun(
   pool: pg.Pool,
   runId: string,
@@ -254,7 +256,7 @@ export async function loadRun(
 }
 
 /** The error a run gets when its workflow ended without finishing the run row. */
-export const WORKFLOW_CLOSED = 'workflow closed unexpectedly';
+const WORKFLOW_CLOSED = 'workflow closed unexpectedly';
 
 /**
  * Starts the oldest queued run unless one is already active (scanning, sending or paused).
@@ -271,7 +273,7 @@ export async function startNextQueued(pool: pg.Pool, control: RunControl): Promi
     const pick = await withTx(pool, async (c) => {
       await c.query("SELECT pg_advisory_xact_lock(hashtext('harvest_start_next'))");
       const active = await c.query<{ id: string }>(
-        `SELECT id::text AS id FROM harvest_runs WHERE state IN ('scanning', 'sending', 'paused')
+        `SELECT id::text AS id FROM harvest_runs WHERE state IN ${ACTIVE_STATES_SQL}
          ORDER BY id LIMIT 1`,
       );
       if (active.rows[0]) return { id: active.rows[0].id, active: true };

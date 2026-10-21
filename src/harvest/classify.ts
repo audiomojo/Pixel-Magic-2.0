@@ -135,6 +135,18 @@ export function childContext(
   };
 }
 
+/** Whether classify judges a file of this name at all: anything else is `ignored`. */
+export function isJudged(name: string): boolean {
+  const ext = extOf(name);
+  return (
+    SYSTEM_FILES.has(name.toLowerCase()) ||
+    RAW_EXTS.has(ext) ||
+    TAGGED_EXTS.has(ext) ||
+    FOLDER_ONLY_EXTS.has(ext) ||
+    MAYBE_EXTS.has(ext)
+  );
+}
+
 /**
  * Classify one regular file by the spec §6.3 rules, in order. Only candidate extensions
  * are judged; anything else is `ignored` without a count. `readMake` runs for rule 8 only.
@@ -152,7 +164,7 @@ export async function classify(
   const raw = RAW_EXTS.has(ext);
   const tagged = TAGGED_EXTS.has(ext);
   const bmp = FOLDER_ONLY_EXTS.has(ext);
-  if (!raw && !tagged && !bmp && !MAYBE_EXTS.has(ext)) return { kind: 'ignored' };
+  if (!isJudged(f.name)) return { kind: 'ignored' };
 
   if (f.name.startsWith('._')) return { kind: 'junk', reason: 'appledouble' };
   if (f.size < minSize) return { kind: 'junk', reason: 'too-small' };

@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type pg from 'pg';
+import { withTx } from '../db.js';
 import { sha256File } from '../fsops.js';
 import { openReadOnly, readFsOps, sameMtime, sourcePath, type SourcePath } from './paths.js';
 import { folderOf, loadScope, type SendScope } from './runs.js';
 
 /** The head hash covers the first 64 KiB; a file no larger has the whole file as its head. */
-export const HEAD_BYTES = 64 * 1024;
+const HEAD_BYTES = 64 * 1024;
 
 export type KnownOutcome =
   | { state: 'KNOWN'; sha256: string }
@@ -168,6 +169,55 @@ export async function checkKnown(
     return cur.head;
   };
 
+  /**
+   * Whether candidate `c` holds this item's bytes. Compares stored full hashes when both
+   * exist; otherwise heads first, and full hashes only where heads collide. Errors reading
+   * this item propagate; an unreadable candidate just does not match (the item is then sent),
+   * and nothing is stored for it.
+   */
+  const sameBytes = async (c: Candidate): Promise<boolean> => {
+    let theirSha = c.sha256;
+    let theirHead = c.head_hash;
+    if (cur.sha !== null && theirSha !== null) return cur.sha === theirSha;
+
+    if (small) theirHead ??= theirSha;
+    // Their full hash but no head (a linked SENT item): our full hash decides, no read of theirs.
+    if (theirHead === null && theirSha !== null) return (await ensureSha()) === theirSha;
+    const myHead = await ensureHead();
+    let resolved: SourcePath | null | undefined;
+    const pathOnce = async () =>
+      resolved === undefined ? (resolved = await candidatePath(c, item.sizeBytes, opts)) : resolved;
+    if (theirHead === null) {
+      const path = await pathOnce();
+      if (path === null) return false;
+      try {
+        if (small) {
+          theirSha = await fullHash(path);
+          theirHead = theirSha;
+          await store(pool, c.id, theirSha, theirHead);
+        } else {
+          theirHead = await headOf(path, item.sizeBytes);
+          await store(pool, c.id, null, theirHead);
+        }
+      } catch {
+        return false;
+      }
+    }
+    if (myHead !== theirHead) return false;
+    const mine = await ensureSha();
+    if (theirSha === null) {
+      const path = await pathOnce();
+      if (path === null) return false;
+      try {
+        theirSha = await fullHash(path);
+        await store(pool, c.id, theirSha, null);
+      } catch {
+        return false;
+      }
+    }
+    return mine === theirSha;
+  };
+
   try {
     // 1. A vault content with this size and sha.
     const sized = await pool.query('SELECT 1 FROM contents WHERE size_bytes = $1 LIMIT 1', [
@@ -201,10 +251,10 @@ export async function checkKnown(
     if (item.runId !== null && rows.some((c) => c.state === 'PLANNED')) {
       scope = await loadScope(pool, item.runId);
     }
-    const myPos = scope && folderOf(scope, item.sourceId, item.pathKey);
+    const myPos = scope ? folderOf(scope, item.sourceId, item.pathKey) : null;
     const qualifies = (c: Candidate): boolean => {
       if (c.state === 'SENT') return true;
-      if (scope === null || myPos === null || myPos === undefined) return false;
+      if (scope === null || myPos === null) return false;
       if (scope.sendOnly && !c.in_run) return false;
       const pos = folderOf(scope, c.source_id, c.path_key);
       if (pos === null) return false;
@@ -217,20 +267,8 @@ export async function checkKnown(
       .filter(qualifies)
       .sort((a, b) => cmp(order(a.kind, a.id), order(b.kind, b.id)));
 
-    const readable = (c: Candidate) => candidatePath(c, item.sizeBytes, opts);
     for (const c of candidates) {
-      if (
-        await sameBytes(pool, c, item.sizeBytes, {
-          cur,
-          ensureHead,
-          ensureSha,
-          theirs: fullHash,
-          path: readable,
-        })
-      ) {
-        const s = cur.sha!;
-        return { state: 'DUP', sha256: s, duplicateOf: c.id };
-      }
+      if (await sameBytes(c)) return { state: 'DUP', sha256: cur.sha!, duplicateOf: c.id };
     }
   } catch (e) {
     await pool.query('UPDATE harvest_items SET last_error = $2 WHERE id = $1', [
@@ -276,74 +314,12 @@ async function candidatePath(
 }
 
 /**
- * Whether candidate `c` holds this item's bytes. Compares stored full hashes when both
- * exist; otherwise heads first, and full hashes only where heads collide. Errors reading
- * this item propagate; an unreadable candidate just does not match (the item is then sent),
- * and nothing is stored for it.
- */
-async function sameBytes(
-  pool: pg.Pool,
-  c: Candidate,
-  size: bigint,
-  me: {
-    cur: { sha: string | null; head: string | null };
-    ensureHead: () => Promise<string>;
-    ensureSha: () => Promise<string>;
-    theirs: (path: SourcePath) => Promise<string>;
-    path: (c: Candidate) => Promise<SourcePath | null>;
-  },
-): Promise<boolean> {
-  const small = size <= BigInt(HEAD_BYTES);
-  let theirSha = c.sha256;
-  let theirHead = c.head_hash;
-  if (me.cur.sha !== null && theirSha !== null) return me.cur.sha === theirSha;
-
-  if (small) theirHead ??= theirSha;
-  // Their full hash but no head (a linked SENT item): our full hash decides, no read of theirs.
-  if (theirHead === null && theirSha !== null) return (await me.ensureSha()) === theirSha;
-  const myHead = await me.ensureHead();
-  let resolved: SourcePath | null | undefined;
-  const pathOnce = async () => (resolved === undefined ? (resolved = await me.path(c)) : resolved);
-  if (theirHead === null) {
-    const path = await pathOnce();
-    if (path === null) return false;
-    try {
-      if (small) {
-        theirSha = await me.theirs(path);
-        theirHead = theirSha;
-        await store(pool, c.id, theirSha, theirHead);
-      } else {
-        theirHead = await headOf(path, size);
-        await store(pool, c.id, null, theirHead);
-      }
-    } catch {
-      return false;
-    }
-  }
-  if (myHead !== theirHead) return false;
-  const mine = await me.ensureSha();
-  if (theirSha === null) {
-    const path = await pathOnce();
-    if (path === null) return false;
-    try {
-      theirSha = await me.theirs(path);
-      await store(pool, c.id, theirSha, null);
-    } catch {
-      return false;
-    }
-  }
-  return mine === theirSha;
-}
-
-/**
  * Lost winner (spec §7.4): the item `lostItemId` ended FAILED or VANISHED. Of the DUP items
  * pointing at it, the earliest (photo first, then id) becomes PLANNED, and the others point at
  * it. One transaction; returns the number of items promoted or repointed.
  */
 export async function promoteDuplicates(pool: pg.Pool, lostItemId: string): Promise<number> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  return withTx(pool, async (client) => {
     const { rows } = await client.query<{ id: string }>(
       `SELECT id::text AS id FROM harvest_items
        WHERE duplicate_of = $1 AND state = 'DUP'
@@ -365,12 +341,6 @@ export async function promoteDuplicates(pool: pg.Pool, lostItemId: string): Prom
         );
       }
     }
-    await client.query('COMMIT');
     return rows.length;
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
+  });
 }

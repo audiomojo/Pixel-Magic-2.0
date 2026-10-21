@@ -14,7 +14,7 @@ import {
   type SourcePath,
 } from './paths.js';
 import { finishRunRows, loadScope, setFolderState, underKey, type SendScope } from './runs.js';
-import { resolveMount } from './sources.js';
+import { liveMount, type LiveMount } from './sources.js';
 import { checkGate } from './throttle.js';
 
 /** Where the send pass stands: the run folder (index in position order) and the last item. */
@@ -52,8 +52,8 @@ export interface SendBatchResult {
   consecutive: number;
 }
 
-export const SEND_BATCH = 500;
-export const MAX_CONSECUTIVE_ERRORS = 25;
+const SEND_BATCH = 500;
+const MAX_CONSECUTIVE_ERRORS = 25;
 /** The pipeline's empty-folder cleanup may remove a parent between mkdir and open. */
 const MKDIR_RETRIES = 3;
 /** Publishing found the name taken (a race): choose another name, at most this often. */
@@ -116,16 +116,7 @@ type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
  * `transient`: a flaky-share error that cost no attempt.
  */
 type ItemOutcome =
-  | 'sent'
-  | 'known'
-  | 'dup'
-  | 'vanished'
-  | 'failed'
-  | 'error'
-  | 'capped'
-  | 'transient'
-  | 'skipped'
-  | Stop;
+  'sent' | 'known' | 'dup' | 'vanished' | 'error' | 'capped' | 'transient' | 'skipped' | Stop;
 
 /**
  * One page of a run folder's PLANNED items (spec §7.3) in send order, after `after` (keyset).
@@ -278,7 +269,6 @@ export function makeSendBatch(deps: HarvestDeps) {
     const gfs = new GuardedFs([join(layout.dropzone, 'harvest')], deps.fsOps);
     const dz = layout.dropzone;
     const res = { sent: 0, known: 0, dups: 0, failed: 0 };
-    const counts = () => ({ sent: res.sent, known: res.known, dups: res.dups, failed: res.failed });
 
     const checkpoint = async (name: string): Promise<void> => {
       try {
@@ -300,28 +290,12 @@ export function makeSendBatch(deps: HarvestDeps) {
         throw e;
       });
 
-    // Mounts are resolved once per batch, with the root's device id (an unplugged drive can
-    // leave a plain directory at its mount point: "exists" is not "still mounted").
-    const mounts = new Map<string, { path: string; dev: bigint } | null>();
-    const mountOf = async (sourceId: string) => {
-      if (!mounts.has(sourceId)) {
-        const p = await resolveMount(pool, deps.sys, sourceId, settings.dataDir, deps.detectOpts);
-        const dev =
-          p === null
-            ? null
-            : await ops.stat(p).then(
-                (s) => s.dev,
-                () => null,
-              );
-        mounts.set(sourceId, p !== null && dev !== null ? { path: p, dev } : null);
-      }
+    // Mounts are resolved once per batch (see liveMount: "exists" is not "still mounted").
+    const mounts = new Map<string, LiveMount | null>();
+    const mountOf = async (sourceId: string): Promise<LiveMount | null> => {
+      if (!mounts.has(sourceId)) mounts.set(sourceId, await liveMount(deps, sourceId, ops.stat));
       return mounts.get(sourceId)!;
     };
-    const alive = (m: { path: string; dev: bigint }): Promise<boolean> =>
-      ops.stat(m.path).then(
-        (s) => s.dev === m.dev,
-        () => false,
-      );
 
     const vanish = async (it: Item, why: string): Promise<'vanished'> => {
       const r = await pool.query(
@@ -418,7 +392,7 @@ export function makeSendBatch(deps: HarvestDeps) {
           bytes - lastBytes >= COPY_HEARTBEAT_BYTES ||
           Date.now() - lastBeat >= COPY_HEARTBEAT_MS
         ) {
-          ctx.heartbeat({ ...counts(), ...detail, ...(bytes ? { copying: bytes } : {}) });
+          ctx.heartbeat({ ...res, ...detail, ...(bytes ? { copying: bytes } : {}) });
           lastBeat = Date.now();
           lastBytes = bytes;
         }
@@ -583,7 +557,7 @@ export function makeSendBatch(deps: HarvestDeps) {
         if (e instanceof Crash || signal.aborted) throw e;
         if (DISK_FULL_CODES.has(code(e))) return { stop: 'DISK_FULL', reason: 'disk full' };
         // Whatever errno a dying mount produces, an unplug never costs the item an attempt.
-        if (!(await alive(mount))) return { stop: 'SOURCE_GONE', reason: `${it.label} unplugged` };
+        if (!(await mount.alive())) return { stop: 'SOURCE_GONE', reason: `${it.label} unplugged` };
         if (code(e) === 'ENOENT' && (await statOrNull(src)) === null) {
           return vanish(it, 'gone from the source');
         }
@@ -592,22 +566,8 @@ export function makeSendBatch(deps: HarvestDeps) {
       }
     };
 
-    // The gate first (cheap): a shut gate never pages the items, however often it is retried.
-    const gate = await checkGate(deps, runId, 0n);
-    if (!gate.open) {
-      return {
-        ...res,
-        outcome: 'GATED',
-        reason: gate.reason,
-        cursor: state.cursor ?? null,
-        consecutive: state.consecutive ?? 0,
-      };
-    }
     let consecutive = state.consecutive ?? 0;
     let cursor: SendCursor | null = state.cursor ?? null;
-    const scope = await loadScope(pool, runId);
-    const limit = deps.sendBatchSize ?? SEND_BATCH;
-    const batch = await nextItems(pool, scope, cursor, limit);
     const stopped = (outcome: SendBatchResult['outcome'], reason: string): SendBatchResult => ({
       ...res,
       outcome,
@@ -615,6 +575,12 @@ export function makeSendBatch(deps: HarvestDeps) {
       cursor,
       consecutive,
     });
+    // The gate first (cheap): a shut gate never pages the items, however often it is retried.
+    const gate = await checkGate(deps, runId, 0n);
+    if (!gate.open) return stopped('GATED', gate.reason);
+    const scope = await loadScope(pool, runId);
+    const limit = deps.sendBatchSize ?? SEND_BATCH;
+    const batch = await nextItems(pool, scope, cursor, limit);
     // Run folder states (spec §9): the folder being sent is `sending`, one whose drive is gone
     // `waiting_source`, every other `done` once its turn has passed.
     const scanning = state.whileScanning === true;
@@ -652,10 +618,10 @@ export function makeSendBatch(deps: HarvestDeps) {
       if (out === 'sent') res.sent++;
       else if (out === 'known') res.known++;
       else if (out === 'dup') res.dups++;
-      else if (out === 'failed' || out === 'capped') res.failed++;
+      else if (out === 'capped') res.failed++;
       consecutive =
         out === 'error' || out === 'capped' || out === 'transient' ? consecutive + 1 : 0;
-      ctx.heartbeat({ ...counts(), item: it.rel_path });
+      ctx.heartbeat({ ...res, item: it.rel_path });
       if (consecutive >= MAX_CONSECUTIVE_ERRORS) return stopped('PAUSED_ERRORS', lastError);
     }
     // A full batch: more may follow the cursor. Otherwise the pass is over; items left PLANNED

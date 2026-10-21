@@ -12,10 +12,10 @@ import {
   type RunState,
 } from './runs.js';
 import { makeScanFolder } from './scan.js';
-import { linkFiles, makeFinishRun, makeSendBatch } from './send.js';
+import { makeFinishRun, makeSendBatch } from './send.js';
 import type { DetectOptions, SystemProbe } from './sources.js';
 
-/** Starts, signals and cancels harvest workflows (implemented by Task 8). */
+/** Starts, signals and cancels harvest workflows. */
 export interface RunControl {
   /**
    * Starts the run's workflow. `running`: it already runs (a duplicate start); `closed`: a
@@ -56,7 +56,6 @@ export function createHarvestActivities(deps: HarvestDeps) {
     scanFolder: makeScanFolder(deps),
     sendBatch: makeSendBatch(deps),
     finishRun: makeFinishRun(deps),
-    linkFiles: (): Promise<number> => linkFiles(deps.pool),
     setRunState: (runId: string, state: RunState, reason?: string | null): Promise<void> =>
       setRunState(deps.pool, runId, state, reason ?? null),
     loadRun: (runId: string) => loadRun(deps.pool, runId),

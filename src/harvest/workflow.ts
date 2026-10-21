@@ -36,23 +36,18 @@ const TRANSIENT_RETRY: RetryPolicy = {
   maximumInterval: '5m',
 };
 
-export const HARVEST_ACTIVITY_OPTIONS = {
-  scanFolder: {
-    taskQueue: 'harvest',
-    startToCloseTimeout: '24h',
-    heartbeatTimeout: '2m',
-    // The run must not be finished (and the next started) while the activity is still working.
-    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
-    retry: TRANSIENT_RETRY,
-  },
-  sendBatch: {
-    taskQueue: 'harvest',
-    startToCloseTimeout: '2h',
-    heartbeatTimeout: '2m',
-    // The run must not be finished (and the next started) while the activity is still working.
-    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
-    retry: TRANSIENT_RETRY,
-  },
+/** scanFolder and sendBatch: long, heartbeating activities. */
+const LONG_ACTIVITY = {
+  taskQueue: 'harvest',
+  heartbeatTimeout: '2m',
+  // The run must not be finished (and the next started) while the activity is still working.
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+  retry: TRANSIENT_RETRY,
+};
+
+const HARVEST_ACTIVITY_OPTIONS = {
+  scanFolder: { ...LONG_ACTIVITY, startToCloseTimeout: '24h' },
+  sendBatch: { ...LONG_ACTIVITY, startToCloseTimeout: '2h' },
   other: { taskQueue: 'harvest', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
 } satisfies Record<string, ActivityOptions>;
 
@@ -63,7 +58,7 @@ const { loadRun, setRunState, setFolderState, finishRun, startNextQueued } = pro
   Pick<A, 'loadRun' | 'setRunState' | 'setFolderState' | 'finishRun' | 'startNextQueued'>
 >(HARVEST_ACTIVITY_OPTIONS.other);
 
-export const BATCHES_PER_RUN = 50;
+const BATCHES_PER_RUN = 50;
 /** Safety net: long stalls add timer events; restart well before the history limit. */
 const MAX_HISTORY = 10_000;
 const GATE_RECHECK = '30s';
@@ -72,9 +67,21 @@ const SOURCE_RECHECK = '60s';
 /** While the scan runs: the wait before another send pass over what the scan has added. */
 const EARLY_PASS_WAIT = '30s';
 /** Marks histories that send while scanning (older ones replay the scan-then-send order). */
-export const SEND_WHILE_SCANNING = 'send-while-scanning';
+const SEND_WHILE_SCANNING = 'send-while-scanning';
 /** Shown at once when a pause arrives during a scan step (it takes effect after the step). */
-export const PAUSE_REQUESTED = 'pause requested — after the current folder step';
+const PAUSE_REQUESTED = 'pause requested — after the current folder step';
+
+/** The wait before rechecking a shut gate: longer once waiting cannot free the disk. */
+const gateRecheck = (reason?: string): string =>
+  reason === STALLED_REASON ? STALL_RECHECK : GATE_RECHECK;
+
+/** The wait after a send pass during the scan; undefined: until the scan ends (disk, errors). */
+function earlyPassWait(res: SendBatchResult): string | undefined {
+  if (res.outcome === 'DONE') return EARLY_PASS_WAIT;
+  if (res.outcome === 'GATED') return gateRecheck(res.reason);
+  if (res.outcome === 'SOURCE_GONE') return SOURCE_RECHECK;
+  return undefined;
+}
 
 export interface HarvestInput {
   runId: string;
@@ -92,6 +99,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
   const maxHistory = input.maxHistory ?? MAX_HISTORY;
   /** Carried into the next execution (only set when not the default). */
   const carry = input.maxHistory === undefined ? {} : { maxHistory };
+  const historyFull = (): boolean => workflowInfo().historyLength > maxHistory;
   let phase: 'scan' | 'send' | 'done' = input.phase ?? 'scan';
   let paused = false;
   let resumes = 0;
@@ -180,7 +188,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
       for (;;) {
         await userPause('scanning');
         // A long unplug retries every 60 s (~11 events each): restart before the history limit.
-        if (canRequested || workflowInfo().historyLength > maxHistory) {
+        if (canRequested || historyFull()) {
           canRequested = true;
           return 'can';
         }
@@ -214,7 +222,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     while (!stop()) {
       await userPause('scanning');
       if (stop()) break;
-      if (workflowInfo().historyLength > maxHistory) {
+      if (historyFull()) {
         canRequested = true;
         break;
       }
@@ -226,16 +234,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
       cursor = res.cursor;
       consecutive = res.consecutive;
       if (res.outcome === 'MORE') continue;
-      const wait =
-        res.outcome === 'DONE'
-          ? EARLY_PASS_WAIT
-          : res.outcome === 'GATED'
-            ? res.reason === STALLED_REASON
-              ? STALL_RECHECK
-              : GATE_RECHECK
-            : res.outcome === 'SOURCE_GONE'
-              ? SOURCE_RECHECK
-              : undefined;
+      const wait = earlyPassWait(res);
       if (wait === undefined) await condition(stop);
       else await condition(stop, wait);
     }
@@ -292,7 +291,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     await show('sending');
     for (;;) {
       await userPause('sending');
-      if (batches >= BATCHES_PER_RUN || workflowInfo().historyLength > maxHistory) {
+      if (batches >= BATCHES_PER_RUN || historyFull()) {
         return await continueAsNew<typeof HarvestWorkflow>({
           runId,
           phase: 'send',
@@ -323,7 +322,7 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
           await waitPaused(
             'sending',
             res.reason ?? 'waiting for the pipeline',
-            res.reason === STALLED_REASON ? STALL_RECHECK : GATE_RECHECK,
+            gateRecheck(res.reason),
           );
           break;
         case 'SOURCE_GONE':

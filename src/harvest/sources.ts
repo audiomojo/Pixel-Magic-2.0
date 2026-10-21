@@ -51,7 +51,7 @@ export interface DetectedSource {
 const NETWORK_FS = new Set(['smbfs', 'afpfs', 'nfs', 'webdav']);
 const RESERVED_LABELS = new Set(['harvest', '.copies', '_logs']);
 
-export function isReservedLabel(label: string): boolean {
+function isReservedLabel(label: string): boolean {
   return RESERVED_LABELS.has(label) || label.startsWith('.');
 }
 
@@ -347,4 +347,43 @@ export async function resolveMount(
     d.probeFailed ? d.mountPath === row.last_mount_path : d.identity === row.identity,
   );
   return hit?.mountPath ?? null;
+}
+
+/** A mounted source's path, and whether it is still the drive that was mounted at the start. */
+export interface LiveMount {
+  path: string;
+  alive(): Promise<boolean>;
+}
+
+/**
+ * The source's mount with its root's device id, or null when it is not mounted (or its root
+ * cannot be read). An unplugged drive can leave a plain directory at its mount point, so
+ * "exists" is not "still mounted": `alive()` compares the device id again.
+ */
+export async function liveMount(
+  deps: {
+    pool: pg.Pool;
+    sys: SystemProbe;
+    settings: { dataDir: string };
+    detectOpts?: DetectOptions;
+  },
+  sourceId: string,
+  stat: (p: string) => Promise<{ dev: bigint }> = (p) => fsp.lstat(p, { bigint: true }),
+): Promise<LiveMount | null> {
+  const path = await resolveMount(
+    deps.pool,
+    deps.sys,
+    sourceId,
+    deps.settings.dataDir,
+    deps.detectOpts,
+  );
+  if (path === null) return null;
+  const devOf = (): Promise<bigint | null> =>
+    stat(path).then(
+      (s) => s.dev,
+      () => null,
+    );
+  const dev = await devOf();
+  if (dev === null) return null;
+  return { path, alive: async () => (await devOf()) === dev };
 }

@@ -19,7 +19,12 @@ import { loadHarvestSettings } from '../../src/harvest/config.js';
 import { checkKnown } from '../../src/harvest/known.js';
 import { realFsOps, type FsOps } from '../../src/harvest/paths.js';
 import { createRun, loadScope, runFolders, setRunState } from '../../src/harvest/runs.js';
-import { pageQuery, type SendBatchResult, type SendState } from '../../src/harvest/send.js';
+import {
+  linkFiles,
+  pageQuery,
+  type SendBatchResult,
+  type SendState,
+} from '../../src/harvest/send.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { DataLayout } from '../../src/fsops.js';
 import { runActivity } from '../helpers/activityEnv.js';
@@ -61,8 +66,6 @@ function recording(base: FsOps = realFsOps): { ops: FsOps; calls: Call[] } {
     mkdir: (p, o) => (calls.push({ op: 'mkdir', paths: [p] }), base.mkdir(p, o)),
     open: (p, f, m) => (calls.push({ op: 'open', paths: [p], arg: f }), base.open(p, f, m)),
     openRead: (p) => (calls.push({ op: 'openRead', paths: [String(p)] }), base.openRead(p)),
-    chmod: (p, m) => (calls.push({ op: 'chmod', paths: [p] }), base.chmod(p, m)),
-    utimes: (p, a, m) => (calls.push({ op: 'utimes', paths: [p] }), base.utimes(p, a, m)),
     rename: (a, b) => (calls.push({ op: 'rename', paths: [a, b] }), base.rename(a, b)),
     unlink: (p) => (calls.push({ op: 'unlink', paths: [p] }), base.unlink(p)),
     link: (a, b) => (calls.push({ op: 'link', paths: [a, b] }), base.link(a, b)),
@@ -459,8 +462,7 @@ describe('crash recovery', () => {
     expect(rec.calls.filter((c) => ['open', 'openRead'].includes(c.op))).toEqual([]);
     expect((await item('DCIM/a.cr2')).state).toBe('SENT');
     expect(await listDz(e.dz)).toEqual([]);
-    const { linkFiles } = createHarvestActivities(e.deps);
-    expect(await runActivity(linkFiles, [])).toBe(1);
+    expect(await linkFiles(e.deps.pool)).toBe(1);
     expect((await item('DCIM/a.cr2')).file_id).toBe(rows[0]!.id);
   });
 
@@ -1302,11 +1304,11 @@ describe('finishRun, linkFiles, setRunState', () => {
         (BigInt(b.dropzone_mtime_ns!) + 1n).toString(),
       ],
     );
-    const { finishRun, linkFiles } = createHarvestActivities(e.deps);
+    const { finishRun } = createHarvestActivities(e.deps);
     await runActivity(finishRun, [e.runId, 'done']);
     expect((await item('DCIM/a.cr2')).file_id).toBe(rows[0]!.id);
     expect((await item('DCIM/b.cr2')).file_id).toBeNull();
-    expect(await runActivity(linkFiles, [])).toBe(0);
+    expect(await linkFiles(e.deps.pool)).toBe(0);
     const f = await pgh.pool.query<{
       last_harvested_at: Date | null;
       last_run_id: string;

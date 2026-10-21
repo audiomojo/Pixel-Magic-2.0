@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 import { loadHarvestSettings } from '../../src/harvest/config.js';
 import { createRun } from '../../src/harvest/runs.js';
 import { registerSources } from '../../src/harvest/sources.js';
+import { STALLED_REASON } from '../../src/harvest/constants.js';
 import { checkGate } from '../../src/harvest/throttle.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
@@ -59,7 +60,7 @@ describe('disk', () => {
 
   test('a file that tips 79 % over 80 % shuts the gate', async () => {
     const g = await checkGate(deps(790n), await newRun(), 14n, NOW);
-    expect(g).toEqual({ open: false, reason: 'disk 80.4 %', stalled: false });
+    expect(g).toEqual({ open: false, reason: 'disk 80.4 %' });
   });
 
   test('exactly at the limit is open; the file size rounds up to blocks', async () => {
@@ -81,7 +82,6 @@ describe('backlog', () => {
     expect(await checkGate(deps(0n), await newRun(), 1n, NOW)).toEqual({
       open: false,
       reason: 'backlog 20,000',
-      stalled: false,
     });
   });
 
@@ -116,7 +116,6 @@ describe('backlog', () => {
     expect(await checkGate(d, await newRun(), 1n, NOW)).toEqual({
       open: false,
       reason: 'backlog 1.2 GB',
-      stalled: false,
     });
   });
 
@@ -140,18 +139,19 @@ describe('backlog', () => {
 
 describe('stall', () => {
   const shut = () => deps(900n);
+  const STALLED = { open: false, reason: STALLED_REASON };
 
   test('not stalled when the run has not been paused for the disk', async () => {
     const run = await newRun();
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
     await pause(run, 'paused by you', minutesAgo(60));
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
   });
 
   test('not stalled before 10 minutes', async () => {
     const run = await newRun();
     await pause(run, 'disk 90.1 %', minutesAgo(9));
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
   });
 
   test('stalled after 10 minutes with nothing in flight', async () => {
@@ -159,11 +159,10 @@ describe('stall', () => {
     await pause(run, 'disk 90.1 %', minutesAgo(10));
     expect(await checkGate(shut(), run, 1n, NOW)).toEqual({
       open: false,
-      reason: 'stalled: the vault is filling the disk',
-      stalled: true,
+      reason: STALLED_REASON,
     });
     await pause(run, 'stalled: the vault is filling the disk', minutesAgo(30));
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: true });
+    expect(await checkGate(shut(), run, 1n, NOW)).toEqual(STALLED);
   });
 
   test('a paused_reason with no paused_since is not stalled', async () => {
@@ -171,14 +170,14 @@ describe('stall', () => {
     await pgh.pool.query("UPDATE harvest_runs SET paused_reason = 'disk 90.1 %' WHERE id = $1", [
       run,
     ]);
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
   });
 
   test('a backlog reason is never stalled', async () => {
     const run = await newRun();
     await pause(run, 'backlog 20,000', minutesAgo(60));
     await setPending(20000);
-    expect(await checkGate(deps(0n), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(deps(0n), run, 1n, NOW)).not.toEqual(STALLED);
   });
 
   const addFile = (state: string, extra = '') =>
@@ -197,7 +196,7 @@ describe('stall', () => {
     const run = await newRun();
     await pause(run, 'disk 90.1 %', minutesAgo(60));
     await arrange();
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
   });
 
   test('reclaimed or mismatched COPY rows do not prevent the stall', async () => {
@@ -209,7 +208,7 @@ describe('stall', () => {
     );
     await pgh.pool.query("UPDATE files SET copy_mismatch = true WHERE rel_path = 'm'");
     await addFile('INGESTED');
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: true });
+    expect(await checkGate(shut(), run, 1n, NOW)).toEqual(STALLED);
   });
 
   test('harvester files still on their way prevent the stall', async () => {
@@ -221,7 +220,7 @@ describe('stall', () => {
        VALUES ($1, 'f', 'f', 10, 1, 'photo', 'SENT', $2)`,
       [rows[0]!.id, minutesAgo(1)],
     );
-    expect(await checkGate(shut(), run, 1n, NOW)).toMatchObject({ stalled: false });
+    expect(await checkGate(shut(), run, 1n, NOW)).not.toEqual(STALLED);
   });
 });
 

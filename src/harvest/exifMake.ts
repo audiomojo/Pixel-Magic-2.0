@@ -2,7 +2,7 @@
 
 import { openReadOnly, type SourcePath } from './paths.js';
 
-export const EXIF_READ_LIMIT = 256 * 1024;
+const EXIF_READ_LIMIT = 256 * 1024;
 const HEIC_EXIF_LIMIT = 64 * 1024;
 const TIFF_IFD_LIMIT = 64 * 1024; // a TIFF IFD0 stored past the first read
 const TIFF_VALUE_LIMIT = 4 * 1024; // a Make value outside that IFD chunk
@@ -10,7 +10,6 @@ const TAG_MAKE = 0x010f;
 const TYPE_ASCII = 2;
 
 type ReadAt = (offset: number, length: number) => Promise<Buffer>;
-type Fetch = (offset: number, length: number) => Promise<Buffer>;
 
 /** Thrown by the parsers for any structurally bad input; parseMake turns it into null. */
 class Malformed extends Error {}
@@ -29,7 +28,7 @@ function uintBE(data: Buffer, pos: number, size: number): number {
 }
 
 /** The stripped IFD0 Make from a TIFF stream, or null. `data` holds the start of the stream. */
-async function tiffMake(data: Buffer, fetch?: Fetch): Promise<string | null> {
+async function tiffMake(data: Buffer, fetch?: ReadAt): Promise<string | null> {
   if (data.length < 8) return null;
   const tag = data.toString('latin1', 0, 2);
   if (tag !== 'II' && tag !== 'MM') return null;
@@ -180,14 +179,14 @@ function heicExifLocation(data: Buffer): { offset: number; length: number } | nu
   let pos = start + 6;
   const idSize = version < 2 ? 2 : 4;
   if (pos + idSize > end) return null;
-  let count = uintBE4(data, pos, idSize);
+  let count = ilocUint(data, pos, idSize);
   pos += idSize;
   const per = indexSize + offsetSize + lengthSize; // bytes per extent
   const minItem = idSize + (version === 1 || version === 2 ? 2 : 0) + 2 + baseOffsetSize + 2;
   count = Math.min(count, Math.floor((end - pos) / minItem));
   for (let n = 0; n < count; n++) {
     if (pos + idSize > end) return null;
-    const itemId = uintBE4(data, pos, idSize);
+    const itemId = ilocUint(data, pos, idSize);
     pos += idSize;
     let method = 0;
     if (version === 1 || version === 2) {
@@ -223,7 +222,7 @@ function heicExifLocation(data: Buffer): { offset: number; length: number } | nu
 }
 
 /** An unsigned big-endian integer of 2 or 4 bytes (the iloc id/count fields). */
-function uintBE4(data: Buffer, pos: number, size: number): number {
+function ilocUint(data: Buffer, pos: number, size: number): number {
   if (pos + size > data.length) return fail();
   return size === 2 ? data.readUInt16BE(pos) : data.readUInt32BE(pos);
 }
@@ -239,7 +238,7 @@ export async function parseMake(
   fileSize: number,
   readAt: ReadAt,
 ): Promise<string | null> {
-  const fetch: Fetch = async (offset, length) =>
+  const fetch: ReadAt = async (offset, length) =>
     offset >= fileSize ? Buffer.alloc(0) : readAt(offset, length);
   try {
     if (head.length >= 2 && head[0] === 0xff && head[1] === 0xd8) return await jpegMake(head);

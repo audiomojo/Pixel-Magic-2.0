@@ -75,8 +75,6 @@ test('refuses sibling, .. escape and symlink escape', async () => {
     OutsideAllowedRootError,
   );
   await expect(g.unlink(join(outside, 'f'))).rejects.toBeInstanceOf(OutsideAllowedRootError);
-  await expect(g.chmod(join(outside, 'f'), 0o444)).rejects.toBeInstanceOf(OutsideAllowedRootError);
-  await expect(g.utimesNs(join(outside, 'f'), 1n)).rejects.toBeInstanceOf(OutsideAllowedRootError);
   await expect(g.rename(join(root, 'a'), join(outside, 'a'))).rejects.toBeInstanceOf(
     OutsideAllowedRootError,
   );
@@ -85,18 +83,12 @@ test('refuses sibling, .. escape and symlink escape', async () => {
   );
   expect(existsSync(join(outside, 'x'))).toBe(false);
 });
-test('allows nested new dirs, write, chmod, utimes, rename, unlink, exists', async () => {
+test('allows nested new dirs, write, rename, unlink, exists', async () => {
   const d = join(root, 'n', 'm');
   await g.mkdirp(d);
   const fh = await g.openForWrite(join(d, 'f.part'));
   await fh.writeFile('hi');
   await fh.close();
-  await g.chmod(join(d, 'f.part'), 0o644);
-  const want = 1_700_000_000_123_456_789n;
-  const got = await g.utimesNs(join(d, 'f.part'), want);
-  const disk = lstatSync(join(d, 'f.part'), { bigint: true }).mtimeNs;
-  expect(got).toBe(disk);
-  expect(got > want ? got - want : want - got).toBeLessThan(1000n);
   await g.rename(join(d, 'f.part'), join(d, 'f'));
   expect(readFileSync(join(d, 'f'), 'utf8')).toBe('hi');
   expect(await g.exists(join(d, 'f'))).toBe(true);
@@ -110,11 +102,6 @@ test('a non-existent allowed root is still usable once created; all calls go thr
   const ops: FsOps = {
     mkdir: async (p, o) => (calls.push('mkdir'), (await import('node:fs/promises')).mkdir(p, o)),
     open: async (p, f, m) => (calls.push('open'), (await import('node:fs/promises')).open(p, f, m)),
-    chmod: async (p, m) => (calls.push('chmod'), (await import('node:fs/promises')).chmod(p, m)),
-    utimes: async (p, a, m) => (
-      calls.push('utimes'),
-      (await import('node:fs/promises')).utimes(p, a, m)
-    ),
     rename: async (a, b) => (calls.push('rename'), (await import('node:fs/promises')).rename(a, b)),
     unlink: async (p) => (calls.push('unlink'), (await import('node:fs/promises')).unlink(p)),
     lstat: async (p) => (calls.push('lstat'), (await import('node:fs/promises')).lstat(p)),
@@ -131,13 +118,10 @@ test('a non-existent allowed root is still usable once created; all calls go thr
   await g2.mkdirp(join(root, 'q'));
   const fh = await g2.openForWrite(join(root, 'q', 'a'));
   await fh.close();
-  await g2.chmod(join(root, 'q', 'a'), 0o600);
-  await g2.utimesNs(join(root, 'q', 'a'), 2_000_000_000n);
-  expect(calls).toContain('mtimeNs');
   await g2.rename(join(root, 'q', 'a'), join(root, 'q', 'b'));
   await g2.unlink(join(root, 'q', 'b'));
   await g2.exists(join(root, 'q'));
-  for (const c of ['mkdir', 'open', 'chmod', 'utimes', 'rename', 'unlink', 'lstat', 'realpath'])
+  for (const c of ['mkdir', 'open', 'rename', 'unlink', 'lstat', 'realpath'])
     expect(calls).toContain(c);
 });
 test('a dangling symlink inside the root is refused, not treated as missing', async () => {
@@ -181,8 +165,6 @@ describe('copyInto and publishNoReplace', () => {
         }
         return fh;
       },
-      chmod: () => Promise.reject(new Error('path chmod not used')),
-      utimes: () => Promise.reject(new Error('path utimes not used')),
     };
     const dest = join(root, 'c1.part');
     const got = await new GuardedFs([root], ops).copyInto(src, dest, {

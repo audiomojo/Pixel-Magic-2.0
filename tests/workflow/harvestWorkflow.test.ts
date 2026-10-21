@@ -10,7 +10,7 @@ import {
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import type { ScanFolderResult } from '../../src/harvest/scan.js';
 import type { SendBatchResult } from '../../src/harvest/send.js';
-import { STALLED_REASON } from '../../src/harvest/throttle.js';
+import { STALLED_REASON } from '../../src/harvest/constants.js';
 import type { HarvestWorkflow } from '../../src/harvest/workflow.js';
 
 const SCAN_DONE: ScanFolderResult = {
@@ -81,7 +81,11 @@ const activities = {
   },
   scanFolder: async (runId: string, folderId: string) => {
     cur.calls.push(`scanFolder ${folderId}`);
-    return cur.scan(runId, folderId);
+    const res = await cur.scan(runId, folderId);
+    // As in the database: a finished folder is done, and a new execution skips it.
+    const folder = cur.folders.find((f) => f.folderId === folderId);
+    if (res.outcome === 'DONE' && folder) folder.state = 'done';
+    return res;
   },
   sendBatch: async (_runId: string, state?: { whileScanning?: boolean }) => {
     if (state?.whileScanning) {
@@ -109,7 +113,6 @@ const activities = {
     cur.calls.push('startNextQueued');
     return Promise.resolve(null);
   },
-  linkFiles: () => Promise.resolve(0),
 };
 
 beforeAll(async () => {
