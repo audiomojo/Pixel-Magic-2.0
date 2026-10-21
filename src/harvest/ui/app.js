@@ -5,6 +5,7 @@ import {
   ago,
   bytes,
   count,
+  day,
   defaultTicked,
   folderStatus,
   gateLine,
@@ -67,13 +68,38 @@ function confirmDialog(title, text, yesLabel) {
 
 const message = (text, bad = false) =>
   h('p', { className: bad ? 'msg bad' : 'msg', role: 'status' }, text);
+const button = (label, onclick, cls = '', attrs = {}) =>
+  h('button', { className: cls ? `btn ${cls}` : 'btn', type: 'button', onclick, ...attrs }, label);
 const sourceName = (s) => s.label || `source ${s.id}`;
+const runName = (dryRun, id) => `${dryRun ? 'Dry run' : 'Harvest'} #${id}`;
+const folderList = (folders) => folders.map((f) => `${f.label}/${f.relPath}`).join(', ');
+const decided = (action, r) =>
+  `${action === 'send' ? 'approved' : 'skipped'}${r.runId ? ` (run #${r.runId})` : ''}`;
+/** A `<dl class="counts">` of [label, value] pairs. */
+const countItems = (items) => items.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v)));
+
+/**
+ * Shows `head` and "Loading…", then fetches `url`. Returns the data, or null when the fetch
+ * failed (the error is shown under `head`) or the user has moved to another view meanwhile.
+ */
+async function loadInto(routeName, head, url) {
+  const m = main();
+  m.replaceChildren(...head, h('p', { className: 'muted' }, 'Loading…'));
+  try {
+    const data = await api(url);
+    return route.name === routeName ? data : null;
+  } catch (e) {
+    if (route.name === routeName) m.replaceChildren(...head, message(e.message, true));
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------- state and polling
 let state = null;
 let stateError = null;
 let route = { name: 'sources' };
 const samples = []; // [time, sent] of the active run, for files per minute
+let samplesRun = null;
 
 async function refreshState() {
   try {
@@ -92,25 +118,21 @@ async function refreshState() {
 }
 
 let timer;
-function schedule() {
-  clearTimeout(timer);
-  if (document.hidden) return;
-  timer = setTimeout(async () => {
-    try {
-      await refreshState();
-    } finally {
-      schedule();
-    }
-  }, POLL_MS);
-}
-document.addEventListener('visibilitychange', async () => {
-  if (document.hidden) return clearTimeout(timer);
+/** Refreshes now, then again every POLL_MS while the page is visible. */
+async function tick() {
   try {
     await refreshState();
   } finally {
     schedule();
   }
-});
+}
+function schedule() {
+  clearTimeout(timer);
+  if (!document.hidden) timer = setTimeout(tick, POLL_MS);
+}
+document.addEventListener('visibilitychange', () =>
+  document.hidden ? clearTimeout(timer) : tick(),
+);
 
 // ---------------------------------------------------------------- banner, nav badge
 function paintChrome() {
@@ -132,8 +154,7 @@ function paintChrome() {
 }
 
 // ---------------------------------------------------------------- run panel
-const panel = { built: false };
-let errorsOpen = false;
+const panel = {};
 let queueKey = '';
 
 function buildPanel() {
@@ -144,27 +165,14 @@ function buildPanel() {
   panel.current = h('p', { className: 'muted' });
   panel.counts = h('dl', { className: 'counts' });
   panel.gate = h('p', { className: 'muted' });
-  panel.pause = h(
-    'button',
-    { className: 'btn', type: 'button', onclick: () => runAction('pause') },
-    'Pause',
-  );
-  panel.resume = h(
-    'button',
-    { className: 'btn primary', type: 'button', onclick: () => runAction('resume') },
-    'Resume',
-  );
-  panel.cancel = h(
-    'button',
-    { className: 'btn danger', type: 'button', onclick: cancelActive },
-    'Cancel',
-  );
+  panel.pause = button('Pause', () => runAction('pause'));
+  panel.resume = button('Resume', () => runAction('resume'), 'primary');
+  panel.cancel = button('Cancel', cancelActive, 'danger');
   panel.errors = h(
     'details',
     {
       ontoggle: () => {
-        errorsOpen = panel.errors.open;
-        if (errorsOpen) loadErrors();
+        if (panel.errors.open) loadErrors();
       },
     },
     h('summary', {}, 'Errors'),
@@ -184,11 +192,10 @@ function buildPanel() {
     panel.errors,
     panel.queue,
   );
-  panel.built = true;
 }
 
-const countsKey = ['dirs', 'photos', 'maybes', 'junk', 'sent', 'known', 'dups', 'errors'];
-const countLabel = {
+/** Count labels, in the run panel's order. */
+const COUNT_LABELS = {
   dirs: 'Folders scanned',
   photos: 'Photos',
   maybes: 'Possible photos',
@@ -208,7 +215,7 @@ function paintRunPanel() {
     samples.length = 0;
     return;
   }
-  if (!panel.built) buildPanel();
+  if (!panel.title) buildPanel();
   root.classList.toggle('stalled', Boolean(run && isStalled(run.paused_reason)));
   panel.err.textContent = '';
   for (const el of [
@@ -226,7 +233,7 @@ function paintRunPanel() {
   }
   if (run) {
     const t = runTotals(run.folders);
-    panel.title.textContent = `${run.dry_run ? 'Dry run' : 'Harvest'} #${run.id}`;
+    panel.title.textContent = runName(run.dry_run, run.id);
     panel.status.textContent = `${run.state}${run.paused_since ? ` since ${ago(run.paused_since)}` : ''}`;
     const stalled = isStalled(run.paused_reason);
     panel.reason.hidden = !run.paused_reason;
@@ -238,24 +245,13 @@ function paintRunPanel() {
       : '';
     const cur = run.folders.find((f) => f.state !== 'done');
     panel.current.textContent = cur ? `Now: ${cur.label}/${cur.relPath} (${cur.state})` : '';
-    // Files per minute over the last minute of samples of this run.
-    const now = Date.now();
-    if (samples.runId !== run.id) {
-      samples.length = 0;
-      samples.runId = run.id;
-    }
-    samples.push([now, t.sent]);
-    while (samples.length > 2 && now - samples[0][0] > 60000) samples.shift();
-    const first = samples[0];
-    const rate =
-      samples.length > 1 && now > first[0] ? ((t.sent - first[1]) * 60000) / (now - first[0]) : 0;
-    const items = countsKey.map((k) => [countLabel[k], count(t[k])]);
-    items.push(
-      ['Files / min', rate >= 10 ? String(Math.round(rate)) : rate.toFixed(1)],
-      ['Bytes sent', bytes(t.bytesSent)],
-    );
+    const rate = filesPerMinute(run.id, t.sent);
     panel.counts.replaceChildren(
-      ...items.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))),
+      ...countItems([
+        ...Object.entries(COUNT_LABELS).map(([k, label]) => [label, count(t[k])]),
+        ['Files / min', rate >= 10 ? String(Math.round(rate)) : rate.toFixed(1)],
+        ['Bytes sent', bytes(t.bytesSent)],
+      ]),
     );
     panel.gate.textContent = gateLine(state);
     const paused = run.state === 'paused';
@@ -263,31 +259,40 @@ function paintRunPanel() {
     panel.resume.hidden = !paused;
     panel.errors.firstChild.textContent = `Errors (${count(t.errors)})`;
     panel.errors.hidden = t.errors === 0;
-    if (errorsOpen && t.errors > 0) loadErrors();
+    if (panel.errors.open && t.errors > 0) loadErrors();
   }
+  paintQueue(queue);
+}
+
+/** Files per minute of run `runId`, over about the last minute of samples. */
+function filesPerMinute(runId, sent) {
+  const now = Date.now();
+  if (samplesRun !== runId) {
+    samples.length = 0;
+    samplesRun = runId;
+  }
+  samples.push([now, sent]);
+  while (samples.length > 2 && now - samples[0][0] > 60000) samples.shift();
+  const first = samples[0];
+  return samples.length > 1 && now > first[0] ? ((sent - first[1]) * 60000) / (now - first[0]) : 0;
+}
+
+/** The waiting runs, repainted only when the queue changed. */
+function paintQueue(queue) {
   const key = JSON.stringify(queue.map((q) => q.id));
-  if (key !== queueKey) {
-    queueKey = key;
-    panel.queue.replaceChildren(
-      queue.length ? h('h3', {}, 'Waiting') : '',
-      ...queue.map((q) =>
-        h(
-          'div',
-          { className: 'row between' },
-          h(
-            'span',
-            {},
-            `${q.dry_run ? 'Dry run' : 'Harvest'} #${q.id}: ${q.folders.map((f) => `${f.label}/${f.relPath}`).join(', ')}`,
-          ),
-          h(
-            'button',
-            { className: 'btn small', type: 'button', onclick: () => removeQueued(q.id) },
-            'Remove',
-          ),
-        ),
+  if (key === queueKey) return;
+  queueKey = key;
+  panel.queue.replaceChildren(
+    queue.length ? h('h3', {}, 'Waiting') : '',
+    ...queue.map((q) =>
+      h(
+        'div',
+        { className: 'row between' },
+        h('span', {}, `${runName(q.dry_run, q.id)}: ${folderList(q.folders)}`),
+        button('Remove', () => removeQueued(q.id), 'small'),
       ),
-    );
-  }
+    ),
+  );
 }
 
 async function loadErrors() {
@@ -416,15 +421,7 @@ function paintSources() {
   if (!state) return m.replaceChildren(h('p', { className: 'muted' }, 'Loading…'));
   if (!sourcesFrame) {
     const msg = h('div');
-    const btn = h(
-      'button',
-      {
-        className: 'btn',
-        type: 'button',
-        onclick: () => refreshDrives(btn, msg),
-      },
-      'Refresh drives',
-    );
+    const btn = button('Refresh drives', () => refreshDrives(btn, msg));
     sourcesFrame = { msg, list: h('div'), key: '' };
     m.replaceChildren(
       h('div', { className: 'row between' }, h('h2', {}, 'Sources'), btn),
@@ -491,14 +488,13 @@ function paintSources() {
 let src = null; // {id, ticked: Set, rows: Map<relPath, {input, entry, li}>}
 
 function openSource() {
-  src = { id: route.id, ticked: new Set(), rows: new Map(), loaded: new Map() };
+  src = { id: route.id, ticked: new Set(), rows: new Map() };
   main().replaceChildren(
     h('div', { id: 'src-head' }),
     h('div', { id: 'src-tree' }),
     h('div', { id: 'src-msg' }),
   );
-  paintSourceHeader();
-  if (state) startTree();
+  paintSourceHeader(); // starts the tree once the source is known and mounted
 }
 
 function currentSource() {
@@ -509,8 +505,7 @@ function paintSourceHeader() {
   if (route.name !== 'source' || !src) return;
   const s = currentSource();
   const head = $('src-head');
-  if (!head) return;
-  if (!state) return;
+  if (!head || !state) return;
   if (!s) {
     src.headKey = 'unknown';
     head.replaceChildren(
@@ -520,8 +515,7 @@ function paintSourceHeader() {
     return;
   }
   if (!src.treeStarted && s.mounted) startTree();
-  const mounted = s.mounted;
-  const key = JSON.stringify([sourceName(s), s.kind, mounted, s.usedBytes, s.totalBytes]);
+  const key = JSON.stringify([sourceName(s), s.kind, s.mounted, s.usedBytes, s.totalBytes]);
   if (key === src.headKey) return;
   src.headKey = key;
   head.replaceChildren(
@@ -530,12 +524,12 @@ function paintSourceHeader() {
     h(
       'p',
       { className: 'muted' },
-      mounted
+      s.mounted
         ? `${s.kind} · used ${bytes(s.usedBytes)} of ${bytes(s.totalBytes)}`
         : 'Not mounted. Plug it in and refresh the drives.',
     ),
   );
-  if (!mounted) {
+  if (!s.mounted) {
     $('src-tree').replaceChildren();
     src.treeStarted = false;
   }
@@ -551,31 +545,19 @@ function startTree() {
   const ul = h('ul', { className: 'tree' });
   const actions = h('div', { className: 'sticky' });
   src.summary = h('span', { className: 'muted', 'aria-live': 'polite' });
-  src.start = h(
-    'button',
-    { className: 'btn primary', type: 'button', disabled: true, onclick: () => startRun(false) },
-    'Start harvest',
-  );
-  src.dry = h(
-    'button',
-    { className: 'btn', type: 'button', disabled: true, onclick: () => startRun(true) },
-    'Dry run',
-  );
-  src.tickNew = h(
-    'button',
-    { className: 'btn', type: 'button', onclick: tickNew },
-    'Tick folders not yet harvested',
-  );
-  actions.append(h('div', { className: 'row' }, src.start, src.dry, src.tickNew, src.summary));
+  src.start = button('Start harvest', () => startRun(false), 'primary', { disabled: true });
+  src.dry = button('Dry run', () => startRun(true), '', { disabled: true });
+  const tickNewBtn = button('Tick folders not yet harvested', tickNew);
+  actions.append(h('div', { className: 'row' }, src.start, src.dry, tickNewBtn, src.summary));
   tree.replaceChildren(ul, actions);
-  const rootLi = nodeFor({ name: `Whole source (${sourceName(s)})`, relPath: '' }, true);
+  const rootLi = nodeFor({ name: `Whole source (${sourceName(s)})`, relPath: '' }, true, [], '');
   ul.append(rootLi);
   expand(rootLi, '');
   syncTicks();
 }
 
-/** A tree row. */
-function nodeFor(entry, isRoot, chain = []) {
+/** A tree row; `status` is its folder status line. */
+function nodeFor(entry, isRoot, chain, status) {
   const input = h('input', {
     type: 'checkbox',
     onchange: () => {
@@ -584,52 +566,44 @@ function nodeFor(entry, isRoot, chain = []) {
       syncTicks();
     },
   });
-  const status = h('span', { className: 'status' }, '');
+  const statusEl = h('span', { className: 'status' }, status);
   const li = h('li');
-  const twisty = h(
-    'button',
-    {
-      className: 'btn small twisty',
-      type: 'button',
-      'aria-expanded': 'false',
-      'aria-label': `Expand ${entry.name}`,
-      onclick: () => toggle(li, entry.relPath, twisty),
-    },
-    '▸',
-  );
+  const twisty = button('▸', () => toggle(li, entry.relPath, twisty), 'small twisty', {
+    'aria-expanded': 'false',
+    'aria-label': `Expand ${entry.name}`,
+  });
   li.append(
     h(
       'div',
       { className: 'node' },
       isRoot ? h('span', { className: 'twisty' }) : twisty,
       h('label', {}, input, h('span', {}, entry.name)),
-      status,
+      statusEl,
     ),
   );
-  li._status = status;
-  src.rows.set(entry.relPath, { input, entry, li, isRoot, chain });
+  src.rows.set(entry.relPath, { input, entry, li, isRoot, chain, statusEl });
   return li;
+}
+
+/** The twisty's state: aria-expanded and its glyph together. */
+function setExpanded(twisty, open) {
+  twisty.setAttribute('aria-expanded', String(open));
+  twisty.textContent = open ? '▾' : '▸';
 }
 
 async function toggle(li, relPath, twisty) {
   const open = twisty.getAttribute('aria-expanded') === 'true';
   const sub = li.querySelector(':scope > ul');
   if (open) {
-    twisty.setAttribute('aria-expanded', 'false');
-    twisty.textContent = '▸';
+    setExpanded(twisty, false);
     if (sub) sub.hidden = true;
     return;
   }
-  twisty.setAttribute('aria-expanded', 'true');
-  twisty.textContent = '▾';
+  setExpanded(twisty, true);
   if (sub && !sub.dataset.failed) sub.hidden = false;
   else {
     if (sub) sub.remove(); // a failed load: try again
-    const ok = await expand(li, relPath);
-    if (!ok) {
-      twisty.setAttribute('aria-expanded', 'false');
-      twisty.textContent = '▸';
-    }
+    if (!(await expand(li, relPath))) setExpanded(twisty, false);
   }
 }
 
@@ -649,49 +623,37 @@ async function expand(li, relPath) {
     ul.replaceChildren(h('li', { className: 'bad', role: 'alert' }, e.message));
     return false;
   }
-  const label = sourceName(s);
-  const covers = data.coveredBy
-    ? {
-        name: `${label}/${data.coveredBy.relPath ? `${data.coveredBy.relPath}/` : ''}`,
-        lastHarvestedAt: data.coveredBy.lastHarvestedAt,
-      }
-    : null;
+  const cov = data.coveredBy;
   // The listed path's own status (root row only; sub-rows got theirs from their parent's listing).
   if (relPath === '') {
-    const rootRow = src.rows.get('');
-    const own =
-      covers && data.coveredBy.relPath === '' ? { lastHarvestedAt: covers.lastHarvestedAt } : {};
-    rootRow.entry.lastHarvestedAt = own.lastHarvestedAt;
-    li._status.textContent = folderStatus(own, []);
+    const own = cov && cov.relPath === '' ? { lastHarvestedAt: cov.lastHarvestedAt } : {};
+    src.rows.get('').statusEl.textContent = folderStatus(own, []);
   }
-  const chain = covers ? [covers] : [];
+  const chain = cov
+    ? [
+        {
+          name: `${sourceName(s)}/${cov.relPath ? `${cov.relPath}/` : ''}`,
+          lastHarvestedAt: cov.lastHarvestedAt,
+        },
+      ]
+    : [];
   ul.replaceChildren(
     ...(data.entries.length === 0 ? [h('li', { className: 'muted' }, 'No sub-folders.')] : []),
-    ...data.entries.map((e) => {
-      const child = nodeFor(
-        { name: e.name, relPath: e.relPath, lastHarvestedAt: e.lastHarvestedAt },
-        false,
-        chain,
-      );
-      child._status.textContent = folderStatus(e, chain);
-      return child;
-    }),
+    ...data.entries.map((e) => nodeFor(e, false, chain, folderStatus(e, chain))),
   );
   syncTicks();
   return true;
 }
 
+/** Whether a ticked folder above `p` includes it. */
+const includedByTick = (p) =>
+  [...src.ticked].some((t) => t !== p && (t === '' || p.startsWith(`${t}/`)));
+
 /** A ticked folder includes everything below it: its descendants show ticked and locked. */
 function syncTicks() {
   if (!src) return;
-  const includedBy = (p) => {
-    for (const t of src.ticked) {
-      if (t !== p && (t === '' || p.startsWith(`${t}/`))) return true;
-    }
-    return false;
-  };
   for (const [p, row] of src.rows) {
-    const locked = includedBy(p);
+    const locked = includedByTick(p);
     row.input.checked = src.ticked.has(p) || locked;
     row.input.disabled = locked;
   }
@@ -705,9 +667,7 @@ function syncTicks() {
 }
 
 function selection() {
-  return [...src.ticked]
-    .filter((p) => ![...src.ticked].some((t) => t !== p && (t === '' || p.startsWith(`${t}/`))))
-    .sort();
+  return [...src.ticked].filter((p) => !includedByTick(p)).sort();
 }
 
 function tickNew() {
@@ -736,7 +696,7 @@ async function startRun(dryRun) {
     const r = await post('/api/runs', { folders, dryRun });
     msg.replaceChildren(
       message(
-        `${dryRun ? 'Dry run' : 'Harvest'} #${r.runId} ${r.state === 'queued' ? 'queued behind the active run' : 'started'}.`,
+        `${runName(dryRun, r.runId)} ${r.state === 'queued' ? 'queued behind the active run' : 'started'}.`,
       ),
     );
     src.ticked.clear();
@@ -749,16 +709,8 @@ async function startRun(dryRun) {
 
 // ---------------------------------------------------------------- 4. review
 async function openReview() {
-  const m = main();
-  m.replaceChildren(h('h2', {}, 'Possible photos'), h('p', { className: 'muted' }, 'Loading…'));
-  try {
-    const { groups } = await api('/api/review');
-    if (route.name !== 'review') return;
-    paintReviewGroups(groups);
-  } catch (e) {
-    if (route.name !== 'review') return;
-    m.replaceChildren(h('h2', {}, 'Possible photos'), message(e.message, true));
-  }
+  const d = await loadInto('review', [h('h2', {}, 'Possible photos')], '/api/review');
+  if (d) paintReviewGroups(d.groups);
 }
 
 function paintReviewGroups(groups) {
@@ -783,9 +735,7 @@ function paintReviewGroups(groups) {
       try {
         const r = await post('/api/review', { sourceId: g.sourceId, path: g.path, action });
         card.replaceChildren(
-          message(
-            `${r.changed} file${r.changed === 1 ? '' : 's'} ${action === 'send' ? 'approved' : 'skipped'}${r.runId ? ` (run #${r.runId})` : ''}.`,
-          ),
+          message(`${r.changed} file${r.changed === 1 ? '' : 's'} ${decided(action, r)}.`),
         );
         refreshState();
       } catch (err) {
@@ -799,12 +749,8 @@ function paintReviewGroups(groups) {
       h(
         'div',
         { className: 'row' },
-        h(
-          'button',
-          { className: 'btn primary small', type: 'button', onclick: act('send') },
-          'Send all',
-        ),
-        h('button', { className: 'btn small', type: 'button', onclick: act('skip') }, 'Skip all'),
+        button('Send all', act('send'), 'primary small'),
+        button('Skip all', act('skip'), 'small'),
         h(
           'a',
           {
@@ -821,23 +767,14 @@ function paintReviewGroups(groups) {
 
 async function openReviewFiles() {
   const { id, path } = route;
-  const m = main();
   const back = h('p', {}, h('a', { href: '#/review' }, '← Possible photos'));
-  m.replaceChildren(
-    back,
-    h('h2', {}, path || '(top of drive)'),
-    h('p', { className: 'muted' }, 'Loading…'),
+  const d = await loadInto(
+    'review-files',
+    [back, h('h2', {}, path || '(top of drive)')],
+    `/api/review?sourceId=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`,
   );
-  let files, label, problem;
-  try {
-    ({ files, label, problem } = await api(
-      `/api/review?sourceId=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`,
-    ));
-  } catch (e) {
-    if (route.name !== 'review-files') return;
-    return m.replaceChildren(back, message(e.message, true));
-  }
-  if (route.name !== 'review-files') return;
+  if (!d) return;
+  const { files, label, problem } = d;
   const grid = h('div', { className: 'grid' });
   const msg = h('div');
   const decide = (item, fig, action) => async () => {
@@ -846,11 +783,7 @@ async function openReviewFiles() {
     try {
       const r = await post('/api/review', { itemIds: [item.id], action });
       fig.remove();
-      msg.replaceChildren(
-        message(
-          `${item.name}: ${action === 'send' ? 'approved' : 'skipped'}${r.runId ? ` (run #${r.runId})` : ''}.`,
-        ),
-      );
+      msg.replaceChildren(message(`${item.name}: ${decided(action, r)}.`));
       refreshState();
     } catch (e) {
       for (const b of buttons) b.disabled = false;
@@ -873,21 +806,13 @@ async function openReviewFiles() {
       h(
         'div',
         { className: 'row' },
-        h(
-          'button',
-          { className: 'btn small primary', type: 'button', onclick: decide(f, fig, 'send') },
-          'Send',
-        ),
-        h(
-          'button',
-          { className: 'btn small', type: 'button', onclick: decide(f, fig, 'skip') },
-          'Skip',
-        ),
+        button('Send', decide(f, fig, 'send'), 'small primary'),
+        button('Skip', decide(f, fig, 'skip'), 'small'),
       ),
     );
     grid.append(fig);
   }
-  m.replaceChildren(
+  main().replaceChildren(
     back,
     h('h2', {}, `${label} · ${path || '(top of drive)'}`),
     problem && files.length ? message(problem.detail, true) : '',
@@ -900,7 +825,6 @@ async function openReviewFiles() {
 function openWhere() {
   const input = h('input', {
     type: 'search',
-    id: 'q',
     placeholder: 'sha256 or file name',
     autocomplete: 'off',
     'aria-label': 'sha256 or file name',
@@ -970,7 +894,7 @@ function whereTable(items) {
             h('td', {}, `${i.state} (${i.kind})`),
             h('td', {}, bytes(i.sizeBytes)),
             h('td', {}, i.sentAt ? ago(i.sentAt) : '–'),
-            h('td', {}, i.mtime ? new Date(i.mtime).toISOString().slice(0, 10) : '–'),
+            h('td', {}, day(i.mtime) || '–'),
           ),
         ),
       ),
@@ -980,60 +904,37 @@ function whereTable(items) {
 
 // ---------------------------------------------------------------- 6. history
 async function openHistory() {
-  const m = main();
-  m.replaceChildren(h('h2', {}, 'History'), h('p', { className: 'muted' }, 'Loading…'));
-  try {
-    const { runs } = await api('/api/runs?limit=50');
-    if (route.name !== 'history') return;
-    m.replaceChildren(
-      h('h2', {}, 'History'),
-      runs.length === 0 ? h('p', { className: 'muted' }, 'No runs yet.') : '',
-      ...runs.map(runCard),
-    );
-  } catch (e) {
-    m.replaceChildren(h('h2', {}, 'History'), message(e.message, true));
-  }
+  const d = await loadInto('history', [h('h2', {}, 'History')], '/api/runs?limit=50');
+  if (!d) return;
+  main().replaceChildren(
+    h('h2', {}, 'History'),
+    d.runs.length === 0 ? h('p', { className: 'muted' }, 'No runs yet.') : '',
+    ...d.runs.map(runCard),
+  );
 }
 
 function runCard(run) {
   const t = runTotals(run.folders);
   const junk = junkSummary(run.folders);
-  const items = run.dry_run
-    ? [
-        ['Would send', t.photos],
-        ['Already in vault', t.known],
-        ['Duplicates', t.dups],
-        ['Possible photos', t.maybes],
-        ['Junk', t.junk],
-        ['Folders scanned', t.dirs],
-      ]
-    : [
-        ['Sent', t.sent],
-        ['Already in vault', t.known],
-        ['Duplicates', t.dups],
-        ['Failed', t.errors],
-        ['Possible photos', t.maybes],
-        ['Junk', t.junk],
-      ];
+  const keys = run.dry_run
+    ? ['photos', 'known', 'dups', 'maybes', 'junk', 'dirs']
+    : ['sent', 'known', 'dups', 'errors', 'maybes', 'junk'];
+  const items = keys.map((k) => [k === 'photos' ? 'Would send' : COUNT_LABELS[k], count(t[k])]);
   return h(
     'div',
     { className: 'card' },
     h(
       'div',
       { className: 'row between' },
-      h('strong', {}, `${run.dry_run ? 'Dry run' : 'Harvest'} #${run.id}`),
+      h('strong', {}, runName(run.dry_run, run.id)),
       h(
         'span',
         { className: run.state === 'failed' ? 'bad' : 'muted' },
         `${run.state} · ${ago(run.created_at)}`,
       ),
     ),
-    h('div', { className: 'muted' }, run.folders.map((f) => `${f.label}/${f.relPath}`).join(', ')),
-    h(
-      'dl',
-      { className: 'counts' },
-      ...items.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, count(v)))),
-    ),
+    h('div', { className: 'muted' }, folderList(run.folders)),
+    h('dl', { className: 'counts' }, ...countItems(items)),
     junk ? h('div', { className: 'muted' }, `Junk by reason: ${junk}`) : '',
     run.error ? h('div', { className: 'bad' }, run.error) : '',
   );
@@ -1041,6 +942,4 @@ function runCard(run) {
 
 // ---------------------------------------------------------------- start
 navigate();
-refreshState().then(() => {
-  schedule();
-});
+tick();

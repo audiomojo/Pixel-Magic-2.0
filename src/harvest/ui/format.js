@@ -32,7 +32,7 @@ export function count(n) {
 }
 
 /** `2026-10-20` (UTC) or '' for a missing or invalid date. */
-function day(date) {
+export function day(date) {
   const t = date ? new Date(date) : null;
   return t && !Number.isNaN(t.getTime()) ? t.toISOString().slice(0, 10) : '';
 }

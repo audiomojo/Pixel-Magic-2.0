@@ -10,7 +10,6 @@
   --bad: #b3261e;
   --bad-bg: #fdecea;
   --warn-bg: #fff4d6;
-  --ok: #1f7a3d;
   font-family:
     system-ui,
     -apple-system,
@@ -32,7 +31,6 @@
     --bad: #ff8a80;
     --bad-bg: #3a1f1d;
     --warn-bg: #3a3118;
-    --ok: #7ed39a;
   }
 }
 * {
@@ -183,7 +181,6 @@ h2 {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
 }
-input[type='text'],
 input[type='search'] {
   font: inherit;
   padding: 0.4rem 0.6rem;
@@ -334,9 +331,4 @@ dialog {
 }
 dialog::backdrop {
   background: rgb(0 0 0 / 0.45);
-}
-@media (prefers-reduced-motion: no-preference) {
-  .btn {
-    transition: opacity 0.15s;
-  }
 }
