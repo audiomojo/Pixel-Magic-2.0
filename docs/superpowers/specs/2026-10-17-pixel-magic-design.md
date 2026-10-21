@@ -155,7 +155,7 @@ Returns `IngestResult(file_id, sha256, is_new, kind)`.
 
 ### 6.3 `cluster_content` (queue `cluster`, single-active)
 
-**In-memory index.** The worker keeps typed arrays: `phash` and `dhash` as hi/lo `Uint32Array` pairs, plus `captured_at_ns`, `subsec`, `camera`, `burst_uuid`, `width`, `height`, `mime` and `copy_group_id`, plus the grouping state. It reloads them all whenever `cluster_state.version` differs from the version it cached (§12 R2).
+**In-memory index.** The worker keeps typed arrays: `phash` and `dhash` as hi/lo `Uint32Array` pairs, plus `captured_at_ns`, `subsec`, `camera`, `burst_uuid`, `width`, `height` and `mime`, plus the grouping state (which holds each content's copy group). It reloads them all whenever `cluster_state.version` differs from the version it cached (§12 R2).
 
 **Matching.** A new hash is compared against **every** stored hash with XOR + 32-bit popcount over the typed arrays. Each candidate within `LOOK_ALIKE_PHASH` = 8 **and** `LOOK_ALIKE_DHASH` = 10 is classified by `classify(a, b) -> "copy" | "similar"`:
 
