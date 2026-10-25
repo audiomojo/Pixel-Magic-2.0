@@ -5,6 +5,7 @@ import { ExifTool } from 'exiftool-vendored';
 import heicDecode from 'heic-decode';
 import sharp, { type Sharp, type SharpOptions } from 'sharp';
 import { unlessEnoent } from './fsops.js';
+import { isHeifHead, RAW_MIME, STILL_EXTS } from './formats.js';
 import { dhashFromGray, phashFromGray } from './hashing.js';
 import type { WireFacts } from './types.js';
 
@@ -44,34 +45,6 @@ const SHARP_MIME: Partial<Record<string, string>> = {
   heif: 'image/avif', // prebuilt libvips decodes only AV1 HEIF; HEVC goes through heic-decode
 };
 
-const STILL_EXT = new Set([
-  'jpg',
-  'jpeg',
-  'png',
-  'webp',
-  'tif',
-  'tiff',
-  'gif',
-  'heic',
-  'heif',
-  'bmp',
-]);
-
-const RAW_MIME: Partial<Record<string, string>> = {
-  dng: 'image/x-adobe-dng',
-  cr2: 'image/x-canon-cr2',
-  cr3: 'image/x-canon-cr3',
-  nef: 'image/x-nikon-nef',
-  arw: 'image/x-sony-arw',
-  orf: 'image/x-olympus-orf',
-  rw2: 'image/x-panasonic-rw2',
-  raf: 'image/x-fuji-raf',
-  pef: 'image/x-pentax-pef',
-  srw: 'image/x-samsung-srw',
-};
-
-const HEIF_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1']);
-
 let exiftool: ExifTool | undefined;
 
 /** Ends the lazily created RAW-preview ExifTool, if any. */
@@ -88,12 +61,11 @@ export async function endDecodeResources(): Promise<void> {
  */
 export async function computeImageFacts(absPath: string, ext: string): Promise<ImageFacts> {
   const e = ext.toLowerCase();
-  const rawMime = RAW_MIME[e];
+  const rawMime = RAW_MIME.get(e);
   if (rawMime) return fromRawPreview(absPath, rawMime);
-  if (!STILL_EXT.has(e)) throw new QuarantineError('unsupported', `unsupported extension .${ext}`);
+  if (!STILL_EXTS.has(e)) throw new QuarantineError('unsupported', `unsupported extension .${ext}`);
   const head = await readHead(absPath, 32);
-  if (HEIF_BRANDS.has(head.toString('latin1', 8, 12)) && head.toString('latin1', 4, 8) === 'ftyp')
-    return fromHeic(absPath);
+  if (isHeifHead(head)) return fromHeic(absPath);
   if (head.toString('latin1', 0, 2) === 'BM') return fromBmp(absPath);
   return factsFrom(absPath);
 }

@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type pg from 'pg';
 import { createPool } from '../db.js';
+import { errText, unlessEnoent } from '../fsops.js';
 import { loadHarvestSettings } from './config.js';
 import { LABEL, renderPlist } from './launchd.js';
 import { GuardedFs } from './paths.js';
@@ -67,7 +68,7 @@ export const runVersion: RuntimeCheck = (path) =>
         else done(stdout.trim());
       });
     } catch (e) {
-      bad(e instanceof Error ? e.message : String(e)); // spawn errors such as ENOEXEC throw
+      bad(errText(e)); // spawn errors such as ENOEXEC throw
     }
   });
 
@@ -140,9 +141,7 @@ async function install(deps: CliDeps): Promise<number> {
   const agents = new GuardedFs([dir]);
   await agents.mkdirp(dir);
   // Reinstall: replace the old plist (the guarded open never overwrites).
-  await agents.unlink(target).catch((e: NodeJS.ErrnoException) => {
-    if (e.code !== 'ENOENT') throw e;
-  });
+  await unlessEnoent(agents.unlink(target));
   const fh = await agents.openForWrite(target);
   try {
     await fh.writeFile(renderPlist({ node, repo, logDir }));
@@ -163,11 +162,7 @@ async function uninstall(deps: CliDeps): Promise<number> {
   const d = withDefaults(deps);
   if (!(await bootout(d))) return 1;
   await removeRuntime(d.runtimeDir);
-  await new GuardedFs([d.agentsDir])
-    .unlink(plistPath(d.agentsDir))
-    .catch((e: NodeJS.ErrnoException) => {
-      if (e.code !== 'ENOENT') throw e;
-    });
+  await unlessEnoent(new GuardedFs([d.agentsDir]).unlink(plistPath(d.agentsDir)));
   out('uninstalled the harvester agent');
   return 0;
 }
@@ -273,7 +268,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
         return 1;
     }
   } catch (e) {
-    fail(`error: ${e instanceof Error ? e.message : String(e)}`);
+    fail(`error: ${errText(e)}`);
     return 1;
   }
 }

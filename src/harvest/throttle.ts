@@ -19,6 +19,34 @@ function formatBytes(n: number): string {
   return `${v.toFixed(1)} ${units[u]}`;
 }
 
+export interface Backlog {
+  /** Drop-zone files not yet ingested. */
+  pendingFiles: number;
+  pendingBytes: number;
+  /** The larger of pendingFiles and our files sent in the last hour but not yet ingested. */
+  backlog: number;
+}
+
+/** The backlog the gate measures (spec §7.5); the page shows the same numbers. */
+export async function measureBacklog(
+  pool: HarvestDeps['pool'],
+  now: Date = new Date(),
+): Promise<Backlog> {
+  const { rows } = await pool.query<{ files: string; bytes: string; sent: string }>(
+    `SELECT s.pending_files::text AS files, s.pending_bytes::text AS bytes,
+            (SELECT count(*) FROM harvest_items
+              WHERE state = 'SENT' AND file_id IS NULL AND sent_at > $1)::text AS sent
+     FROM scan_stats s WHERE s.id = 1`,
+    [new Date(now.getTime() - SENT_WINDOW_MS)],
+  );
+  const pendingFiles = Number(rows[0]?.files ?? 0);
+  return {
+    pendingFiles,
+    pendingBytes: Number(rows[0]?.bytes ?? 0),
+    backlog: Math.max(pendingFiles, Number(rows[0]?.sent ?? 0)),
+  };
+}
+
 /**
  * The throttle gate checked before every file copy (spec §7.5). A pure read: the workflow
  * writes `paused_reason` / `paused_since`; this reads them to measure the 10-minute stall.
@@ -43,16 +71,7 @@ export async function checkGate(
     }
   }
 
-  const { rows } = await pool.query<{ files: string; bytes: string; sent: string }>(
-    `SELECT s.pending_files::text AS files, s.pending_bytes::text AS bytes,
-            (SELECT count(*) FROM harvest_items
-              WHERE state = 'SENT' AND file_id IS NULL AND sent_at > $1)::text AS sent
-     FROM scan_stats s WHERE s.id = 1`,
-    [new Date(now.getTime() - SENT_WINDOW_MS)],
-  );
-  const pendingFiles = Number(rows[0]?.files ?? 0);
-  const pendingBytes = Number(rows[0]?.bytes ?? 0);
-  const backlog = Math.max(pendingFiles, Number(rows[0]?.sent ?? 0));
+  const { pendingBytes, backlog } = await measureBacklog(pool, now);
   if (backlog >= settings.maxPendingFiles) {
     return { open: false, reason: `backlog ${backlog.toLocaleString('en-US')}` };
   }

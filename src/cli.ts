@@ -5,7 +5,7 @@ import { Client, Connection } from '@temporalio/client';
 import type pg from 'pg';
 import { loadSettings } from './config.js';
 import { createPool } from './db.js';
-import { DataLayout } from './fsops.js';
+import { DataLayout, errText } from './fsops.js';
 import { doctor, listCopies, removedCopies, retryFailed, verifyVault } from './operator.js';
 import type { CopySweepWorkflow, StagingWorkflow } from './workflows.js';
 
@@ -154,7 +154,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   try {
     return await main(argv, deps);
   } catch (e) {
-    process.stderr.write(`error: ${e instanceof Error ? e.message : String(e)}\n`);
+    process.stderr.write(`error: ${errText(e)}\n`);
     return 1;
   }
 }

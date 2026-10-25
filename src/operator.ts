@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Client } from '@temporalio/client';
 import type pg from 'pg';
 import type { DataLayout } from './fsops.js';
-import { sha256File } from './fsops.js';
+import { errText, sha256File, shaOfVaultName } from './fsops.js';
 import type { ContentWorkflow } from './workflows.js';
 
 export interface RetryResult {
@@ -38,7 +38,7 @@ export async function retryFailed(
       });
       result.started += 1;
     } catch (e) {
-      result.failed.push({ sha256: row.sha256, error: e instanceof Error ? e.message : String(e) });
+      result.failed.push({ sha256: row.sha256, error: errText(e) });
     }
   }
   return result;
@@ -80,7 +80,7 @@ export async function verifyVault(layout: DataLayout, sample?: number): Promise<
   const mismatches: VaultReport['mismatches'] = [];
   for (const path of chosen) {
     const name = path.slice(path.lastIndexOf('/') + 1);
-    const expected = name.split('.')[0]!;
+    const expected = shaOfVaultName(name);
     const actual = await sha256File(path);
     if (actual !== expected) mismatches.push({ path: layout.rel(path), expected, actual });
   }

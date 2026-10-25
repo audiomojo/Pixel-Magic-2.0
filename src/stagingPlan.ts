@@ -1,3 +1,4 @@
+import { FORMAT_RANK } from './formats.js';
 import { vaultRel } from './fsops.js';
 
 /** One `contents` row as staging sees it. `copyGroup` and `similarSet` are root group ids. */
@@ -49,21 +50,6 @@ export type BestCopyKey = readonly [
   negEpochMs: number,
   sha256: string,
 ];
-
-const RAW = ['dng', 'cr2', 'cr3', 'nef', 'arw', 'orf', 'rw2', 'raf', 'pef', 'srw'];
-const FORMAT_RANK = new Map<string, number>([
-  ...RAW.map((e) => [e, 8] as const),
-  ['tif', 7],
-  ['tiff', 7],
-  ['png', 6],
-  ['heic', 5],
-  ['heif', 5],
-  ['jpg', 4],
-  ['jpeg', 4],
-  ['webp', 3],
-  ['gif', 2],
-  ['bmp', 1],
-]);
 
 /** Spec §6.4 best-copy key, highest first (see `compareBestCopy`). */
 export function bestCopyKey(c: StageContent, hasLive: boolean): BestCopyKey {

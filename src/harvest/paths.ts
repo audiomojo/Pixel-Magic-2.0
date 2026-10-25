@@ -2,6 +2,7 @@ import type { BigIntStats } from 'node:fs';
 import { constants } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { isEnoent } from '../fsops.js';
 
 /** NFC + lowercase: APFS ignores normalization and case, SMB can deliver NFD/NFC twins. */
 export function pathKey(rel: string): string {
@@ -116,7 +117,7 @@ export class GuardedFs {
       try {
         return join(await this.ops.realpath(cur), ...tail);
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+        if (!isEnoent(e)) throw e;
         // A dangling symlink is not "missing": it could be followed out of the root.
         const st = await this.ops.lstat(cur).catch(() => null);
         if (st?.isSymbolicLink()) throw new OutsideAllowedRootError(path);
@@ -234,7 +235,7 @@ export class GuardedFs {
       await this.ops.lstat(path);
       return true;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      if (isEnoent(e)) return false;
       throw e;
     }
   }

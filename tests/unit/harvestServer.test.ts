@@ -311,7 +311,14 @@ describe('state, sources', () => {
     ]);
     expect(s.queue.map((q: { id: string }) => q.id)).toEqual([r2]);
     // 400 of 1000 blocks used = 40 %, limit 80 %
-    expect(s.gate).toMatchObject({ diskPct: 40, diskLimit: 80, backlog: 0, backlogLimit: 20000 });
+    expect(s.gate).toMatchObject({
+      diskPct: 40,
+      diskLimit: 80,
+      backlog: 0,
+      backlogLimit: 20000,
+      pendingBytes: 0,
+      pendingBytesLimit: null,
+    });
   });
 
   test('a mounted local drive whose probe failed is listed as unidentified, with no row', async () => {

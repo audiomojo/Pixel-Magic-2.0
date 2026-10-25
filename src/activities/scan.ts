@@ -9,7 +9,7 @@ import {
   WorkflowIdConflictPolicy,
   WorkflowIdReusePolicy,
 } from '@temporalio/client';
-import { errCode, isEnoent, isIgnored, unlessEnoent } from '../fsops.js';
+import { errCode, isEnoent, isIgnored, isMissing, unlessEnoent } from '../fsops.js';
 import { fileWorkflowId } from '../ids.js';
 import type { FileRef, ScanResult } from '../types.js';
 import type { FileWorkflow } from '../workflows.js';
@@ -32,14 +32,12 @@ const isLitter = (name: string): boolean => name === '.DS_Store' || name.startsW
 type Snapshot = Map<string, { size: bigint; mtimeNs: bigint }>;
 
 const isNotEmpty = (e: unknown): boolean => ['ENOTEMPTY', 'EEXIST'].includes(errCode(e) ?? '');
-/** The path is gone: removed, or a parent directory was replaced by a file. */
-const isGone = (e: unknown): boolean => isEnoent(e) || errCode(e) === 'ENOTDIR';
 
 async function statOrNull(path: string) {
   try {
     return await stat(path, { bigint: true });
   } catch (e) {
-    if (isGone(e)) return null;
+    if (isMissing(e)) return null;
     throw e;
   }
 }
@@ -115,7 +113,7 @@ export function makeScan(deps: Deps) {
     const old = new Set<string>();
     for (const dir of paths) {
       const st = await lstat(dir).catch((e: unknown) => {
-        if (isGone(e)) return null;
+        if (isMissing(e)) return null;
         throw e;
       });
       if (st?.isDirectory() && st.mtimeMs <= cutoff) old.add(dir);
@@ -130,7 +128,7 @@ export function makeScan(deps: Deps) {
         await rmdir(dir);
         removed++;
       } catch (e) {
-        if (isGone(e) || isNotEmpty(e)) continue; // gone already, or something arrived: keep it
+        if (isMissing(e) || isNotEmpty(e)) continue; // gone already, or something arrived: keep it
         throw e;
       }
     }

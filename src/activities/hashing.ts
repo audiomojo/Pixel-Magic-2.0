@@ -1,8 +1,6 @@
-import { join } from 'node:path';
 import { ApplicationFailure } from '@temporalio/activity';
 import workerpool, { type Pool } from 'workerpool';
 import type { WireFacts } from '../types.js';
-import { vaultRel } from '../fsops.js';
 import { toSigned } from '../hashing.js';
 import type { DecodeKilledType, DecodeResult } from '../types.js';
 import type { Deps } from './index.js';
@@ -57,7 +55,7 @@ export function makeHashing(deps: Deps) {
 
   /** Queue `cpu`. No database access and no skip check (spec §12 R4): it always decodes. */
   async function decodeContent(sha256: string, ext: string): Promise<DecodeResult> {
-    const abs = join(layout.root, vaultRel(sha256, ext));
+    const abs = layout.vaultFile(sha256, ext);
     try {
       const facts = (await deps.decodePool
         .exec('computeImageFacts', [abs, ext])

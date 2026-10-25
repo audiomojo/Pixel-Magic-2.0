@@ -2,21 +2,13 @@ import { readdir, stat } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import heicDecode from 'heic-decode';
 import sharp from 'sharp';
+import { isHeifHead } from '../formats.js';
+import { unlessEnoent } from '../fsops.js';
 import { GuardedFs, readFsOps, type SourcePath } from './paths.js';
 
 const THUMB_PX = 256;
 /** Sources bigger than this are not thumbnailed (the whole file is read into memory). */
 const MAX_SOURCE_BYTES = 256 * 1024 * 1024;
-const HEIF_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1']);
-
-/** HEIC/HEIF by content (`ftyp` box), since extensions lie. */
-function isHeif(b: Buffer): boolean {
-  return (
-    b.length > 12 &&
-    b.toString('latin1', 4, 8) === 'ftyp' &&
-    HEIF_BRANDS.has(b.toString('latin1', 8, 12))
-  );
-}
 
 async function readSource(src: SourcePath): Promise<Buffer> {
   const fh = await readFsOps.openRead(src);
@@ -29,7 +21,7 @@ async function readSource(src: SourcePath): Promise<Buffer> {
 }
 
 async function render(input: Buffer): Promise<Buffer> {
-  if (isHeif(input)) {
+  if (isHeifHead(input)) {
     const { width, height, data } = await heicDecode({ buffer: input });
     return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), {
       raw: { width, height, channels: 4 },
@@ -72,10 +64,7 @@ export async function evictThumbs(
   capBytes: number,
   fs: GuardedFs = new GuardedFs([dir]),
 ): Promise<number> {
-  const names = await readdir(dir).catch((e: NodeJS.ErrnoException) => {
-    if (e.code === 'ENOENT') return [] as string[];
-    throw e;
-  });
+  const names = (await unlessEnoent(readdir(dir))) ?? [];
   const files: { path: string; size: number; mtime: number }[] = [];
   for (const n of names) {
     if (n.endsWith('.part')) continue;

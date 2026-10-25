@@ -49,15 +49,22 @@ export function ago(date, now = new Date()) {
   return day(t);
 }
 
-/** `disk 74 % (limit 80 %) · backlog 12,400 (limit 20,000)`; '' when the server sent no gate. */
+/**
+ * `disk 74 % (limit 80 %) · backlog 12,400 (limit 20,000)`, plus the pending bytes when a
+ * byte limit is set; '' when the server sent no gate.
+ */
 export function gateLine(state) {
   const g = state && state.gate;
   if (!g) return '';
   const limit = (v, fmt) => (num(v) === null ? '' : ` (limit ${fmt(v)})`);
-  return [
+  const parts = [
     `disk ${Math.round(Number(g.diskPct))} %${limit(g.diskLimit, (v) => `${v} %`)}`,
     `backlog ${count(g.backlog)}${limit(g.backlogLimit, count)}`,
-  ].join(' · ');
+  ];
+  if (num(g.pendingBytesLimit) !== null) {
+    parts.push(`${bytes(g.pendingBytes)}${limit(g.pendingBytesLimit, bytes)}`);
+  }
+  return parts.join(' · ');
 }
 
 /**

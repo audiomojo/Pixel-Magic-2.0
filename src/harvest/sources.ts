@@ -1,7 +1,9 @@
 import * as fsp from 'node:fs/promises';
 import { basename, dirname, resolve, sep } from 'node:path';
 import type pg from 'pg';
+import { withTx } from '../db.js';
 import { logger } from '../logger.js';
+import { withTimeout } from './timeout.js';
 
 export interface MountEntry {
   device: string;
@@ -95,11 +97,9 @@ export interface DetectOptions {
 class FsTimeout extends Error {}
 
 function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const limit = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new FsTimeout()), ms);
+  return withTimeout(work, ms, () => {
+    throw new FsTimeout();
   });
-  return Promise.race([work, limit]).finally(() => clearTimeout(timer));
 }
 
 /** True when `dataDir` lies inside the volume mounted at `root` (device+inode, then casefolded path). */
@@ -258,11 +258,9 @@ export async function registerDetected(
     if (!d.probeFailed && isReservedLabel(d.labelBase))
       throw new Error(`reserved source label: ${d.labelBase}`);
   }
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  const resolved: DetectedSource[] = [];
+  const rows = await withTx(pool, async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('harvest_sources'))");
-    const resolved: DetectedSource[] = [];
     for (const d0 of detected) {
       let d = d0;
       if (d0.probeFailed) {
@@ -303,30 +301,25 @@ export async function registerDetected(
         [d.identity, label, d.kind, d.mountPath],
       );
     }
-    const { rows } = await client.query<DbRow>(
+    const all = await client.query<DbRow>(
       `SELECT id::text AS id, identity, label, kind, last_mount_path, last_seen_at
        FROM harvest_sources ORDER BY id`,
     );
-    await client.query('COMMIT');
-    const now = new Set(resolved.map((d) => d.identity));
-    return {
-      rows: rows.map((r) => ({
-        id: r.id,
-        identity: r.identity,
-        label: r.label,
-        kind: r.kind,
-        lastMountPath: r.last_mount_path,
-        lastSeenAt: r.last_seen_at,
-        mounted: now.has(r.identity),
-      })),
-      unidentified,
-    };
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally {
-    client.release();
-  }
+    return all.rows;
+  });
+  const now = new Set(resolved.map((d) => d.identity));
+  return {
+    rows: rows.map((r) => ({
+      id: r.id,
+      identity: r.identity,
+      label: r.label,
+      kind: r.kind,
+      lastMountPath: r.last_mount_path,
+      lastSeenAt: r.last_seen_at,
+      mounted: now.has(r.identity),
+    })),
+    unidentified,
+  };
 }
 
 /** The current mount path of the source with this id, or null when it is not mounted. */

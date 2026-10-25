@@ -2,6 +2,7 @@
 // GuardedFs confined to the log directory (DATA_DIR/logs), like every other harvester write.
 import { stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { unlessEnoent } from '../fsops.js';
 import { GuardedFs } from './paths.js';
 
 /**
@@ -20,12 +21,9 @@ export async function rotateIfLarge(
     () => 0,
   );
   if (size <= maxBytes) return false;
-  const quiet = (e: NodeJS.ErrnoException): void => {
-    if (e.code !== 'ENOENT') throw e;
-  };
-  await fs.unlink(`${path}.${keep}`).catch(quiet);
+  await unlessEnoent(fs.unlink(`${path}.${keep}`));
   for (let i = keep - 1; i >= 1; i--)
-    await fs.rename(`${path}.${i}`, `${path}.${i + 1}`).catch(quiet);
+    await unlessEnoent(fs.rename(`${path}.${i}`, `${path}.${i + 1}`));
   await fs.rename(path, `${path}.1`);
   return true;
 }

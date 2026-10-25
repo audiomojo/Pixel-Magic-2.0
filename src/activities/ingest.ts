@@ -11,7 +11,6 @@ import {
   sameFile,
   sha256File,
   unlessEnoent,
-  vaultRel,
 } from '../fsops.js';
 import type { Metadata } from '../metadata.js';
 import type { FileRef, IngestResult } from '../types.js';
@@ -51,12 +50,9 @@ function extOf(meta: Metadata): string {
 
 export function makeIngestFile(deps: Deps) {
   const { pool, layout, metadata } = deps;
-  const claimedPath = (id: string) => join(layout.claimed, id);
-  const copiesPath = (id: string, ext: string) => join(layout.vaultCopies, `${id}.${ext}`);
-  const vaultPath = (sha: string, ext: string) => join(layout.root, vaultRel(sha, ext));
   /** Where a hashed row's bytes are kept: its .copies file for a COPY, else the vault file. */
   const keptPath = (id: string, state: string, sha: string, ext: string) =>
-    state === 'COPY' ? copiesPath(id, ext) : vaultPath(sha, ext);
+    state === 'COPY' ? layout.copiesFile(id, ext) : layout.vaultFile(sha, ext);
 
   /** `UPDATE files … WHERE id AND state IN (allowed)`; throws StaleAttemptError if no row moved. */
   async function guarded(
@@ -78,8 +74,8 @@ export function makeIngestFile(deps: Deps) {
   async function finish(id: string, keep: string, sha: string): Promise<void> {
     const k = await statOrNull(keep);
     if (!k) return;
-    if (await sameFile(claimedPath(id), keep, sha, () => heartbeat()))
-      await unlink(claimedPath(id));
+    if (await sameFile(layout.claimedFile(id), keep, sha, () => heartbeat()))
+      await unlink(layout.claimedFile(id));
     if ((k.mode & 0o777) !== 0o444) await chmod(keep, 0o444);
   }
 
@@ -102,7 +98,7 @@ export function makeIngestFile(deps: Deps) {
 
   async function commitCopy(row: Row, sha: string, ext: string): Promise<IngestResult> {
     await guarded(pool, row.id, `state = 'COPY'`, ['CLAIMED']);
-    await finish(row.id, copiesPath(row.id, ext), sha);
+    await finish(row.id, layout.copiesFile(row.id, ext), sha);
     return { fileId: row.id, sha256: sha, ext, state: 'COPY', kind: null };
   }
 
@@ -136,7 +132,7 @@ export function makeIngestFile(deps: Deps) {
       );
       await guarded(c, row.id, `state = 'INGESTED'`, ['CLAIMED']);
     });
-    await finish(row.id, vaultPath(sha, ext), sha);
+    await finish(row.id, layout.vaultFile(sha, ext), sha);
     return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', kind: meta.kind };
   }
 
@@ -189,7 +185,7 @@ export function makeIngestFile(deps: Deps) {
    * inode the row committed, it belongs to the committing attempt, which unlinks it itself.
    */
   async function putBack(ref: FileRef, id: string): Promise<void> {
-    const claimed = claimedPath(id);
+    const claimed = layout.claimedFile(id);
     const c = await statOrNull(claimed);
     if (!c) return;
     const r = await pool.query<{ state: string; sha256: string | null; ext: string | null }>(
@@ -228,7 +224,7 @@ export function makeIngestFile(deps: Deps) {
       return quarantineUnhashed(row.id, 'vanished', ['DISCOVERED']);
     }
     if (row.ext) {
-      const vault = vaultPath(row.sha256, row.ext);
+      const vault = layout.vaultFile(row.sha256, row.ext);
       const v = await statOrNull(vault);
       if (v)
         return commitOwner(row, row.sha256, row.ext, await metadata.read(vault), BigInt(v.size));
@@ -246,14 +242,14 @@ export function makeIngestFile(deps: Deps) {
 
     // Step 1: the row for this drop, keyed among non-final rows.
     const row = await upsert(ref, runId);
-    const claimed = claimedPath(row.id);
+    const claimed = layout.claimedFile(row.id);
     await deps.checkpoint?.('upsert');
 
     // Step 2: claim. An existing claimed file is never overwritten (a re-drop at the same path
     // waits for the next scan), and a copy already parked in .copies is committed as such.
     let claimedHere = false;
     if (!(await statOrNull(claimed))) {
-      if (row.sha256 && row.ext && (await statOrNull(copiesPath(row.id, row.ext)))) {
+      if (row.sha256 && row.ext && (await statOrNull(layout.copiesFile(row.id, row.ext)))) {
         await fsyncDir(layout.vaultCopies); // durable before COPY is committed
         return commitCopy(row, row.sha256, row.ext);
       }
@@ -312,12 +308,12 @@ export function makeIngestFile(deps: Deps) {
     await guarded(pool, row.id, `ext = $3`, ['CLAIMED'], [ext]);
 
     // Step 5: vault link. A different inode already there means a byte-identical copy.
-    const outcome = await linkIntoVault(claimed, vaultPath(sha, ext), sha, {
+    const outcome = await linkIntoVault(claimed, layout.vaultFile(sha, ext), sha, {
       onChunk: () => heartbeat(),
     });
     await deps.checkpoint?.('link');
     if (outcome === 'EXISTS_OTHER') {
-      await rename(claimed, copiesPath(row.id, ext));
+      await rename(claimed, layout.copiesFile(row.id, ext));
       await fsyncDir(layout.vaultCopies); // the rename is durable before COPY is committed
       await deps.checkpoint?.('copies_rename');
       return commitCopy(row, sha, ext);

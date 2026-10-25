@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Context, heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
 import { withTx } from '../db.js';
+import { errCode, errText, isEnoent } from '../fsops.js';
 import type { HarvestDeps } from './activities.js';
 import {
   childContext,
@@ -42,10 +43,9 @@ const BATCH = 500;
 const STAT_CONCURRENCY = 16;
 const GONE_CODES = new Set(['ENOENT', 'EIO', 'ENOTCONN', 'ENXIO', 'ETIMEDOUT']);
 
-const isGone = (e: unknown): boolean => GONE_CODES.has((e as NodeJS.ErrnoException).code ?? '');
+const isGone = (e: unknown): boolean => GONE_CODES.has(errCode(e) ?? '');
 const DENIED_CODES = new Set(['EPERM', 'EACCES']);
-const isDenied = (e: unknown): boolean => DENIED_CODES.has((e as NodeJS.ErrnoException).code ?? '');
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const isDenied = (e: unknown): boolean => DENIED_CODES.has(errCode(e) ?? '');
 
 interface Entry {
   name: string;
@@ -121,7 +121,7 @@ export async function resolveComponent(
   try {
     return (await io.lstat(childPath(parent, direct))).isDirectory() ? direct : null;
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    if (!isEnoent(e)) throw e;
   }
   return (
     (await io.listDir(parent)).find((e) => e.isDir && e.name.normalize('NFC') === name) ?? null

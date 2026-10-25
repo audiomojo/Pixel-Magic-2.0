@@ -3,8 +3,13 @@ import { link, mkdir, open, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative } from 'node:path';
 
-export const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+export const errCode = (e: unknown): string | undefined =>
+  (e as NodeJS.ErrnoException | null | undefined)?.code;
 export const isEnoent = (e: unknown): boolean => errCode(e) === 'ENOENT';
+/** The path is gone: removed, or a parent directory was replaced by a file. */
+export const isMissing = (e: unknown): boolean => isEnoent(e) || errCode(e) === 'ENOTDIR';
+/** An error's message, or the thrown value as text. */
+export const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** `p`'s value, or null when it rejected with ENOENT (any other error propagates). */
 export async function unlessEnoent<T>(p: Promise<T>): Promise<T | null> {
@@ -39,15 +44,39 @@ export class DataLayout {
     this.staging = join(root, 'staging');
   }
 
+  /** Every directory of the layout, by name. */
+  dirs(): [name: string, path: string][] {
+    return [
+      ['dropzone', this.dropzone],
+      ['claimed', this.claimed],
+      ['vault', this.vault],
+      ['vaultCopies', this.vaultCopies],
+      ['staging', this.staging],
+    ];
+  }
+
   async ensure(): Promise<void> {
-    for (const d of [this.dropzone, this.claimed, this.vaultCopies, this.staging]) {
-      await mkdir(d, { recursive: true });
-    }
+    for (const [, d] of this.dirs()) await mkdir(d, { recursive: true });
   }
 
   /** Path relative to the data root, as stored in the database. */
   rel(abs: string): string {
     return relative(this.root, abs);
+  }
+
+  /** A file being ingested, named by its `files.id`. */
+  claimedFile(id: string): string {
+    return join(this.claimed, id);
+  }
+
+  /** A byte-identical drop parked until its removal (`.copies/<files.id>.<ext>`). */
+  copiesFile(id: string, ext: string): string {
+    return join(this.vaultCopies, `${id}.${ext}`);
+  }
+
+  /** The vault file holding this content. */
+  vaultFile(sha256: string, ext: string): string {
+    return join(this.root, vaultRel(sha256, ext));
   }
 }
 
@@ -56,14 +85,7 @@ type DevStat = (path: string) => Promise<{ dev: number }>;
 /** Throws SameDeviceError unless every layout directory is on the same device as the root. */
 export async function checkSameDevice(layout: DataLayout, statFn: DevStat = stat): Promise<void> {
   const rootDev = (await statFn(layout.root)).dev;
-  const dirs: [string, string][] = [
-    ['dropzone', layout.dropzone],
-    ['claimed', layout.claimed],
-    ['vault', layout.vault],
-    ['vaultCopies', layout.vaultCopies],
-    ['staging', layout.staging],
-  ];
-  for (const [name, dir] of dirs) {
+  for (const [name, dir] of layout.dirs()) {
     const dev = (await statFn(dir)).dev;
     if (dev !== rootDev) {
       throw new SameDeviceError(`${name} (${dir}) is on device ${dev}, root is on ${rootDev}`);
@@ -73,6 +95,11 @@ export async function checkSameDevice(layout: DataLayout, statFn: DevStat = stat
 
 export function vaultRel(sha256: string, ext: string): string {
   return `vault/${sha256.slice(0, 2)}/${sha256.slice(2, 4)}/${sha256}.${ext}`;
+}
+
+/** The sha256 a vault file name claims (the inverse of `vaultRel`'s file name). */
+export function shaOfVaultName(name: string): string {
+  return name.split('.')[0]!;
 }
 
 const CHUNK = 1 << 20;

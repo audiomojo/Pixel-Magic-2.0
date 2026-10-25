@@ -8,6 +8,7 @@ import { extname, join, sep } from 'node:path';
 import type pg from 'pg';
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { errCode, errText, isMissing } from '../fsops.js';
 import type { RunControl } from './activities.js';
 import { childContext, keepDir, ROOT_CONTEXT, type DirContext } from './classify.js';
 import type { HarvestSettings } from './config.js';
@@ -27,6 +28,8 @@ import {
   type SourceRow,
   type SystemProbe,
 } from './sources.js';
+import { measureBacklog } from './throttle.js';
+import { withTimeout } from './timeout.js';
 import { evictThumbs, makeThumb, placeholderJpeg } from './thumbs.js';
 
 export interface HarvestServerDeps {
@@ -54,8 +57,6 @@ const BODY_LIMIT = 1024 * 1024;
 /** A database id in a path or body. */
 const ID_RE = /^\d{1,15}$/;
 
-const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
-const isMissing = (e: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes(errCode(e) ?? '');
 const isDenied = (e: unknown): boolean => ['EPERM', 'EACCES'].includes(errCode(e) ?? '');
 
 /** What the page shows when macOS refuses a listing (README: granting drive access). */
@@ -175,13 +176,10 @@ function parse<T extends z.ZodType>(schema: T, value: unknown): z.output<T> {
   return r.data;
 }
 
-const timeout = <T>(work: Promise<T>, ms: number, what: string): Promise<T> => {
-  let timer: NodeJS.Timeout | undefined;
-  const limit = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new HttpError(504, `${what} timed out`)), ms);
+const timeout = <T>(work: Promise<T>, ms: number, what: string): Promise<T> =>
+  withTimeout(work, ms, () => {
+    throw new HttpError(504, `${what} timed out`);
   });
-  return Promise.race([work, limit]).finally(() => clearTimeout(timer));
-};
 
 export function createHarvestServer(d: HarvestServerDeps): http.Server {
   const { pool, settings, sys, control } = d;
@@ -243,10 +241,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       sizePending.set(id, call);
       void call.finally(() => sizePending.delete(id));
     }
-    const size = await Promise.race([
-      call,
-      new Promise<null>((r) => setTimeout(() => r(null), statfsTimeoutMs)),
-    ]);
+    const size = await withTimeout(call, statfsTimeoutMs, () => null);
     sizes.set(id, { at: Date.now(), size });
     return size;
   }
@@ -313,18 +308,14 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   async function gateStatus(): Promise<Json> {
     const f = await sys.statfs(settings.dataDir);
     const used = f.blocks - f.bavail;
-    const { rows } = await pool.query<{ files: string; sent: string }>(
-      `SELECT s.pending_files::text AS files,
-              (SELECT count(*) FROM harvest_items
-                WHERE state = 'SENT' AND file_id IS NULL
-                  AND sent_at > now() - interval '1 hour')::text AS sent
-       FROM scan_stats s WHERE s.id = 1`,
-    );
+    const { backlog, pendingBytes } = await measureBacklog(pool);
     return {
       diskPct: f.blocks > 0n ? Number((used * 1000n) / f.blocks) / 10 : 0,
       diskLimit: settings.maxDiskPct,
-      backlog: Math.max(Number(rows[0]?.files ?? 0), Number(rows[0]?.sent ?? 0)),
+      backlog,
       backlogLimit: settings.maxPendingFiles,
+      pendingBytes,
+      pendingBytesLimit: settings.maxPendingBytes,
     };
   }
 
@@ -378,7 +369,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     try {
       return await work();
     } catch (e) {
-      throw new HttpError(502, `${what} failed: ${e instanceof Error ? e.message : String(e)}`);
+      throw new HttpError(502, `${what} failed: ${errText(e)}`);
     }
   };
 

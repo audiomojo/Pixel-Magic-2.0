@@ -1,4 +1,5 @@
 import { ExifTool } from 'exiftool-vendored';
+import { STILL_FILE_TYPES } from './formats.js';
 
 export interface Metadata {
   /** exiftool `MIMEType`: the only source of `contents.mime`. */
@@ -12,25 +13,6 @@ export interface Metadata {
   liveContentId: string | null;
   durationS: number | null;
 }
-
-const STILL_TYPES = new Set([
-  'JPEG',
-  'PNG',
-  'HEIC',
-  'HEIF',
-  'WEBP',
-  'TIFF',
-  'GIF',
-  'BMP',
-  'DNG',
-  'CR2',
-  'CR3',
-  'NEF',
-  'ARW',
-  'ORF',
-  'RW2',
-  'RAF',
-]);
 
 const str = (v: unknown): string | null => {
   if (typeof v === 'string') return v.trim() === '' ? null : v.trim();
@@ -79,7 +61,7 @@ export function parseMetadata(tags: Record<string, unknown>): Metadata {
   const mime = str(tags['File:MIMEType']) ?? '';
   const rawExt = (str(tags['File:FileTypeExtension']) ?? '').toLowerCase();
   const kind =
-    mime.startsWith('image/') && STILL_TYPES.has(fileType)
+    mime.startsWith('image/') && STILL_FILE_TYPES.has(fileType)
       ? 'still'
       : mime.startsWith('video/')
         ? 'motion'

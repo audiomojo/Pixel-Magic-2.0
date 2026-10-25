@@ -63,6 +63,15 @@ describe('gateLine', () => {
       gateLine({ gate: { diskPct: 74.2, diskLimit: 80, backlog: 12400, backlogLimit: 20000 } }),
     ).toBe('disk 74 % (limit 80 %) · backlog 12,400 (limit 20,000)');
   });
+  it('adds the pending bytes when a byte limit is set', () => {
+    const gate = { diskPct: 50, diskLimit: 80, backlog: 10, backlogLimit: 20000 };
+    expect(gateLine({ gate: { ...gate, pendingBytes: 1.2e9, pendingBytesLimit: null } })).toBe(
+      'disk 50 % (limit 80 %) · backlog 10 (limit 20,000)',
+    );
+    expect(gateLine({ gate: { ...gate, pendingBytes: 1.2e9, pendingBytesLimit: 2e9 } })).toBe(
+      'disk 50 % (limit 80 %) · backlog 10 (limit 20,000) · 1.2 GB (limit 2.0 GB)',
+    );
+  });
   it('is empty without a gate', () => {
     expect(gateLine({ gate: null })).toBe('');
     expect(gateLine({})).toBe('');

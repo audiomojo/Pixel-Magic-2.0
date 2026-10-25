@@ -24,6 +24,7 @@ import { startNextQueued } from './runs.js';
 import { linkFiles } from './send.js';
 import { createHarvestServer } from './server.js';
 import { realSystem } from './system.js';
+import { withTimeout } from './timeout.js';
 
 const here = (file: string) => fileURLToPath(new URL(file, import.meta.url));
 const LOG_MAX_BYTES = 20 * 1024 * 1024;
@@ -140,10 +141,9 @@ async function main(): Promise<void> {
 
     const temporalHealthy = async (): Promise<boolean> => {
       try {
-        await Promise.race([
-          clientConnection.workflowService.getSystemInfo({}),
-          sleep(3000).then(() => Promise.reject(new Error('timeout'))),
-        ]);
+        await withTimeout(clientConnection.workflowService.getSystemInfo({}), 3000, () => {
+          throw new Error('timeout');
+        });
         return true;
       } catch {
         return false;

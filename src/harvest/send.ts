@@ -1,6 +1,7 @@
 import { dirname, join } from 'node:path';
 import { Context } from '@temporalio/activity';
 import type pg from 'pg';
+import { errCode, errText } from '../fsops.js';
 import type { HarvestDeps } from './activities.js';
 import { checkKnown, promoteDuplicates } from './known.js';
 import {
@@ -76,10 +77,7 @@ const TRANSIENT_CODES = new Set([
   'ENETUNREACH',
 ]);
 const isTransient = (e: unknown, sourceKind: string | null): boolean =>
-  TRANSIENT_CODES.has(code(e)) || (code(e) === 'EIO' && sourceKind === 'network');
-
-const code = (e: unknown): string => (e as NodeJS.ErrnoException | null)?.code ?? '';
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  TRANSIENT_CODES.has(errCode(e) ?? '') || (errCode(e) === 'EIO' && sourceKind === 'network');
 
 /** A throw from a test checkpoint: a simulated crash, never handled as an item error. */
 class Crash extends Error {
@@ -286,7 +284,7 @@ export function makeSendBatch(deps: HarvestDeps) {
     };
     const statOrNull = (p: SourcePath) =>
       ops.stat(p).catch((e: unknown) => {
-        if (code(e) === 'ENOENT') return null;
+        if (errCode(e) === 'ENOENT') return null;
         throw e;
       });
 
@@ -425,7 +423,7 @@ export function makeSendBatch(deps: HarvestDeps) {
             onChunk,
           });
         } catch (e) {
-          if (code(e) === 'ENOENT' && i < MKDIR_RETRIES && !(await gfs.exists(dirname(part)))) {
+          if (errCode(e) === 'ENOENT' && i < MKDIR_RETRIES && !(await gfs.exists(dirname(part)))) {
             continue;
           }
           throw e;
@@ -539,7 +537,7 @@ export function makeSendBatch(deps: HarvestDeps) {
             try {
               if (!(await gfs.publishNoReplace(part, finalAbs))) await removeIfExists(part);
             } catch (e) {
-              if (code(e) === 'EEXIST' && round < PUBLISH_RETRIES) {
+              if (errCode(e) === 'EEXIST' && round < PUBLISH_RETRIES) {
                 await removeIfExists(part);
                 continue;
               }
@@ -555,10 +553,11 @@ export function makeSendBatch(deps: HarvestDeps) {
         }
       } catch (e) {
         if (e instanceof Crash || signal.aborted) throw e;
-        if (DISK_FULL_CODES.has(code(e))) return { stop: 'DISK_FULL', reason: 'disk full' };
+        if (DISK_FULL_CODES.has(errCode(e) ?? ''))
+          return { stop: 'DISK_FULL', reason: 'disk full' };
         // Whatever errno a dying mount produces, an unplug never costs the item an attempt.
         if (!(await mount.alive())) return { stop: 'SOURCE_GONE', reason: `${it.label} unplugged` };
-        if (code(e) === 'ENOENT' && (await statOrNull(src)) === null) {
+        if (errCode(e) === 'ENOENT' && (await statOrNull(src)) === null) {
           return vanish(it, 'gone from the source');
         }
         if (isTransient(e, it.source_kind)) return flaky(it, `${it.rel_path}: ${errText(e)}`);

@@ -2,9 +2,8 @@
 // disk: in its vault file and in `vault/.copies/<id>.<ext>`. The `.copies` file is unlinked only
 // after a fresh re-hash of BOTH files equals `files.sha256`; anything else deletes nothing.
 import { lstat, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
-import { fsyncDir, sha256File, unlessEnoent, vaultRel } from '../fsops.js';
+import { fsyncDir, sha256File, unlessEnoent } from '../fsops.js';
 import type { ReclaimOutcome, SweepResult } from '../types.js';
 import type { Deps } from './index.js';
 import { ChangedWhileHashingError } from './ingest.js';
@@ -74,8 +73,8 @@ export function makeCopies(deps: Deps) {
     if (row.copy_removed_at !== null) return 'ALREADY_REMOVED';
     if (row.copy_mismatch) return 'MISMATCH';
     const { id, sha256: sha } = row;
-    const copy = join(layout.vaultCopies, `${String(id)}.${row.ext}`);
-    const vault = join(layout.root, vaultRel(sha, row.ext));
+    const copy = layout.copiesFile(String(id), row.ext);
+    const vault = layout.vaultFile(sha, row.ext);
 
     const c = await lstatOrNull(copy);
     const v = await lstatOrNull(vault);
