@@ -28,6 +28,7 @@ import {
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { DataLayout } from '../../src/fsops.js';
 import { runActivity } from '../helpers/activityEnv.js';
+import { tmpIsCaseInsensitive } from '../helpers/layout.js';
 import { tmpDir } from '../helpers/layout.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 import {
@@ -345,49 +346,53 @@ describe('copy protocol', () => {
     expect(MUT.test('openRead')).toBe(false);
   });
 
-  test('case-colliding names get a suffix and never overwrite', async () => {
-    const mine = randomBytes(4000);
-    const e = await setup({ 'DCIM/IMG_1.CR2': mine, 'DCIM/B.CR2': randomBytes(1000) });
-    // A pre-existing drop-zone file with another case, and another unlinked SENT item's name.
-    const theirs = randomBytes(1234);
-    await mkdir(join(e.dz, 'harvest/Drive/DCIM'), { recursive: true });
-    await writeFile(join(e.dz, 'harvest/Drive/DCIM/img_1.cr2'), theirs);
-    await pgh.pool.query(
-      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state, dropzone_path, sent_at)
+  // Names collide only on a case-insensitive volume, as on the Macs the harvester runs on.
+  test.runIf(tmpIsCaseInsensitive)(
+    'case-colliding names get a suffix and never overwrite',
+    async () => {
+      const mine = randomBytes(4000);
+      const e = await setup({ 'DCIM/IMG_1.CR2': mine, 'DCIM/B.CR2': randomBytes(1000) });
+      // A pre-existing drop-zone file with another case, and another unlinked SENT item's name.
+      const theirs = randomBytes(1234);
+      await mkdir(join(e.dz, 'harvest/Drive/DCIM'), { recursive: true });
+      await writeFile(join(e.dz, 'harvest/Drive/DCIM/img_1.cr2'), theirs);
+      await pgh.pool.query(
+        `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state, dropzone_path, sent_at)
        VALUES ($1, 'old/b.cr2', 'old/b.cr2', 1, 1, 'photo', 'SENT', 'harvest/Drive/DCIM/b.cr2', now())`,
-      [e.sourceId],
-    );
-    let crashed = false;
-    await expect(
-      e.send({
-        checkpoint: (n) => {
-          if (n === 'send_renamed' && !crashed) {
-            crashed = true;
-            throw new Error('crash');
-          }
-        },
-      }),
-    ).rejects.toThrow('crash');
-    const res = await e.send();
-    expect(res).toMatchObject({ sent: 2 });
-    expect((await item('DCIM/IMG_1.CR2')).dropzone_path).toBe('harvest/Drive/DCIM/IMG_1 (2).CR2');
-    expect((await item('DCIM/B.CR2')).dropzone_path).toBe('harvest/Drive/DCIM/B (2).CR2');
-    expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/img_1.cr2'))).toEqual(theirs);
-    expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/IMG_1 (2).CR2'))).toEqual(mine);
-    const listing = await listDz(e.dz);
-    // Retry stable: nothing new on another batch or another run.
-    expect((await e.send()).sent).toBe(0);
-    await e.rerun();
-    expect((await e.send()).sent).toBe(0);
-    expect(await listDz(e.dz)).toEqual(listing);
-    expect(listing.map((p) => p.normalize()).sort()).toEqual(
-      [
-        'harvest/Drive/DCIM/B (2).CR2',
-        'harvest/Drive/DCIM/IMG_1 (2).CR2',
-        'harvest/Drive/DCIM/img_1.cr2',
-      ].sort(),
-    );
-  });
+        [e.sourceId],
+      );
+      let crashed = false;
+      await expect(
+        e.send({
+          checkpoint: (n) => {
+            if (n === 'send_renamed' && !crashed) {
+              crashed = true;
+              throw new Error('crash');
+            }
+          },
+        }),
+      ).rejects.toThrow('crash');
+      const res = await e.send();
+      expect(res).toMatchObject({ sent: 2 });
+      expect((await item('DCIM/IMG_1.CR2')).dropzone_path).toBe('harvest/Drive/DCIM/IMG_1 (2).CR2');
+      expect((await item('DCIM/B.CR2')).dropzone_path).toBe('harvest/Drive/DCIM/B (2).CR2');
+      expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/img_1.cr2'))).toEqual(theirs);
+      expect(await readFile(join(e.dz, 'harvest/Drive/DCIM/IMG_1 (2).CR2'))).toEqual(mine);
+      const listing = await listDz(e.dz);
+      // Retry stable: nothing new on another batch or another run.
+      expect((await e.send()).sent).toBe(0);
+      await e.rerun();
+      expect((await e.send()).sent).toBe(0);
+      expect(await listDz(e.dz)).toEqual(listing);
+      expect(listing.map((p) => p.normalize()).sort()).toEqual(
+        [
+          'harvest/Drive/DCIM/B (2).CR2',
+          'harvest/Drive/DCIM/IMG_1 (2).CR2',
+          'harvest/Drive/DCIM/img_1.cr2',
+        ].sort(),
+      );
+    },
+  );
 
   test('a re-sent name whose earlier copy is still pending gets (2)', async () => {
     const first = randomBytes(2000);
@@ -1210,7 +1215,7 @@ describe('paging (I5)', () => {
     const dplan = dup.rows.map((x) => x['QUERY PLAN']).join('\n');
     expect(dplan).toMatch(/harvest_items_duplicate_of_idx/);
     console.log(`EXPLAIN promoteDuplicates lookup (120k rows):\n${dplan}`);
-  });
+  }, 30_000); // loads 120k rows
 });
 
 describe('send-only runs (F-1)', () => {
