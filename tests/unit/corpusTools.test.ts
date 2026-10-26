@@ -34,6 +34,9 @@ import {
 import { HEIC_SCENE0 } from '../helpers/images.js';
 import { tmpDir } from '../helpers/layout.js';
 
+/** The corpus tools use macOS `sips` and APFS clones. */
+const macTest = test.runIf(process.platform === 'darwin');
+
 let tmp: string;
 beforeAll(async () => {
   tmp = await tmpDir();
@@ -282,7 +285,7 @@ describe('subsets', () => {
 });
 
 describe('manifest', () => {
-  test('manifest numbers are decimal strings', async () => {
+  macTest('manifest numbers are decimal strings', async () => {
     const rec0 = (await manifestOf(await makeCorpus())).records[0]!;
     expect(rec0.size).toMatch(/^\d+$/);
     expect(rec0.mtimeNs).toMatch(/^\d+$/);
@@ -295,7 +298,7 @@ describe('manifest', () => {
     expect(await loadManifest(p)).toEqual(m);
   });
 
-  test('records carry independent facts; the cache is reused', async () => {
+  macTest('records carry independent facts; the cache is reused', async () => {
     const src = await makeCorpus();
     await writeFile(join(src, 'notes.jpg'), 'plain text, not a JPEG');
     await writeFile(join(src, '.DS_Store'), 'ignored');
@@ -344,7 +347,7 @@ describe('manifest', () => {
     expect(again.records.find((r) => r.name === 'a.jpg')!.sha256).toBe('from-cache');
   });
 
-  test('verify detects drift', async () => {
+  macTest('verify detects drift', async () => {
     const src = await makeCorpus();
     const m = await manifestOf(src);
     expect(await verify(src, m, true)).toEqual([]);
@@ -357,7 +360,7 @@ describe('manifest', () => {
     );
   });
 
-  test('verify: same-size rewrite needs deep; unexpected files are drift', async () => {
+  macTest('verify: same-size rewrite needs deep; unexpected files are drift', async () => {
     const src = await makeCorpus();
     const p = join(src, 'd.png');
     await utimes(p, 1_600_000_000, 1_600_000_000); // whole seconds survive a utimes round trip
@@ -386,84 +389,87 @@ describe('seed', () => {
     expect(existsSync(`${tmp}/dz/a.jpg`)).toBe(true);
   });
 
-  test('seed manifest: hashes, mtimes kept, nested layout, extras, synthetic variants', async () => {
-    const src = await makeCorpus();
-    const before = await snapshot(src);
-    const m = await manifestOf(src);
-    const dest = join(tmp, 'dz-nested');
-    const sm = await seed({
-      corpusDir: src,
-      names: ['a.jpg', 'b.jpg', 'c.jpg', 'e.heic'],
-      dest,
-      layout: 'nested',
-      shuffle: 3,
-      extras: ['junk', 'corrupt'],
-      synthetic: true,
-      prefix: 'z-',
-    });
-    expect(await snapshot(src)).toEqual(before);
-    expect(sm.dest).toBe(dest);
-    const truth = new Map(m.records.map((r) => [r.name, r]));
-    for (const f of sm.files) {
-      const s = await stat(join(dest, f.relPath), { bigint: true });
-      expect([f.size, f.mtimeNs]).toEqual([String(s.size), String(s.mtimeNs)]);
-    }
-    const corpus = sm.files.filter((f) => f.origin === 'corpus');
-    expect(corpus.map((f) => f.name).sort()).toEqual(['a.jpg', 'b.jpg', 'c.jpg', 'e.heic']);
-    for (const f of corpus) {
-      expect(f.relPath).toMatch(/^d\d Été\/e\d 写真\//); // nested Unicode directories
-      expect(f.sha256).toBe(truth.get(f.name)!.sha256);
-      expect(f.mtimeNs).toBe(truth.get(f.name)!.mtimeNs);
-    }
-    expect(sm.files.filter((f) => f.origin === 'junk').length).toBeGreaterThan(0);
-    expect(
-      sm.files
-        .filter((f) => f.origin === 'corrupt')
-        .map((f) => f.reason)
-        .sort(),
-    ).toEqual(['decode_error', 'truncated']);
+  macTest(
+    'seed manifest: hashes, mtimes kept, nested layout, extras, synthetic variants',
+    async () => {
+      const src = await makeCorpus();
+      const before = await snapshot(src);
+      const m = await manifestOf(src);
+      const dest = join(tmp, 'dz-nested');
+      const sm = await seed({
+        corpusDir: src,
+        names: ['a.jpg', 'b.jpg', 'c.jpg', 'e.heic'],
+        dest,
+        layout: 'nested',
+        shuffle: 3,
+        extras: ['junk', 'corrupt'],
+        synthetic: true,
+        prefix: 'z-',
+      });
+      expect(await snapshot(src)).toEqual(before);
+      expect(sm.dest).toBe(dest);
+      const truth = new Map(m.records.map((r) => [r.name, r]));
+      for (const f of sm.files) {
+        const s = await stat(join(dest, f.relPath), { bigint: true });
+        expect([f.size, f.mtimeNs]).toEqual([String(s.size), String(s.mtimeNs)]);
+      }
+      const corpus = sm.files.filter((f) => f.origin === 'corpus');
+      expect(corpus.map((f) => f.name).sort()).toEqual(['a.jpg', 'b.jpg', 'c.jpg', 'e.heic']);
+      for (const f of corpus) {
+        expect(f.relPath).toMatch(/^d\d Été\/e\d 写真\//); // nested Unicode directories
+        expect(f.sha256).toBe(truth.get(f.name)!.sha256);
+        expect(f.mtimeNs).toBe(truth.get(f.name)!.mtimeNs);
+      }
+      expect(sm.files.filter((f) => f.origin === 'junk').length).toBeGreaterThan(0);
+      expect(
+        sm.files
+          .filter((f) => f.origin === 'corrupt')
+          .map((f) => f.reason)
+          .sort(),
+      ).toEqual(['decode_error', 'truncated']);
 
-    const synth = sm.files.filter((f) => f.origin === 'synthetic');
-    const variants = (seedName: string) =>
-      synth
-        .filter((f) => f.seedName === seedName)
-        .map((f) => f.variant)
-        .sort();
-    expect(variants('a.jpg')).toEqual(['png', 'q60-noexif', 'resize50']);
-    expect(variants('e.heic')).toEqual(['png', 'q60-noexif', 'resize50']);
-    expect(variants('b.jpg')).toEqual(['bridge', 'png', 'q60-noexif', 'resize50']);
-    expect(synth.every((f) => f.name.startsWith('z-'))).toBe(true);
-    const truthOf = (seedName: string, variant: string) =>
-      synth
-        .filter((f) => f.seedName === seedName && f.variant === variant)
-        .map((f) => [f.expect, f.bridges ?? null]);
-    // a.jpg has no capture time: a same-size, same-mime re-encode is only "similar" (§6.3 row 8).
-    // Rows 7–8 (and 6) need the copy distances, which the oracle can't measure: copy-if-tight.
-    expect(truthOf('a.jpg', 'resize50')).toEqual([['copy-if-tight', null]]);
-    expect(truthOf('a.jpg', 'q60-noexif')).toEqual([['similar', null]]);
-    expect(truthOf('a.jpg', 'png')).toEqual([['copy-if-tight', null]]);
-    expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy-if-tight', null]]);
-    // b.jpg and c.jpg are a burst: EXIF-kept variants are copies, EXIF-less ones are bridges.
-    expect(truthOf('b.jpg', 'resize50')).toEqual([['copy', null]]);
-    expect(truthOf('b.jpg', 'png')).toEqual([['copy', null]]);
-    expect(truthOf('b.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
-    expect(truthOf('b.jpg', 'bridge')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
-    expect(truthOf('c.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['c.jpg', 'b.jpg']]]);
-    const resized = synth.find((f) => f.seedName === 'b.jpg' && f.variant === 'resize50')!;
-    const meta = await sharp(join(dest, resized.relPath)).metadata();
-    expect([meta.width, meta.height, meta.exif !== undefined]).toEqual([32, 24, true]);
-    const bridge = synth.find((f) => f.variant === 'bridge')!;
-    expect((await sharp(join(dest, bridge.relPath)).metadata()).exif).toBeUndefined();
-    // Every variant carries its seed's mtime, so two runs seeded at different times stage the
-    // same names (an EXIF-less best copy is named by its file's mtime).
-    for (const f of synth) {
-      const [v, sd] = await Promise.all([
-        stat(join(dest, f.relPath)),
-        stat(join(src, f.seedName!)),
-      ]);
-      expect(Math.abs(v.mtimeMs - sd.mtimeMs), f.name).toBeLessThan(0.01);
-    }
-  });
+      const synth = sm.files.filter((f) => f.origin === 'synthetic');
+      const variants = (seedName: string) =>
+        synth
+          .filter((f) => f.seedName === seedName)
+          .map((f) => f.variant)
+          .sort();
+      expect(variants('a.jpg')).toEqual(['png', 'q60-noexif', 'resize50']);
+      expect(variants('e.heic')).toEqual(['png', 'q60-noexif', 'resize50']);
+      expect(variants('b.jpg')).toEqual(['bridge', 'png', 'q60-noexif', 'resize50']);
+      expect(synth.every((f) => f.name.startsWith('z-'))).toBe(true);
+      const truthOf = (seedName: string, variant: string) =>
+        synth
+          .filter((f) => f.seedName === seedName && f.variant === variant)
+          .map((f) => [f.expect, f.bridges ?? null]);
+      // a.jpg has no capture time: a same-size, same-mime re-encode is only "similar" (§6.3 row 8).
+      // Rows 7–8 (and 6) need the copy distances, which the oracle can't measure: copy-if-tight.
+      expect(truthOf('a.jpg', 'resize50')).toEqual([['copy-if-tight', null]]);
+      expect(truthOf('a.jpg', 'q60-noexif')).toEqual([['similar', null]]);
+      expect(truthOf('a.jpg', 'png')).toEqual([['copy-if-tight', null]]);
+      expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy-if-tight', null]]);
+      // b.jpg and c.jpg are a burst: EXIF-kept variants are copies, EXIF-less ones are bridges.
+      expect(truthOf('b.jpg', 'resize50')).toEqual([['copy', null]]);
+      expect(truthOf('b.jpg', 'png')).toEqual([['copy', null]]);
+      expect(truthOf('b.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
+      expect(truthOf('b.jpg', 'bridge')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
+      expect(truthOf('c.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['c.jpg', 'b.jpg']]]);
+      const resized = synth.find((f) => f.seedName === 'b.jpg' && f.variant === 'resize50')!;
+      const meta = await sharp(join(dest, resized.relPath)).metadata();
+      expect([meta.width, meta.height, meta.exif !== undefined]).toEqual([32, 24, true]);
+      const bridge = synth.find((f) => f.variant === 'bridge')!;
+      expect((await sharp(join(dest, bridge.relPath)).metadata()).exif).toBeUndefined();
+      // Every variant carries its seed's mtime, so two runs seeded at different times stage the
+      // same names (an EXIF-less best copy is named by its file's mtime).
+      for (const f of synth) {
+        const [v, sd] = await Promise.all([
+          stat(join(dest, f.relPath)),
+          stat(join(src, f.seedName!)),
+        ]);
+        expect(Math.abs(v.mtimeMs - sd.mtimeMs), f.name).toBeLessThan(0.01);
+      }
+    },
+  );
 
   test('shuffle changes only the copy order, never the content', async () => {
     const src = await makeCorpus();
@@ -474,7 +480,7 @@ describe('seed', () => {
     expect(one.files.map(key).sort()).toEqual(two.files.map(key).sort());
   });
 
-  test('same-stem HEIC and JPG seeds get distinct variant names', async () => {
+  macTest('same-stem HEIC and JPG seeds get distinct variant names', async () => {
     const src = await makeCorpus();
     await copyFile(join(src, 'a.jpg'), join(src, 'e.jpg'));
     const dest = join(tmp, 'dz-stem');
@@ -489,7 +495,7 @@ describe('seed', () => {
     ]);
   });
 
-  test('a tmp dir on APFS clones: no fallback copies', async () => {
+  macTest('a tmp dir on APFS clones: no fallback copies', async () => {
     const src = await makeCorpus();
     const sm = await seed({ corpusDir: src, names: ['a.jpg', 'b.jpg'], dest: join(tmp, 'cl') });
     expect(sm.fallbackCopies).toBe(0);
