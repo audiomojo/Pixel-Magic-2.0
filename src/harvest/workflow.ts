@@ -145,9 +145,10 @@ export async function HarvestWorkflow(input: HarvestInput): Promise<'done' | 'ca
     reason: string,
     timeout?: string,
   ): Promise<void> {
-    await show('paused', reason);
+    // Counted before the write: a resume that arrives while the pause is being shown counts.
     const seen = resumes;
     const woke = () => resumes !== seen;
+    await show('paused', reason);
     if (timeout === undefined) {
       await condition(woke);
       await show(work);
