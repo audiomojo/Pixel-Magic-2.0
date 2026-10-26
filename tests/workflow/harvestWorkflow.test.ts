@@ -45,6 +45,8 @@ interface Fakes {
   dryRun: boolean;
   sendOnly: boolean;
   folders: { folderId: string; state: string }[];
+  /** Runs inside setRunState before it returns (to act while the state is being written). */
+  onRunState?: (state: string) => Promise<void>;
 }
 function fakes(o: Partial<Fakes> = {}): Fakes {
   return {
@@ -101,9 +103,9 @@ const activities = {
     cur.calls.push(`folder ${folderId} ${state}`);
     return Promise.resolve();
   },
-  setRunState: (_runId: string, state: string, reason?: string | null) => {
+  setRunState: async (_runId: string, state: string, reason?: string | null) => {
     cur.calls.push(reason ? `state ${state}: ${reason}` : `state ${state}`);
-    return Promise.resolve();
+    await cur.onRunState?.(state);
   },
   finishRun: (_runId: string, outcome: string, error?: string) => {
     cur.calls.push(error ? `finishRun ${outcome}: ${error}` : `finishRun ${outcome}`);
@@ -334,6 +336,22 @@ test('PAUSED_ERRORS waits for resume', async () => {
   await h.signal('resume');
   expect(await h.result()).toBe('done');
 });
+
+test('a resume sent while the pause is being written is not lost', async () => {
+  let n = 0;
+  let handle!: (h: Handle) => void;
+  const started = new Promise<Handle>((r) => (handle = r));
+  const f = fakes({
+    send: () => (n++ === 0 ? batch('PAUSED_ERRORS', '25 errors in a row') : batch('DONE')),
+    // The signal reaches the workflow before setRunState('paused') completes.
+    onRunState: async (state) => {
+      if (state === 'paused') await (await started).signal('resume');
+    },
+  });
+  handle(await begin(f));
+  expect(await (await started).result()).toBe('done');
+  expect(count(f, 'sendBatch')).toBe(2);
+}, 20_000);
 
 test('cancel runs finishRun(cancelled) and startNextQueued', async () => {
   const f = fakes({ send: () => batch('DISK_FULL', 'disk full') });
