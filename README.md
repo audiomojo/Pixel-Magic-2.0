@@ -1,5 +1,7 @@
 # Pixel Magic 2.0
 
+[![CI](https://github.com/audiomojo/Pixel-Magic-2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/audiomojo/Pixel-Magic-2.0/actions/workflows/ci.yml)
+
 Photo de-duplication pipeline (TypeScript, Temporal, Postgres). Drop photos into
 `DATA_DIR/dropzone`; unique photos and copies are organised under `DATA_DIR/staging`.
 
