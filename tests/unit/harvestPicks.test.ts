@@ -9,7 +9,7 @@ import { DataLayout, vaultRel } from '../../src/fsops.js';
 import type { RunControl } from '../../src/harvest/activities.js';
 import type { AiControl } from '../../src/harvest/aiControl.js';
 import { loadHarvestSettings } from '../../src/harvest/config.js';
-import { signToken, verifyToken } from '../../src/harvest/picks.js';
+import { signToken, verifyToken, type PickToken } from '../../src/harvest/picks.js';
 import { createHarvestServer, type HarvestServerDeps } from '../../src/harvest/server.js';
 import type { SystemProbe } from '../../src/harvest/sources.js';
 import { placeholderJpeg } from '../../src/harvest/thumbs.js';
@@ -67,6 +67,15 @@ interface Env {
   post(path: string, body?: unknown): Promise<Res>;
 }
 
+/** The servers' token key, so tests can mint fresh tokens (each one is single-use). */
+const SECRET = Buffer.alloc(32, 42);
+let minted = 0;
+/** Another single-use token for the same shown set (a distinct iat, so a distinct MAC). */
+function reissue(token: string): string {
+  const t = JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString()) as PickToken;
+  return signToken(SECRET, { ...t, iat: t.iat - ++minted });
+}
+
 function fakeAi(): FakeAi {
   const ai: FakeAi = {
     calls: [],
@@ -115,6 +124,7 @@ async function setup(
     staticDir,
     temporalHealthy: () => Promise.resolve(true),
     detectOpts: { volumes: `${dataDir}/no-volumes/` },
+    picksSecret: SECRET,
     picksRng: () => 0.5, // never a random draw; a fixed shuffle
     ...o.deps,
   });
@@ -364,7 +374,7 @@ describe('POST /api/picks', () => {
     });
     expect([...rows[0].shown_sha256].sort()).toEqual([A, B, C]);
 
-    const m = await e.post('/api/picks', { token: n.token, chosen: A });
+    const m = await e.post('/api/picks', { token: reissue(n.token), chosen: A });
     expect(m.json).toEqual({ modelPick: B, modelVersion: v, matched: false });
   });
 
@@ -391,7 +401,7 @@ describe('POST /api/picks', () => {
 
   test('a forged, tampered or other-process token → 409 and no row', async () => {
     const e = await setup();
-    const other = await setup();
+    const other = await setup({ deps: { picksSecret: Buffer.alloc(32, 9) } });
     await set(1, [A, B]);
     const n = (await e.get('/api/picks/next')).json;
     const foreign = (await other.get('/api/picks/next')).json;
@@ -405,6 +415,60 @@ describe('POST /api/picks', () => {
       expect(r.json.error).toBe('reload the page');
     }
     expect(await pickCount()).toBe(0);
+  });
+
+  test('a token is single-use: a repeat returns the first response and stores nothing', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    for (let i = 0; i < 8; i++) await pickRow({ setId: 9, chosen: E, shown: [E, F] });
+    const v = await rankedModel({ [A]: 0.9, [B]: 0.1 });
+    const { token } = (await e.get('/api/picks/next')).json;
+    const first = await e.post('/api/picks', { token, chosen: B }); // 9th
+    expect(first.json).toEqual({ modelPick: A, modelVersion: v, matched: false });
+    // a double-click (concurrent) and a later retry, even with another answer
+    const again = await Promise.all([
+      e.post('/api/picks', { token, chosen: B }),
+      e.post('/api/picks', { token, chosen: A }),
+      e.post('/api/picks', { token, noClearBest: true }),
+    ]);
+    for (const r of again) {
+      expect(r.status).toBe(200);
+      expect(r.json).toEqual(first.json);
+    }
+    expect(await pickCount()).toBe(9);
+    expect(e.ai.calls).toEqual([]); // the repeats did not reach the 10th pick
+  });
+
+  test('a re-spelled MAC of a used token is the same token', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    const { token } = (await e.get('/api/picks/next')).json;
+    expect((await e.post('/api/picks', { token, chosen: A })).status).toBe(200);
+    const [payload, sig] = token.split('.') as [string, string];
+    // 32 bytes are 43 base64url characters: the last one's low 2 bits are padding.
+    const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const last = ALPHA.indexOf(sig.at(-1)!);
+    const variants = [1, 2, 3].map((x) => `${payload}.${sig.slice(0, -1)}${ALPHA[last ^ x]!}`);
+    variants.push(`${payload}.${sig}=`);
+    for (const t of variants) {
+      expect(Buffer.from(t.split('.')[1]!, 'base64url').equals(Buffer.from(sig, 'base64url'))).toBe(
+        true,
+      );
+      const r = await e.post('/api/picks', { token: t, chosen: B });
+      expect(r.status).toBe(200);
+      expect(r.json).toEqual({ modelPick: null, modelVersion: null, matched: null });
+    }
+    const { rows } = await pgh.pool.query('SELECT chosen_sha256 FROM picks');
+    expect(rows).toEqual([{ chosen_sha256: A }]);
+  });
+
+  test('a first POST refused with 400 does not use the token up', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    const { token } = (await e.get('/api/picks/next')).json;
+    expect((await e.post('/api/picks', { token, chosen: C })).status).toBe(400);
+    expect((await e.post('/api/picks', { token, chosen: A })).json.matched).toBeNull();
+    expect(await pickCount()).toBe(1);
   });
 
   test('tokens expire after 24 h', () => {
@@ -441,12 +505,12 @@ describe('POST /api/picks', () => {
     const { token } = (await e.get('/api/picks/next')).json;
     await e.post('/api/picks', { token, chosen: A }); // 9th
     expect(e.ai.calls).toEqual([]);
-    await e.post('/api/picks', { token, chosen: A }); // 10th
+    await e.post('/api/picks', { token: reissue(token), chosen: A }); // 10th
     expect(e.ai.calls).toEqual(['startTrain']);
-    for (let i = 0; i < 9; i++) await e.post('/api/picks', { token, chosen: A }); // 11th–19th
+    for (let i = 0; i < 9; i++) await e.post('/api/picks', { token: reissue(token), chosen: A }); // 11th–19th
     expect(e.ai.calls).toEqual(['startTrain']);
     e.ai.failTrain = true;
-    const r = await e.post('/api/picks', { token, chosen: B }); // 20th
+    const r = await e.post('/api/picks', { token: reissue(token), chosen: B }); // 20th
     expect(r.status).toBe(200);
     expect(e.ai.calls).toEqual(['startTrain', 'startTrain']);
     expect(await pickCount()).toBe(20);

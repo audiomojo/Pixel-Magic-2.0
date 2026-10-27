@@ -62,6 +62,18 @@ export function signToken(secret: Buffer, t: PickToken): string {
 
 /** The token's payload, or null when it is malformed, forged, from another process or stale. */
 export function verifyToken(secret: Buffer, token: string, now = Date.now()): PickToken | null {
+  return verifySigned(secret, token, now)?.token ?? null;
+}
+
+/**
+ * As verifyToken, plus the verified MAC bytes: the identity of a token (its base64url text is
+ * not, since a decoder accepts several spellings of the same bytes).
+ */
+function verifySigned(
+  secret: Buffer,
+  token: string,
+  now: number,
+): { token: PickToken; mac: Buffer } | null {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [payload, sig] = parts as [string, string];
@@ -77,7 +89,7 @@ export function verifyToken(secret: Buffer, token: string, now = Date.now()): Pi
   const r = tokenSchema.safeParse(json);
   if (!r.success) return null;
   const age = now - r.data.iat;
-  return age > TOKEN_TTL_MS || age < -TOKEN_SKEW_MS ? null : r.data;
+  return age > TOKEN_TTL_MS || age < -TOKEN_SKEW_MS ? null : { token: r.data, mac: want };
 }
 
 /**
@@ -293,13 +305,32 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     }
   }
 
+  /**
+   * Tokens are single-use: the first accepted POST of each (keyed on its verified MAC) is kept,
+   * as its pending or settled response, until the token expires. A repeat (double-click, retry)
+   * gets that same response and stores nothing. A first POST that fails is forgotten.
+   */
+  const used = new Map<string, { expires: number; response: Promise<Json> }>();
+
   async function postPick(body: unknown): Promise<Json> {
     const b = parse(pickBody, body);
-    const t = verifyToken(secret, b.token);
-    if (!t) throw new HttpError(409, 'reload the page');
+    const now = Date.now();
+    for (const [k, u] of used) if (u.expires < now) used.delete(k);
+    const v = verifySigned(secret, b.token, now);
+    if (!v) throw new HttpError(409, 'reload the page');
+    const key = v.mac.toString('hex');
+    const seen = used.get(key);
+    if (seen) return seen.response;
+    const t = v.token;
     if (b.chosen !== undefined && !t.shown.includes(b.chosen))
       throw new HttpError(400, 'chosen: not one of the photos shown');
-    const chosen = b.chosen ?? null;
+    const response = storePick(t, b.chosen ?? null, b.reasons);
+    used.set(key, { expires: t.iat + TOKEN_TTL_MS, response });
+    response.catch(() => used.delete(key));
+    return response;
+  }
+
+  async function storePick(t: PickToken, chosen: string | null, reasons: string[]): Promise<Json> {
     await pool.query(
       `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best, random_draw,
                           model_version, model_pick_sha256, reasons)
@@ -312,7 +343,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
         t.randomDraw,
         t.modelVersion,
         t.modelPick,
-        [...new Set(b.reasons)],
+        [...new Set(reasons)],
       ],
     );
     const { rows } = await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM picks');
