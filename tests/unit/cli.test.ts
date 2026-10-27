@@ -273,6 +273,8 @@ test('doctor counts orphaned claimed files and stuck work', async () => {
     filesStuckRetrying: 1,
     contentsStale: 1,
     copyMismatches: 0,
+    duplicatesRetired: 0,
+    duplicatesMismatched: 0,
   });
 });
 
@@ -284,6 +286,8 @@ test('doctor reports zeros on a clean system', async () => {
     filesStuckRetrying: 0,
     contentsStale: 0,
     copyMismatches: 0,
+    duplicatesRetired: 0,
+    duplicatesMismatched: 0,
   });
 });
 
@@ -352,4 +356,20 @@ test('sweep-copies runs CopySweepWorkflow on main and prints its result', async 
   expect(f.executed[0]!.opts).toMatchObject({ taskQueue: 'main', args: [] });
   expect(f.executed[0]!.opts.workflowId).toMatch(/^pm-copies-cli-\d+$/);
   expect(out()).toContain('"gen":4'); // the fake's canned result, printed as is
+});
+
+test('doctor counts retired duplicates and identical-duplicate mismatches', async () => {
+  const keeper = await seedContent({ state: 'CLUSTERED' });
+  const retired = await seedContent({ state: 'CLUSTERED' });
+  const flagged = await seedContent({ state: 'CLUSTERED' });
+  await pgh.pool.query(
+    `UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2 WHERE sha256 IN ($1, $3)`,
+    [retired, keeper, flagged],
+  );
+  await pgh.pool.query('UPDATE contents SET duplicate_mismatch = true WHERE sha256 = $1', [
+    flagged,
+  ]);
+  const out = capture('stdout');
+  expect(await main(['doctor'], deps)).toBe(0);
+  expect(JSON.parse(out())).toMatchObject({ duplicatesRetired: 2, duplicatesMismatched: 1 });
 });

@@ -19,6 +19,7 @@ import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import { vaultRel, type DataLayout } from '../../src/fsops.js';
+import { verifyVault } from '../../src/operator.js';
 import { runActivity, testDeps } from '../helpers/activityEnv.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
@@ -661,4 +662,61 @@ test('any other failure while removing a generation fails the build (retryable),
   expect(
     await readFile(join(layout.staging, '.rescued', String(g1), 'unique', 'mine.txt'), 'utf8'),
   ).toBe('keep me');
+});
+
+/** Retires `loser` into `keeper` as the identical-dedupe activity would (row only). */
+async function retire(loser: string, keeper: string): Promise<void> {
+  await pool.query(
+    `UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2, duplicate_rule = 'test',
+                         duplicate_at = clock_timestamp()
+      WHERE sha256 = $1`,
+    [loser, keeper],
+  );
+}
+
+test('a retired duplicate is not staged, its files are not staged, the others are', async () => {
+  const { a, a2, b } = await seedSimilarSet();
+  await build(true);
+  expect((await tree(join(layout.staging, 'current'))).map(([p]) => basename(p))).toContain(
+    'A.JPG',
+  );
+  await retire(a2, a);
+  expect(await build(false)).toMatchObject({ skipped: false });
+  const names = (await tree(join(layout.staging, 'current'))).map(([p]) => basename(p));
+  expect(names).not.toContain('20211003_140211_A.JPG');
+  expect(names.some((n) => n.endsWith('A.JPG'))).toBe(false);
+  expect(names.some((n) => n.endsWith('A.HEIC'))).toBe(true);
+  expect(names.some((n) => n.endsWith('B.HEIC'))).toBe(true);
+  expect((await candidates()).map((c) => c.sha256)).not.toContain(a2);
+  expect((await candidates()).map((c) => c.sha256).sort()).toEqual([a, b].sort());
+});
+
+test('a pick of a retired content marks its keeper', async () => {
+  const { b } = await seedSimilarSet();
+  const bb = randomBytes(64);
+  const b2 = await content(bb, { ext: 'jpg', kind: 'still', state: 'CLUSTERED', w: 10, group: 2 });
+  await file('p/B2.JPG', b2, 'jpg');
+  await put(vaultRel(b2, 'jpg'), bb);
+  await retire(b2, b);
+  await pool.query(
+    `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best)
+     VALUES (9, $1, $2, false)`,
+    [b2, [b2, b]],
+  );
+  await build(true);
+  expect(await setNames()).toEqual(['0-best_20211003_140211_B.HEIC', '20211003_140211_A.HEIC']);
+});
+
+test('a retired vault file unlinked under the current generation: tree reads, next build drops it, verify-vault is clean', async () => {
+  const { a, a2 } = await seedSimilarSet();
+  await build(true);
+  await retire(a2, a);
+  await rm(join(layout.root, vaultRel(a2, 'jpg')), { force: true });
+  // The current generation still holds the hardlink: every staged file reads.
+  const before = await tree(join(layout.staging, 'current'));
+  expect(before.some(([p]) => p.endsWith('A.JPG'))).toBe(true);
+  expect(await build(false)).toMatchObject({ gen: 2, skipped: false });
+  const after = await tree(join(layout.staging, 'current'));
+  expect(after.some(([p]) => p.endsWith('A.JPG'))).toBe(false);
+  expect(await verifyVault(layout)).toMatchObject({ mismatches: [] });
 });

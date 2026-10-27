@@ -96,6 +96,10 @@ export interface DoctorReport {
   contentsStale: number;
   /** COPY files not removed because a re-hash disagreed or a file was missing (spec §6.5). */
   copyMismatches: number;
+  /** Contents retired as pixel-identical duplicates of a keeper. */
+  duplicatesRetired: number;
+  /** Retired duplicates whose vault file was not removed because a re-hash disagreed. */
+  duplicatesMismatched: number;
 }
 
 export const STUCK_ATTEMPTS = 5;
@@ -122,11 +126,18 @@ export async function doctor(pool: pg.Pool, layout: DataLayout): Promise<DoctorR
   const mismatches = await pool.query<{ n: bigint }>(
     `SELECT count(*) AS n FROM files WHERE copy_mismatch`,
   );
+  const dups = await pool.query<{ retired: bigint; mismatched: bigint }>(
+    `SELECT count(*) FILTER (WHERE state = 'DUPLICATE') AS retired,
+            count(*) FILTER (WHERE duplicate_mismatch) AS mismatched
+       FROM contents`,
+  );
   return {
     orphanedClaimed: Number(orphans.rows[0]!.n),
     filesStuckRetrying: Number(stuck.rows[0]!.n),
     contentsStale: Number(stale.rows[0]!.n),
     copyMismatches: Number(mismatches.rows[0]!.n),
+    duplicatesRetired: Number(dups.rows[0]!.retired),
+    duplicatesMismatched: Number(dups.rows[0]!.mismatched),
   };
 }
 

@@ -337,6 +337,51 @@ describe('GET /api/picks/next', () => {
     expect((await e.get('/api/picks/next')).json.set).toBeNull();
   });
 
+  /** Retires `loser` into `keeper` (the row only; the pick API reads rows). */
+  async function retire(loser: string, keeper: string): Promise<void> {
+    await pgh.pool.query(
+      `UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2 WHERE sha256 = $1`,
+      [loser, keeper],
+    );
+  }
+
+  test('a set whose picked photo was retired into its keeper is not offered again', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await pickRow({ setId: 1, chosen: C, shown: [C, B] });
+    await content(C);
+    await retire(C, A);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
+  test('a retired shown member whose keeper was also shown is not a change', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await content(C);
+    await pickRow({ setId: 1, chosen: B, shown: [A, B, C] });
+    await retire(C, A);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
+  test('a no-clear-best pick that showed a retired photo still covers the set', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await content(C);
+    await pickRow({ setId: 1, chosen: null, shown: [C, B] });
+    await retire(C, A);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
+  test('a genuinely new candidate still brings a set back after a retire', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await content(C);
+    await pickRow({ setId: 1, chosen: C, shown: [C, B] });
+    await retire(C, A);
+    await set(1, [D]);
+    expect((await e.get('/api/picks/next')).json.set.id).toBe('1');
+  });
+
   test('no clear best for the same candidates is never offered; changed candidates come back', async () => {
     const e = await setup();
     await set(1, [A, B]);
