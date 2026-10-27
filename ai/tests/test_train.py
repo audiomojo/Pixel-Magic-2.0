@@ -158,7 +158,7 @@ def test_worse_candidate_is_kept_unpromoted_and_scores_not_rewritten(acts, conn,
     assert models(conn)[1][4] == before_ranked
 
 
-def test_missing_model_file_falls_back_to_previous_version(acts, conn, caplog):
+def test_missing_model_file_falls_back_to_previous_file_under_current_version(acts, conn, caplog):
     sets = add_sets(conn)
     acts.train_ranker()
     add_smile_picks(conn, sets, 30)
@@ -166,10 +166,14 @@ def test_missing_model_file_falls_back_to_previous_version(acts, conn, caplog):
     Path(models(conn)[1][3]).unlink()
     with caplog.at_level(logging.WARNING):
         assert acts.rank_sets() == N_SETS * SIZE
-    assert len(scores(conn, 1)) == N_SETS * SIZE
-    assert scores(conn, 2) == {}
-    assert models(conn)[0][4] is not None
-    assert "version 1" in caplog.text
+    s2 = scores(conn, 2)
+    assert len(s2) == N_SETS * SIZE
+    assert scores(conn, 1) == {}
+    assert models(conn)[0][4] is None and models(conn)[1][4] is not None
+    assert "version 1 file" in caplog.text
+    with psycopg.connect(acts.deps.settings.database_url) as c:
+        v1 = ranker.score(ranker.load(models(conn)[0][3]), db.load_sets(c, 1))
+    assert s2 == pytest.approx(v1, rel=1e-5)  # the version 1 model produced them
 
 
 def test_no_readable_model_file_ranks_rule_only_under_current_version(acts, conn):
@@ -187,10 +191,35 @@ def test_no_readable_model_file_ranks_rule_only_under_current_version(acts, conn
     assert s2 == pytest.approx(rule, rel=1e-5)
 
 
-def test_rank_without_any_model_is_a_no_op(acts, conn):
+def test_rank_without_any_model_bootstraps_the_rule_score_once(acts, conn, tmp_path):
     add_sets(conn)
-    assert acts.rank_sets() == 0
-    assert conn.execute("SELECT count(*) FROM photo_scores").fetchone() == (0,)
+    assert acts.rank_sets() == N_SETS * SIZE
+    ((version, picks_used, promoted, path, ranked_at),) = models(conn)
+    assert (version, picks_used, promoted) == (1, 0, True) and ranked_at is not None
+    assert path == str(tmp_path / "ai" / "models" / "1.npz")
+    model = ranker.load(path)
+    assert np.array_equal(model.weights, ranker.RULE_ONLY(model.pca).weights)
+    assert len(scores(conn, 1)) == N_SETS * SIZE
+    assert acts.rank_sets() == N_SETS * SIZE
+    assert len(models(conn)) == 1
+
+
+def test_bootstrap_waits_for_a_running_training(acts, conn):
+    """rank_sets takes the train lock before the rank lock; a training in progress is waited
+    for and its model used, not a second bootstrap."""
+    add_sets(conn)
+    conn.execute("SELECT pg_advisory_lock(hashtext('pm.ai.train'))")
+    t = threading.Thread(target=acts.rank_sets)
+    t.start()
+    time.sleep(0.3)
+    assert t.is_alive() and models(conn) == []
+    acts_other = Activities(acts.deps)
+    with psycopg.connect(acts.deps.settings.database_url) as c:
+        acts_other._train_locked(c)  # the training that held the lock
+    conn.execute("SELECT pg_advisory_unlock(hashtext('pm.ai.train'))")
+    t.join(5)
+    assert not t.is_alive()
+    assert len(models(conn)) == 1 and models(conn)[0][4] is not None
 
 
 def test_two_rank_sets_at_once_serialise(acts, conn, monkeypatch):

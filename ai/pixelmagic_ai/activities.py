@@ -8,6 +8,8 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +27,19 @@ log = logging.getLogger(__name__)
 
 RANK_LOCK = "pm.ai.rank"
 TRAIN_LOCK = "pm.ai.train"
+
+@contextmanager
+def advisory_lock(conn: psycopg.Connection, key: str) -> Iterator[None]:
+    """A session advisory lock held for the block, released even after an error."""
+    conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (key,))
+    conn.commit()
+    try:
+        yield
+    finally:
+        conn.rollback()  # no-op after a commit; clears a failed transaction
+        conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
+        conn.commit()
+
 
 def model_path(data_dir: Path, version: int) -> Path:
     return data_dir / "ai" / "models" / f"{version}.npz"
@@ -112,75 +127,84 @@ class Activities:
         with self._connect() as conn:
             return db.describe_backlog(conn, FEATURE_VERSION, limit, after_sha=after_sha)
 
+    def _train_locked(self, conn: psycopg.Connection) -> tuple[int, bool]:
+        """Fits a model on the picks and stores it (file and ranker_models row, kept whether
+        promoted or not), committing. (version, promoted). With no model yet the rule score
+        is stored and promoted. The caller holds TRAIN_LOCK."""
+        fv = db.ranking_feature_version(conn, FEATURE_VERSION)
+        sets = db.load_sets(conn, fv)
+        picks = db.load_picks(conn)
+        found = load_current(conn)
+        current = None
+        if found is not None:  # no readable file: compare against the rule score
+            current = found[1] or ranker.RULE_ONLY(ranker.fit_pca(sets))
+        model, cv, promoted = ranker.train(sets, picks, current)
+        used = ranker.picks_used(model, sets, picks)
+        version = db.insert_model(conn, fv, used, cv, promoted, "")
+        path = model_path(self.deps.settings.data_dir, version)
+        save_atomic(model, path)
+        db.set_model_path(conn, version, str(path))
+        conn.commit()
+        log.info(
+            "model version %d: %d picks, cv %.3f, %s",
+            version, used, cv, "promoted" if promoted else "kept unpromoted",
+        )
+        return version, promoted
+
     @activity.defn(name="train_ranker")
     def train_ranker(self) -> int | None:
-        """Fits a model on the picks and stores it (file and ranker_models row, kept whether
-        promoted or not). The promoted version, else None. The first run promotes the rule
-        score."""
-        with self._connect() as conn:
-            conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (TRAIN_LOCK,))
-            try:
-                fv = db.ranking_feature_version(conn, FEATURE_VERSION)
-                sets = db.load_sets(conn, fv)
-                picks = db.load_picks(conn)
-                found = load_current(conn)
-                current = None
-                if found is not None:  # no readable file: compare against the rule score
-                    current = found[1] or ranker.RULE_ONLY(ranker.fit_pca(sets))
-                model, cv, promoted = ranker.train(sets, picks, current)
-                used = ranker.picks_used(model, sets, picks)
-                version = db.insert_model(conn, fv, used, cv, promoted, "")
-                path = model_path(self.deps.settings.data_dir, version)
-                save_atomic(model, path)
-                db.set_model_path(conn, version, str(path))
-                conn.commit()
-                log.info(
-                    "model version %d: %d picks, cv %.3f, %s",
-                    version, used, cv, "promoted" if promoted else "kept unpromoted",
-                )
-                return version if promoted else None
-            finally:
-                conn.rollback()  # no-op after the commit; clears a failed transaction
-                conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (TRAIN_LOCK,))
-                conn.commit()
+        """The promoted version, else None (see _train_locked)."""
+        with self._connect() as conn, advisory_lock(conn, TRAIN_LOCK):
+            version, promoted = self._train_locked(conn)
+            return version if promoted else None
 
     @activity.defn(name="rank_sets")
     def rank_sets(self) -> int:
         """Scores every described candidate with the current model; candidates scored.
 
-        Scores go under the version whose file was used: an unreadable current file falls back
-        to the previous promoted version's file. When no file is readable the rule score is
-        written under the current version (its row exists; the rule score needs no file)."""
+        With no promoted model yet it first stores and promotes the rule score through the
+        training path (locks taken train then rank, as in training), so describing alone gives
+        day-one picks. Scores always go under the CURRENT promoted version, so staging sees the
+        latest ranking: an unreadable current file falls back to the previous promoted
+        version's file, and with none readable to the rule score."""
         with self._connect() as conn:
-            conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (RANK_LOCK,))
-            try:
-                found = load_current(conn)
-                if found is None:
-                    log.info("rank_sets: no promoted model yet")
-                    return 0
-                current, model, version = found
-                fv = db.ranking_feature_version(conn, FEATURE_VERSION)
-                sets = db.load_sets(conn, fv)
-                if model is None:
-                    model = ranker.RULE_ONLY(ranker.fit_pca(sets))
-                    log.warning("rank_sets: rule score under version %d", version)
-                elif version != current.version:
-                    log.warning(
-                        "rank_sets: version %d instead of %d", version, current.version
-                    )
-                scores = ranker.score(model, sets)
-                db.write_scores(conn, version, scores)
-                db.mark_ranked(conn, version)
-                conn.commit()
-                log.info(
-                    "rank_sets: %d candidates scored by version %d (features v%d)",
-                    len(scores), version, fv,
-                )
-                return len(scores)
-            finally:
+            if db.current_model(conn) is None:
                 conn.rollback()
-                conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (RANK_LOCK,))
-                conn.commit()
+                with advisory_lock(conn, TRAIN_LOCK):
+                    if db.current_model(conn) is None:  # re-check under the lock
+                        self._train_locked(conn)
+                    conn.rollback()
+                    with advisory_lock(conn, RANK_LOCK):
+                        return self._rank_locked(conn)
+            with advisory_lock(conn, RANK_LOCK):
+                return self._rank_locked(conn)
+
+    def _rank_locked(self, conn: psycopg.Connection) -> int:
+        found = load_current(conn)
+        if found is None:
+            log.info("rank_sets: no promoted model")
+            return 0
+        current, model, used = found
+        version = current.version
+        fv = db.ranking_feature_version(conn, FEATURE_VERSION)
+        sets = db.load_sets(conn, fv)
+        if model is None:
+            model = ranker.RULE_ONLY(ranker.fit_pca(sets))
+            log.warning("rank_sets: no readable model file; rule score under version %d", version)
+        elif used != version:
+            log.warning(
+                "rank_sets: scored by the version %d file, written under version %d",
+                used, version,
+            )
+        scores = ranker.score(model, sets)
+        db.write_scores(conn, version, scores)
+        db.mark_ranked(conn, version)
+        conn.commit()
+        log.info(
+            "rank_sets: %d candidates scored under version %d (features v%d)",
+            len(scores), version, fv,
+        )
+        return len(scores)
 
     def all(self) -> list:
         return [
