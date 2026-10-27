@@ -83,12 +83,38 @@ export function parseMetadata(tags: Record<string, unknown>): Metadata {
   };
 }
 
+export interface KeeperTags {
+  software: string | null;
+  creatorTool: string | null;
+  /** Present count of DateTimeOriginal, Make, Model, GPSLatitude. */
+  metaCount: number;
+}
+
+/** Pure: the tags the identical-dedupe keeper rule needs, from exiftool `-G -n` output. */
+export function parseKeeperTags(tags: Record<string, unknown>): KeeperTags {
+  const present = (...keys: string[]): number => (keys.some((k) => str(tags[k]) !== null) ? 1 : 0);
+  return {
+    software: str(tags['EXIF:Software']),
+    creatorTool: str(tags['XMP:CreatorTool']),
+    metaCount:
+      present('EXIF:DateTimeOriginal') +
+      present('EXIF:Make') +
+      present('EXIF:Model') +
+      present('EXIF:GPSLatitude', 'Composite:GPSLatitude'),
+  };
+}
+
 export class MetadataReader {
   private readonly exiftool = new ExifTool({ maxProcs: 2 });
 
   async read(absPath: string): Promise<Metadata> {
     const tags = await this.exiftool.readRaw(absPath, { readArgs: ['-G', '-n'] });
     return parseMetadata(tags as Record<string, unknown>);
+  }
+
+  async keeperTags(absPath: string): Promise<KeeperTags> {
+    const tags = await this.exiftool.readRaw(absPath, { readArgs: ['-G', '-n'] });
+    return parseKeeperTags(tags as Record<string, unknown>);
   }
 
   async end(): Promise<void> {

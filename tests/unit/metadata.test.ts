@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { parseMetadata } from '../../src/metadata.js';
+import { parseKeeperTags, parseMetadata } from '../../src/metadata.js';
 
 const heic = {
   'File:FileType': 'HEIC',
@@ -118,4 +118,34 @@ describe('parseMetadata', () => {
       }).capturedAt?.toISOString(),
     ).toBe('2024-02-29T09:59:59.000Z');
   });
+});
+
+describe('parseKeeperTags', () => {
+  test('software, creator tool and metadata count', () => {
+    expect(
+      parseKeeperTags({
+        'EXIF:Software': ' Picasa 3.0 ',
+        'XMP:CreatorTool': 'Adobe Lightroom',
+        'EXIF:DateTimeOriginal': '2021:10:03 14:02:11',
+        'EXIF:Make': 'Apple',
+        'EXIF:Model': 'iPhone 12',
+        'Composite:GPSLatitude': 12.5,
+      }),
+    ).toEqual({
+      software: 'Picasa 3.0',
+      creatorTool: 'Adobe Lightroom',
+      metaCount: 4,
+    });
+  });
+  test('empty tags', () =>
+    expect(parseKeeperTags({})).toEqual({ software: null, creatorTool: null, metaCount: 0 }));
+  test('blank values do not count; EXIF GPS counts once', () =>
+    expect(
+      parseKeeperTags({
+        'EXIF:Make': '  ',
+        'EXIF:Model': 'X',
+        'EXIF:GPSLatitude': 1,
+        'Composite:GPSLatitude': 1,
+      }).metaCount,
+    ).toBe(2));
 });
