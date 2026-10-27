@@ -375,3 +375,19 @@ def test_two_train_starts_with_the_same_id_run_once():
 
 def test_train_workflow_id():
     assert TRAIN_WORKFLOW_ID == "ai-train"
+
+
+def test_train_skips_after_a_losing_training_without_newer_picks(acts, conn, tmp_path, monkeypatch):
+    """The skip compares against the newest model of any kind: a kept-unpromoted model already
+    learnt from these picks, so training again would only store another identical loser."""
+    sets = add_sets(conn)
+    acts.train_ranker()
+    add_smile_picks(conn, sets, 30)
+    real = ranker.train
+    monkeypatch.setattr(ranker, "train", lambda *a: (real(*a)[0], 0.1, False))
+    assert acts.train_ranker() is None  # v2 kept unpromoted
+    assert len(models(conn)) == 2
+    files = sorted((tmp_path / "ai" / "models").iterdir())
+    assert acts.train_ranker() is None
+    assert len(models(conn)) == 2
+    assert sorted((tmp_path / "ai" / "models").iterdir()) == files

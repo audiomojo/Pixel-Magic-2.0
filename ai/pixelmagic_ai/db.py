@@ -168,15 +168,15 @@ def set_model_path(conn: psycopg.Connection, version: int, path: str) -> None:
     conn.execute("UPDATE ranker_models SET path = %s WHERE version = %s", (path, version))
 
 
-def picks_since_model(conn: psycopg.Connection, version: int) -> bool:
-    """Whether any pick (no_clear_best ones included) was decided after the model was created."""
+def picks_since_last_model(conn: psycopg.Connection) -> bool:
+    """Whether any pick (no_clear_best ones included) was decided after the newest model of any
+    kind (promoted or not) was created; true with no model at all."""
     row = conn.execute(
         """
         SELECT EXISTS (
           SELECT 1 FROM picks
-          WHERE decided_at > (SELECT created_at FROM ranker_models WHERE version = %s))
-        """,
-        (version,),
+          WHERE decided_at > coalesce((SELECT max(created_at) FROM ranker_models), '-infinity'))
+        """
     ).fetchone()
     assert row is not None
     return bool(row[0])
