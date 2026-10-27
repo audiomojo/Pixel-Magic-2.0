@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -64,10 +65,59 @@ export async function computeImageFacts(absPath: string, ext: string): Promise<I
   const rawMime = RAW_MIME.get(e);
   if (rawMime) return fromRawPreview(absPath, rawMime);
   if (!STILL_EXTS.has(e)) throw new QuarantineError('unsupported', `unsupported extension .${ext}`);
+  const { input, opts, mime } = await stillSource(absPath);
+  return factsFrom(input, opts, mime);
+}
+
+/** A decodable still, as sharp input: a path, or a raw pixel buffer from HEIC/BMP decoding. */
+interface StillSource {
+  input: string | Buffer;
+  opts: SharpOptions;
+  mime?: string;
+}
+
+/** Sniffs the content (HEIF, BMP, else sharp's own loaders) and returns the sharp input. */
+async function stillSource(absPath: string): Promise<StillSource> {
   const head = await readHead(absPath, 32);
-  if (isHeifHead(head)) return fromHeic(absPath);
-  if (head.toString('latin1', 0, 2) === 'BM') return fromBmp(absPath);
-  return factsFrom(absPath);
+  if (isHeifHead(head)) return heicSource(absPath);
+  if (head.toString('latin1', 0, 2) === 'BM') return bmpSource(absPath);
+  return { input: absPath, opts: {} };
+}
+
+export interface PixelDigest {
+  width: number;
+  height: number;
+  channels: number;
+  sha256: string;
+}
+
+/**
+ * SHA-256 over the oriented, full-resolution, 8-bit pixel buffer (alpha kept only if the
+ * source has it, so channel count is part of identity). RAW is `unsupported`: its preview is
+ * not its picture. Same quarantine mapping as `computeImageFacts`.
+ */
+export async function pixelDigest(absPath: string, ext: string): Promise<PixelDigest> {
+  const e = ext.toLowerCase();
+  if (RAW_MIME.has(e)) throw new QuarantineError('unsupported', `no pixel digest for RAW .${ext}`);
+  if (!STILL_EXTS.has(e)) throw new QuarantineError('unsupported', `unsupported extension .${ext}`);
+  const { input, opts } = await stillSource(absPath);
+  try {
+    const img = sharp(input, { limitInputPixels: PIXEL_LIMIT, failOn: 'truncated', ...opts });
+    const meta = await img.metadata();
+    if (!meta.format || (!SHARP_MIME[meta.format] && !opts.raw))
+      throw new QuarantineError('unsupported', `unsupported image format ${meta.format}`);
+    const { data, info } = await img.rotate().raw().toBuffer({ resolveWithObject: true });
+    if (data.length !== info.width * info.height * info.channels)
+      throw new Error(`unexpected raw buffer size ${data.length}`);
+    return {
+      width: info.width,
+      height: info.height,
+      channels: info.channels,
+      sha256: createHash('sha256').update(data).digest('hex'),
+    };
+  } catch (err) {
+    throw toQuarantine(err);
+  }
 }
 
 export async function computeImageFactsWire(absPath: string, ext: string): Promise<WireFacts> {
@@ -141,7 +191,7 @@ type HeifImages = {
   decode(): Promise<{ width: number; height: number; data: Uint8ClampedArray }>;
 }[] & { dispose(): void };
 
-async function fromHeic(absPath: string): Promise<ImageFacts> {
+async function heicSource(absPath: string): Promise<StillSource> {
   const buffer = await readFile(absPath);
   let decoded: { width: number; height: number; data: Uint8ClampedArray };
   try {
@@ -163,11 +213,11 @@ async function fromHeic(absPath: string): Promise<ImageFacts> {
     throw new QuarantineError('decode_error', `HEIC: ${String(err)}`);
   }
   const { width, height, data } = decoded;
-  return factsFrom(
-    Buffer.from(data.buffer, data.byteOffset, data.byteLength),
-    { raw: { width, height, channels: 4 } },
-    'image/heic',
-  );
+  return {
+    input: Buffer.from(data.buffer, data.byteOffset, data.byteLength),
+    opts: { raw: { width, height, channels: 4 } },
+    mime: 'image/heic',
+  };
 }
 
 function checkPixels(width: number, height: number): void {
@@ -179,7 +229,7 @@ function checkPixels(width: number, height: number): void {
  * Prebuilt libvips has no BMP loader, so uncompressed (BI_RGB) 24/32-bit BMPs are decoded
  * here and handed to sharp as raw RGB. Anything else is `unsupported`.
  */
-async function fromBmp(absPath: string): Promise<ImageFacts> {
+async function bmpSource(absPath: string): Promise<StillSource> {
   const buf = await readFile(absPath);
   if (buf.length < 54) throw new QuarantineError('truncated', 'BMP header cut short');
   const offset = buf.readUInt32LE(10);
@@ -206,7 +256,7 @@ async function fromBmp(absPath: string): Promise<ImageFacts> {
       rgb[d + 2] = buf.readUInt8(s);
     }
   }
-  return factsFrom(rgb, { raw: { width, height, channels: 3 } }, 'image/bmp');
+  return { input: rgb, opts: { raw: { width, height, channels: 3 } }, mime: 'image/bmp' };
 }
 
 /**

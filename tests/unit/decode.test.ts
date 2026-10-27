@@ -10,6 +10,7 @@ import {
   computeImageFacts,
   computeImageFactsWire,
   endDecodeResources,
+  pixelDigest,
   QuarantineError,
 } from '../../src/decode.js';
 import { hamming } from '../../src/hashing.js';
@@ -296,3 +297,70 @@ function bmpHeader(bpp: number, compression: number): Buffer {
   h.writeUInt32LE(compression, 30);
   return h;
 }
+
+test('pixelDigest: identical pixels match across formats, a changed pixel or orientation differs', async () => {
+  const d = await tmpDir();
+  const jpg = await photo(d, 'jpg');
+  const decoded = await sharp(jpg).raw().toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = decoded.info;
+  const raw = { width, height, channels };
+  const png = join(d, 'same.png');
+  await sharp(decoded.data, { raw }).png().toFile(png);
+  const a = await pixelDigest(jpg, 'jpg');
+  expect(a).toMatchObject({ width: 640, height: 480, channels: 3 });
+  expect(a.sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(await pixelDigest(png, 'png')).toEqual(a);
+
+  const changed = Buffer.from(decoded.data);
+  changed[1000] = (changed[1000] ?? 0) ^ 1;
+  const png2 = join(d, 'changed.png');
+  await sharp(changed, { raw }).png().toFile(png2);
+  expect((await pixelDigest(png2, 'png')).sha256).not.toBe(a.sha256);
+
+  // Same stored pixels, orientation 1 vs 6: the oriented pixels differ.
+  const stored = join(d, 'o1.jpg');
+  const tagged = join(d, 'o6.jpg');
+  await sharp(decoded.data, { raw }).jpeg().toFile(stored);
+  await sharp(decoded.data, { raw }).jpeg().withMetadata({ orientation: 6 }).toFile(tagged);
+  const [o1, o6] = [await pixelDigest(stored, 'jpg'), await pixelDigest(tagged, 'jpg')];
+  expect([o1.width, o1.height]).toEqual([640, 480]);
+  expect([o6.width, o6.height]).toEqual([480, 640]);
+  expect(o6.sha256).not.toBe(o1.sha256);
+});
+
+test('pixelDigest: a changed EXIF Software tag alone does not change the digest', async () => {
+  const d = await tmpDir();
+  const a = await photo(d, 'jpg');
+  const b = join(d, 'soft.jpg');
+  await writeFile(b, await readFile(a));
+  const et = new ExifTool({ maxProcs: 1 });
+  try {
+    await et.write(b, { Software: 'Edited 1.0' }, { writeArgs: ['-overwrite_original'] });
+  } finally {
+    await et.end();
+  }
+  expect((await readFile(b)).equals(await readFile(a))).toBe(false);
+  expect(await pixelDigest(b, 'jpg')).toEqual(await pixelDigest(a, 'jpg'));
+});
+
+test('pixelDigest: HEIC (with alpha channel) and BMP are deterministic', async () => {
+  const d = await tmpDir();
+  const h = await pixelDigest(HEIC_SCENE0, 'heic');
+  expect(await pixelDigest(HEIC_SCENE0, 'heic')).toEqual(h);
+  expect(h.channels).toBe(4);
+  const bmp = await bmpFile(d, { bpp: 24 });
+  const b = await pixelDigest(bmp, 'bmp');
+  expect(b).toMatchObject({ width: 64, height: 48, channels: 3 });
+  expect(await pixelDigest(await bmpFile(d, { bpp: 24, topDown: true }), 'bmp')).toEqual(b);
+});
+
+test('pixelDigest: RAW is unsupported, corrupt files quarantine', async () => {
+  const d = await tmpDir();
+  await expect(pixelDigest(await rawWithPreview(d), 'dng')).rejects.toMatchObject({
+    name: 'QuarantineError',
+    reason: 'unsupported',
+  });
+  await expect(pixelDigest(await truncatedJpeg(d), 'jpg')).rejects.toMatchObject({
+    reason: 'truncated',
+  });
+});
