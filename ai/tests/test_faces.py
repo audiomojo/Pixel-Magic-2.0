@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pixelmagic_ai.faces import FakeDetector
+from pixelmagic_ai.faces import FakeDetector, _eye_ratio, _eyes_open, _smile
+from pixelmagic_ai.imageio import UndecodableError
 
 CORPUS = Path(__file__).resolve().parents[2] / "test-automation" / "sample-images"
 MAX_SCAN = 200
@@ -43,14 +44,53 @@ def test_portrait_has_one_face_with_sane_measures():
     ][:MAX_SCAN]
     for p in files:
         try:
-            faces = det.detect(load_rgb(p, p.suffix.lstrip(".").lower()))
-        except Exception:
+            img = load_rgb(p, p.suffix.lstrip(".").lower())
+        except (UndecodableError, OSError):
             continue
+        faces = det.detect(img)
         if len(faces) == 1:
             f = faces[0]
-            assert 0 < f["size"] < 1
+            assert 0.002 < f["size"] < 1
+            assert f["quality"] > 0
             assert 0 <= f["quality"] <= 1
             assert 0 <= f["eyes_open"] <= 1
             assert 0 <= f["smile"] <= 1
             return
     pytest.skip("no single-face photo found in the corpus")
+
+
+def _eye(w: float, h: float):
+    # a rectangle-ish eye of normalised width w and height h
+    return [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+
+
+def test_eye_ratio_scales_by_box_pixel_axes():
+    pts = _eye(0.4, 0.1)
+    assert _eye_ratio(pts, 100, 100) == pytest.approx(0.25)
+    assert _eye_ratio(pts, 100, 200) == pytest.approx(0.5)  # taller box, same points
+    assert _eye_ratio(_eye(0.4, 0.02), 100, 100) < _eye_ratio(_eye(0.4, 0.2), 100, 100)
+
+
+def test_eyes_open_normalises_and_caps():
+    def f(ratio, size=0.1):
+        e = _eye(1.0, ratio)
+        return _eyes_open(e, e, size, 1.0, 1.0)
+
+    assert f(0.1) == pytest.approx(0.5)
+    assert f(0.2) == pytest.approx(1.0)
+    assert f(0.3) == 1.0
+    assert f(2.0) == 0.5  # implausible
+    assert f(0.3, size=0.001) == 0.5  # tiny face
+    assert _eyes_open([], [], 0.1, 1.0, 1.0) == 0.5  # no landmarks
+
+
+def test_smile_sign_and_clamp():
+    # bottom-left origin: larger y is higher
+    up = [(0.0, 0.6), (0.5, 0.4), (1.0, 0.6)]
+    down = [(0.0, 0.4), (0.5, 0.6), (1.0, 0.4)]
+    assert _smile(up, 1.0, 1.0) > 0
+    assert _smile(down, 1.0, 1.0) == 0.0
+    assert _smile([(0.0, 0.0), (0.5, -5.0), (1.0, 0.0)], 1.0, 1.0) == 1.0
+    assert _smile([], 1.0, 1.0) == 0.0
+    # y scaled by the box's pixel height
+    assert _smile(up, 1.0, 2.0) > _smile(up, 1.0, 1.0)
