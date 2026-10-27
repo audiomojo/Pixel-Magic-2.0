@@ -205,3 +205,44 @@ test('similar_candidates PK rejects a duplicate (set_id, sha256)', async () => {
   await pool.query(c);
   await expect(pool.query(c)).rejects.toMatchObject({ code: '23505' });
 });
+
+const sha = (c: string): string => c.repeat(64);
+const dupIns = `INSERT INTO contents(sha256, ext, kind, size_bytes, state, duplicate_of)
+  VALUES ($1,'jpg','still',1,$2,$3)`;
+test('a DUPLICATE content requires duplicate_of, and only a DUPLICATE may have it', async () => {
+  await expect(pool.query(dupIns, [sha('a'), 'DUPLICATE', null])).rejects.toMatchObject({
+    code: '23514',
+  });
+  await pool.query(dupIns, [sha('a'), 'DUPLICATE', sha('b')]);
+  await expect(pool.query(dupIns, [sha('c'), 'HASHED', sha('b')])).rejects.toMatchObject({
+    code: '23514',
+  });
+  await pool.query(dupIns, [sha('d'), 'HASHED', null]);
+});
+test('duplicate_mismatch defaults false; contents_suspect_idx exists', async () => {
+  await pool.query(dupIns, [sha('d'), 'HASHED', null]);
+  expect((await one<{ m: boolean }>('SELECT duplicate_mismatch m FROM contents')).m).toBe(false);
+  expect(
+    (await rows(`SELECT 1 FROM pg_indexes WHERE indexname='contents_suspect_idx'`)).length,
+  ).toBe(1);
+});
+test('pixel_compares rejects sha_a >= sha_b, an unknown verdict, and a repeated pair', async () => {
+  const pc = `INSERT INTO pixel_compares(sha_a, sha_b, verdict) VALUES ($1,$2,$3)`;
+  try {
+    await expect(pool.query(pc, [sha('b'), sha('a'), 'identical'])).rejects.toMatchObject({
+      code: '23514',
+    });
+    await expect(pool.query(pc, [sha('a'), sha('a'), 'identical'])).rejects.toMatchObject({
+      code: '23514',
+    });
+    await expect(pool.query(pc, [sha('a'), sha('b'), 'maybe'])).rejects.toMatchObject({
+      code: '23514',
+    });
+    await pool.query(pc, [sha('a'), sha('b'), 'identical']);
+    await expect(pool.query(pc, [sha('a'), sha('b'), 'different'])).rejects.toMatchObject({
+      code: '23505',
+    });
+  } finally {
+    await pool.query('DELETE FROM pixel_compares');
+  }
+});
