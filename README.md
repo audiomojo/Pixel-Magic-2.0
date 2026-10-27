@@ -161,6 +161,8 @@ It needs uv, the stack up (`make up`) and migration 0008 (applied by the stack's
 `AI_DESCRIBE_CONCURRENCY` (default 2) sets how many photos are described at once; run
 `make ai-install` again after changing it or moving the repo. Logs:
 `DATA_DIR/logs/ai.launchd.log`.
+After installing, run `make stage FORCE=1` once so staging records the similar sets the
+worker describes.
 
 ## Upgrading
 

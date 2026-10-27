@@ -98,6 +98,20 @@ export function makeStaging(deps: Deps) {
                              WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
                  OR EXISTS (SELECT 1 FROM ranker_models
                              WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
+                 -- No candidates recorded although a set exists (e.g. migration 0008 came
+                 -- after the last build): the planner's sets, two or more copy groups of
+                 -- staged CLUSTERED stills sharing a similar set.
+                 OR CASE WHEN EXISTS (SELECT 1 FROM similar_candidates) THEN false
+                    ELSE EXISTS (
+                      SELECT 1 FROM contents c JOIN groups g ON g.id = c.copy_group_id
+                       WHERE c.kind = 'still' AND c.state = 'CLUSTERED'
+                         AND g.similar_set_id IS NOT NULL
+                         AND EXISTS (SELECT 1 FROM files f
+                                      WHERE f.sha256 = c.sha256 AND f.ext IS NOT NULL
+                                        AND f.state IN ('INGESTED', 'COPY'))
+                       GROUP BY g.similar_set_id
+                      HAVING count(DISTINCT c.copy_group_id) > 1)
+                    END
               ) AS changed,
               b.gen AS last_gen,
               extract(epoch FROM clock_timestamp() - b.built_at)::float8 AS since_s

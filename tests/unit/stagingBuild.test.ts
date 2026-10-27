@@ -361,6 +361,23 @@ test('the candidates stamp moves only when set membership changes', async () => 
   expect(second! > first!).toBe(true);
 });
 
+test('empty candidates with a similar set rebuild (an install after the last build)', async () => {
+  const { a, b } = await seedSimilarSet();
+  await build(true);
+  await pool.query('DELETE FROM similar_candidates'); // as before migration 0008
+  expect((await build(false)).skipped).toBe(false);
+  expect(await candidates()).toEqual([a, b].sort().map((sha256) => ({ set_id: 9n, sha256 })));
+  expect(await build(false)).toMatchObject({ skipped: true });
+});
+
+test('empty candidates without a set of two copy groups still skip', async () => {
+  await seedSimilarSet();
+  await pool.query(`UPDATE groups SET similar_set_id = NULL WHERE id = 2`);
+  await build(true);
+  expect(await candidates()).toEqual([]);
+  expect(await build(false)).toMatchObject({ skipped: true });
+});
+
 test('a new user pick rebuilds and marks that file', async () => {
   const { a, b } = await seedSimilarSet();
   await build(true);
