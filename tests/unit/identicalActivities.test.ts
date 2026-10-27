@@ -633,3 +633,79 @@ test('RAW and non-still contents never form families', async () => {
   expect(await dedupeIdenticalAll(ctx(), { apply: true })).toMatchObject({ families: 0 });
   expect((await row(a)).state).toBe('HASHED');
 });
+
+/** A second family (another scene): a camera original and a Picasa re-save. */
+async function secondFamily(): Promise<{ cam: string; pic: string }> {
+  const p = await photo(await tmpDir(), 'jpg', { scene: 6 });
+  const q = join(await tmpDir(), 'q.jpg');
+  await copyFile(p, q);
+  await et.write(q, { Software: 'Picasa 3.0' }, ['-overwrite_original']);
+  return { cam: await hashed(p, { name: 'cam2.jpg' }), pic: await hashed(q, { name: 'pic2.jpg' }) };
+}
+
+test('an apply interrupted after the first family has already streamed its rows', async () => {
+  const f1 = await seedFamilies();
+  const f2 = await secondFamily();
+  const seen: { removed_sha256: string | number; outcome?: string }[] = [];
+  let calls = 0;
+  const c = ctx({
+    checkpoint: () => {
+      calls += 1;
+      if (calls === 2) throw new Error('killed');
+    },
+  });
+  await expect(
+    dedupeIdenticalAll(c, { apply: true, onRows: (rows) => void seen.push(...rows) }),
+  ).rejects.toThrow('killed');
+  expect(seen).toHaveLength(1);
+  expect(seen[0]).toMatchObject({ outcome: 'REMOVED' });
+  const gone = String(seen[0]!.removed_sha256);
+  expect([f1.pic, f2.pic]).toContain(gone);
+  expect(await exists(await vaultPath(gone))).toBe(false);
+});
+
+test('a resumed pending removal appears in the applied rows with its outcome', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  const c = ctx();
+  await withTx(pool, async (tx) => retireFamily(c, tx, await findFamily(c, tx, cam)));
+  const seen: unknown[] = [];
+  const r = await dedupeIdenticalAll(ctx(), {
+    apply: true,
+    onRows: (rows) => void seen.push(...rows),
+  });
+  expect(seen).toEqual([
+    expect.objectContaining({
+      keeper_sha256: cam,
+      removed_sha256: n,
+      rule: 'camera-original',
+      outcome: 'REMOVED',
+    }),
+  ]);
+  expect(r).toMatchObject({ families: 0, files: 1, errors: 0 });
+  expect(reportCsv(r.rows, true).split('\n')[0]).toMatch(/,bytes,outcome$/);
+});
+
+test('a loser that fails its checksum is MISMATCH: not counted as removed, counted as an error', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  const nPath = await vaultPath(n);
+  const r = await dedupeIdenticalAll(
+    ctx({
+      checkpoint: async (name) => {
+        if (name === 'identical_retired') await appendFile(nPath, Buffer.from('x'));
+      },
+    }),
+    { apply: true },
+  );
+  expect(r).toMatchObject({ families: 1, files: 0, bytes: 0, errors: 1 });
+  expect(r.rows).toEqual([
+    expect.objectContaining({
+      keeper_sha256: cam,
+      removed_sha256: n,
+      bytes: 0,
+      outcome: 'MISMATCH',
+    }),
+  ]);
+  expect(await exists(nPath)).toBe(true);
+});

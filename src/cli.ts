@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -8,7 +8,8 @@ import type pg from 'pg';
 import { createDecodePool } from './activities/hashing.js';
 import {
   dedupeIdenticalAll,
-  reportCsv,
+  reportHeader,
+  reportLines,
   type CleanupSummary,
   type IdenticalCtx,
 } from './activities/identical.js';
@@ -114,14 +115,20 @@ async function dedupeIdentical(deps: Deps, apply: boolean): Promise<number> {
       warn: (m, meta) => process.stderr.write(`warning: ${m} ${JSON.stringify(meta)}\n`),
     },
   };
-  const r: CleanupSummary = await dedupeIdenticalAll(ctx, { apply });
+  // The report exists from the first moment and grows family by family, so an interrupted
+  // apply still leaves a record of every file it removed.
   const dir = join(deps.settings.dataDir, 'reports');
   await mkdir(dir, { recursive: true });
   const file = join(dir, `dedupe-identical-${stamp(new Date())}${apply ? '-applied' : ''}.csv`);
-  await writeFile(file, reportCsv(r.rows));
+  await writeFile(file, reportHeader(apply));
+  const r: CleanupSummary = await dedupeIdenticalAll(ctx, {
+    apply,
+    onRows: (rows) => appendFile(file, reportLines(rows, apply)),
+  });
   out(
-    `families ${String(r.families)}, files to remove ${String(r.files)}, ` +
-      `bytes to free ${String(r.bytes)}, errors ${String(r.errors)}`,
+    `families ${String(r.families)}, ` +
+      `${apply ? 'files removed' : 'files to remove'} ${String(r.files)}, ` +
+      `${apply ? 'bytes freed' : 'bytes to free'} ${String(r.bytes)}, errors ${String(r.errors)}`,
   );
   out(`report: ${file}`);
   return 0;

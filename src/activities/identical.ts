@@ -457,15 +457,18 @@ export const REPORT_COLUMNS = [
   'rule',
   'bytes',
 ] as const;
-export type ReportRow = Record<(typeof REPORT_COLUMNS)[number], string | number>;
+export type ReportRow = Record<(typeof REPORT_COLUMNS)[number], string | number> & {
+  /** Apply only: what `removeRetired` did with this file (a 9th column of the applied report). */
+  outcome?: RemoveOutcome;
+};
 
 export interface CleanupSummary {
   families: number;
-  /** Losers retired (apply) or that would be (dry run). */
+  /** Apply: files actually removed (outcome REMOVED); dry run: losers that would be. */
   files: number;
   /** Bytes freed (apply: actually reclaimed) or that would be. */
   bytes: number;
-  /** Distinct pairs that failed to compare (they are retried by the next run). */
+  /** Pairs that failed to compare (retried next run); under apply also MISMATCH/MISSING removals. */
   errors: number;
   rows: ReportRow[];
 }
@@ -476,11 +479,26 @@ const csvField = (v: string | number): string => {
   return /[",\n\r]/.test(t) ? `"${t.replaceAll('"', '""')}"` : t;
 };
 
-/** The report: header plus one line per removed file. */
-export function reportCsv(rows: ReportRow[]): string {
-  const lines = [REPORT_COLUMNS.join(',')];
-  for (const r of rows) lines.push(REPORT_COLUMNS.map((k) => csvField(r[k])).join(','));
-  return lines.join('\n') + '\n';
+/** The report header; the applied report has a 9th column, `outcome`. */
+export function reportHeader(applied: boolean): string {
+  return [...REPORT_COLUMNS, ...(applied ? ['outcome'] : [])].join(',') + '\n';
+}
+
+/** Report lines (no header), one per file. */
+export function reportLines(rows: ReportRow[], applied: boolean): string {
+  return rows
+    .map(
+      (r) =>
+        [...REPORT_COLUMNS.map((k) => csvField(r[k])), ...(applied ? [r.outcome ?? ''] : [])].join(
+          ',',
+        ) + '\n',
+    )
+    .join('');
+}
+
+/** The whole report: header plus one line per file. */
+export function reportCsv(rows: ReportRow[], applied = false): string {
+  return reportHeader(applied) + reportLines(rows, applied);
 }
 
 /** Report rows for a family's losers, read inside the family's transaction. */
@@ -531,7 +549,7 @@ async function reportRows(
  */
 export async function dedupeIdenticalAll(
   ctx: IdenticalCtx,
-  opts: { apply: boolean },
+  opts: { apply: boolean; onRows?: (rows: ReportRow[]) => void | Promise<void> },
 ): Promise<CleanupSummary> {
   const failed = new Set<string>();
   const run: IdenticalCtx = {
@@ -545,16 +563,41 @@ export async function dedupeIdenticalAll(
       },
     },
   };
+  let removalErrors = 0;
+  /** Applied rows: only a real removal frees bytes or counts as removed; MISSING/MISMATCH are errors. */
+  const settle = (row: ReportRow): void => {
+    if (row.outcome === 'REMOVED') out.files += 1;
+    else {
+      row.bytes = 0;
+      if (row.outcome === 'MISMATCH' || row.outcome === 'MISSING') removalErrors += 1;
+    }
+    out.bytes += Number(row.bytes);
+  };
   const out: CleanupSummary = { families: 0, files: 0, bytes: 0, errors: 0, rows: [] };
 
   if (opts.apply) {
     const pending = await ctx.pool.query<{ sha256: string }>(
       `SELECT s.sha256 FROM contents s WHERE ${PENDING} ORDER BY s.sha256`,
     );
-    await removePending(
-      run,
-      pending.rows.map((r) => r.sha256),
-    );
+    for (const { sha256 } of pending.rows) {
+      const c = await ctx.pool.connect();
+      let row: ReportRow;
+      try {
+        const d = (
+          await c.query<{ duplicate_of: string; duplicate_rule: string }>(
+            'SELECT duplicate_of, duplicate_rule FROM contents WHERE sha256 = $1',
+            [sha256],
+          )
+        ).rows[0]!;
+        row = (await reportRows(run, c, d.duplicate_of, [{ sha256, rule: d.duplicate_rule }]))[0]!;
+      } finally {
+        c.release();
+      }
+      row.outcome = await removeRetired(run, sha256);
+      settle(row);
+      ctx.beat();
+      await opts.onRows?.([row]);
+    }
   }
 
   const keys = await ctx.pool.query<{ sha256: string; n: number }>(
@@ -600,19 +643,20 @@ export async function dedupeIdenticalAll(
       out.families += 1;
       if (opts.apply) {
         await ctx.checkpoint?.('identical_retired');
-        for (const [i, l] of done.plan.losers.entries()) {
-          const outcome = await removeRetired(run, l.sha256);
-          const row = done.rows[i]!;
-          if (outcome !== 'REMOVED') row.bytes = 0; // nothing reclaimed
+        for (const row of done.rows) {
+          row.outcome = await removeRetired(run, String(row.removed_sha256));
+          settle(row);
           ctx.beat();
         }
+      } else {
+        out.files += done.rows.length;
+        out.bytes += done.rows.reduce((n, r) => n + Number(r.bytes), 0);
       }
-      out.files += done.plan.losers.length;
-      out.bytes += done.rows.reduce((n, r) => n + Number(r.bytes), 0);
       out.rows.push(...done.rows);
+      await opts.onRows?.(done.rows);
     }
   }
-  out.errors = failed.size;
+  out.errors = failed.size + removalErrors;
   return out;
 }
 

@@ -437,6 +437,7 @@ test('dedupe-identical dry run writes a report and totals, deletes nothing', asy
   expect(csv).toContain(vaultRel(lose, 'jpg'));
   expect(csv).toContain(keep);
   expect(await exists(layout.vaultFile(lose, 'jpg'))).toBe(true);
+  expect(csv.split('\n')[0]).not.toMatch(/outcome/);
   expect(
     (await pgh.pool.query('SELECT state FROM contents WHERE state = $1', ['DUPLICATE'])).rowCount,
   ).toBe(0);
@@ -446,12 +447,17 @@ test('dedupe-identical --apply retires, removes, names the report -applied; re-r
   const { keep, lose } = await seedDupes();
   const out = capture('stdout');
   expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
-  expect(out()).toMatch(/families 1, files to remove 1, bytes to free \d+, errors 0/);
+  expect(out()).toMatch(/families 1, files removed 1, bytes freed \d+, errors 0/);
   // A full tie falls to ingest time then sha: exactly one of the two stays.
   const left = [keep, lose].filter((h) => existsSync(layout.vaultFile(h, 'jpg')));
   expect(left).toHaveLength(1);
-  expect((await reports())[0]).toMatch(/dedupe-identical-\d{8}-\d{6}-applied\.csv$/);
+  const rep = (await reports())[0]!;
+  expect(rep).toMatch(/dedupe-identical-\d{8}-\d{6}-applied\.csv$/);
+  const lines = (await readFile(rep, 'utf8')).trim().split('\n');
+  expect(lines[0]).toMatch(/,rule,bytes,outcome$/);
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toMatch(/,REMOVED$/);
   const again = capture('stdout');
   expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
-  expect(again()).toMatch(/families 0, files to remove 0, bytes to free 0, errors 0/);
+  expect(again()).toMatch(/families 0, files removed 0, bytes freed 0, errors 0/);
 });
