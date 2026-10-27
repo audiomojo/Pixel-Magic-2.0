@@ -15,8 +15,13 @@ function revealText(r, none) {
   return r.matched ? 'It picked the same' : 'It picked this one';
 }
 
+/** The live Picks view, if any: re-opening it (`#/picks` → `#/picks/`) ends the old one first,
+ *  so only one instance ever handles keys and posts picks. */
+let active = null;
+
 /** `ui` = {main, h, api, post, button, message, routeIs}; app.js owns routing. */
 export function openPicks(ui) {
+  active?.end();
   const { h, api, post, button, message, routeIs } = ui;
   const main = ui.main();
   const board = h('section', { className: 'panel', 'aria-label': 'Scoreboard' });
@@ -39,6 +44,7 @@ export function openPicks(ui) {
   const end = () => {
     if (ended) return;
     ended = true;
+    if (active?.end === end) active = null;
     document.removeEventListener('keydown', onKey);
     window.removeEventListener('hashchange', onHash);
     window.removeEventListener('pagehide', end);
@@ -263,6 +269,7 @@ export function openPicks(ui) {
     ev.preventDefault();
   }
   document.addEventListener('keydown', onKey);
+  active = { end };
 
   paintBoard();
   guarded(load);

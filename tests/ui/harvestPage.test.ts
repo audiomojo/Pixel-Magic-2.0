@@ -451,6 +451,22 @@ test('picks: keys are ignored while typing in a field', async () => {
   expect(await pickRows()).toEqual([]);
 });
 
+test('picks: re-opening the tab under another hash leaves one live view', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  const next = e.page.waitForResponse((r) => r.url().endsWith('/api/picks/next'));
+  await e.page.evaluate(`location.hash = '#/picks/'`); // the same view, built again
+  await next;
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.keyboard.press('1');
+  await e.page.keyboard.press('Enter');
+  await e.page.getByText(/It picked|No model pick/).waitFor();
+  await new Promise((r) => setTimeout(r, 300)); // a second instance's POST would land by now
+  expect(await pickRows()).toHaveLength(1);
+});
+
 test('picks: leaving the tab ends the session and trains once', async () => {
   const e = await setup();
   await seedSet(1, 2);
