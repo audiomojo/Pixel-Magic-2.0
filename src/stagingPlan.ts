@@ -1,5 +1,6 @@
 import { FORMAT_RANK } from './formats.js';
 import { vaultRel } from './fsops.js';
+import { choosePick, NO_PICKS, type PickInputs } from './similarPick.js';
 
 /** One `contents` row as staging sees it. `copyGroup` and `similarSet` are root group ids. */
 export interface StageContent {
@@ -217,20 +218,94 @@ function push<K, V>(map: Map<K, V[]>, k: K, v: V): void {
   list.push(v);
 }
 
-/**
- * The full staged tree (spec §6.4, §12 R5/R8) from database facts, sorted by `dest`. Only facts
- * decide it — never group ids, file ids beyond the last tie-break, or input order.
- */
-export function planStaging(
+/** What every placement starts from: staged contents, their files, Live pairs, best-copy order. */
+interface Basis {
+  staged: StageContent[];
+  fileMap: Map<string, StageFile[]>;
+  pairs: Map<string, string>;
+  /** Copy groups of CLUSTERED stills, each best copy first. */
+  groups: StageContent[][];
+  /** Root set id → the set's best content, for sets of two or more copy groups. */
+  setBest: Map<number, StageContent>;
+}
+
+function basis(
   contents: readonly StageContent[],
   files: readonly StageFile[],
   maxDurationS: number,
-): Entry[] {
+): Basis {
   const fileMap = filesByContent(files);
   const staged = [...contents].filter((c) => fileMap.has(c.sha256)).sort(bySha);
   const pairs = pairLivePhotos(staged, files, maxDurationS);
   const key = (c: StageContent) => bestCopyKey(c, pairs.has(c.sha256));
   const better = (a: StageContent, b: StageContent) => compareBestCopy(key(a), key(b));
+
+  // Copy groups and similar sets of CLUSTERED stills.
+  const groups = new Map<number, StageContent[]>();
+  const sets = new Map<number, StageContent[]>();
+  for (const c of staged) {
+    if (c.kind !== 'still' || c.state !== 'CLUSTERED' || c.copyGroup === null) continue;
+    push(groups, c.copyGroup, c);
+    if (c.similarSet !== null) push(sets, c.similarSet, c);
+  }
+  // A set is two or more look-alike copy groups (spec §6.3). One that holds a single copy group
+  // (its groups merged after they were linked) stages as unique: had the copies merged first,
+  // there'd be no set, and the tree must not depend on arrival order.
+  const setBest = new Map(
+    [...sets]
+      .filter(([, cs]) => new Set(cs.map((c) => c.copyGroup)).size > 1)
+      .map(([id, cs]) => [id, [...cs].sort(better)[0]!]),
+  );
+  return {
+    staged,
+    fileMap,
+    pairs,
+    groups: [...groups.values()].map((m) => [...m].sort(better)),
+    setBest,
+  };
+}
+
+/** Root set id → its candidates by sha: each copy group's best (the stills under `similar/`). */
+function setCandidates(b: Basis): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  for (const [best] of b.groups)
+    if (best!.similarSet !== null && b.setBest.has(best!.similarSet))
+      push(out, best!.similarSet, best!.sha256);
+  for (const list of out.values()) list.sort(cmpStr);
+  return out;
+}
+
+/**
+ * Each similar set's candidates (root set id → sha256s, ascending): exactly the stills
+ * `planStaging` places under `similar/`. A copy group's other contents and Live motions are never
+ * candidates. `maxDurationS` is staging's Live bound: a Live pair ranks a copy above its twin.
+ */
+export function similarSets(
+  contents: readonly StageContent[],
+  files: readonly StageFile[],
+  maxDurationS: number,
+): Map<number, string[]> {
+  return setCandidates(basis(contents, files, maxDurationS));
+}
+
+/**
+ * The full staged tree (spec §6.4, §12 R5/R8) from database facts, sorted by `dest`. Only facts
+ * decide it — never group ids, file ids beyond the last tie-break, or input order. Each similar
+ * set's pick (`choosePick`) is named `0-best_…` in the same set folder.
+ */
+export function planStaging(
+  contents: readonly StageContent[],
+  files: readonly StageFile[],
+  maxDurationS: number,
+  picks: PickInputs = NO_PICKS,
+): Entry[] {
+  const b = basis(contents, files, maxDurationS);
+  const { staged, fileMap, pairs, setBest } = b;
+  const picked = new Set<string>();
+  for (const cands of setCandidates(b).values()) {
+    const p = choosePick(cands, picks);
+    if (p !== null) picked.add(p);
+  }
   const filesOf = (c: StageContent): StageFile[] => fileMap.get(c.sha256)!;
   const namingFile = (c: StageContent): StageFile => filesOf(c)[0]!;
   const dateOf = (c: StageContent) =>
@@ -256,30 +331,14 @@ export function planStaging(
     placementOf.set(c.sha256, r);
   };
 
-  // Copy groups and similar sets of CLUSTERED stills.
-  const groups = new Map<number, StageContent[]>();
-  const sets = new Map<number, StageContent[]>();
-  for (const c of staged) {
-    if (c.kind !== 'still' || c.state !== 'CLUSTERED' || c.copyGroup === null) continue;
-    push(groups, c.copyGroup, c);
-    if (c.similarSet !== null) push(sets, c.similarSet, c);
-  }
-  // A set is two or more look-alike copy groups (spec §6.3). One that holds a single copy group
-  // (its groups merged after they were linked) stages as unique: had the copies merged first,
-  // there'd be no set, and the tree must not depend on arrival order.
-  const setBest = new Map(
-    [...sets]
-      .filter(([, cs]) => new Set(cs.map((c) => c.copyGroup)).size > 1)
-      .map(([id, cs]) => [id, [...cs].sort(better)[0]!]),
-  );
-  for (const members of groups.values()) {
-    const [best, ...others] = [...members].sort(better);
+  for (const [best, ...others] of b.groups) {
     const copies = `copies/g-${sha8(best!.sha256)}`;
     const sb = best!.similarSet === null ? undefined : setBest.get(best!.similarSet);
     const folder = sb
       ? `similar/${dateOf(sb).dir}/s-${sha8(sb.sha256)}`
       : `unique/${dateOf(best!).dir}`;
-    place(best!, folder, `${dateOf(best!).stamp}_${namingFile(best!).originalName}`);
+    const mark = sb && picked.has(best!.sha256) ? '0-best_' : '';
+    place(best!, folder, `${mark}${dateOf(best!).stamp}_${namingFile(best!).originalName}`);
     // The group's other contents: different files of the same shot.
     for (const o of others) place(o, copies, namingFile(o).originalName);
   }

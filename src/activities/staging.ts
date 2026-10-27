@@ -14,8 +14,16 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname, join, relative, sep } from 'node:path';
 import { heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
+import { withTx } from '../db.js';
 import { errCode, fsyncDir, isEnoent, unlessEnoent } from '../fsops.js';
-import { planStaging, type Entry, type StageContent, type StageFile } from '../stagingPlan.js';
+import type { PickInputs } from '../similarPick.js';
+import {
+  planStaging,
+  similarSets,
+  type Entry,
+  type StageContent,
+  type StageFile,
+} from '../stagingPlan.js';
 import type { BuildResult } from '../types.js';
 import type { Deps } from './index.js';
 import { RUNNING_FILE_WORKFLOWS } from './scan.js';
@@ -85,6 +93,10 @@ export function makeStaging(deps: Deps) {
                  OR EXISTS (SELECT 1 FROM files
                              WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
                  OR EXISTS (SELECT 1 FROM contents
+                             WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
+                 OR EXISTS (SELECT 1 FROM picks
+                             WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
+                 OR EXISTS (SELECT 1 FROM ranker_models
                              WHERE NOT pg_visible_in_snapshot(xmin::text::xid8, b.snapshot))
               ) AS changed,
               b.gen AS last_gen,
@@ -172,6 +184,46 @@ export function makeStaging(deps: Deps) {
         state: r.state,
       })),
     };
+  }
+
+  /**
+   * What decides each set's pick (spec §6): user picks in decision order (`no_clear_best` ones
+   * choose nothing), and the scores of the current ranked model (the newest promoted one that
+   * has finished ranking).
+   */
+  async function loadPickInputs(c: pg.PoolClient): Promise<PickInputs> {
+    const up = await c.query<{ chosen_sha256: string }>(
+      `SELECT chosen_sha256 FROM picks WHERE chosen_sha256 IS NOT NULL ORDER BY decided_at, id`,
+    );
+    const sc = await c.query<{ sha256: string; score: number }>(
+      `SELECT sha256, score FROM photo_scores
+        WHERE model_version = (SELECT max(version) FROM ranker_models
+                                WHERE promoted AND ranked_at IS NOT NULL)`,
+    );
+    return {
+      // A later pick of the same photo overwrites its order: the latest decision counts.
+      userPicks: new Map(up.rows.map((r, i) => [r.chosen_sha256, i])),
+      scores: new Map(sc.rows.map((r) => [r.sha256, r.score])),
+    };
+  }
+
+  /** Replaces `similar_candidates` with this build's sets, so the worker can find sets to rank. */
+  async function writeCandidates(sets: Map<number, string[]>): Promise<void> {
+    const ids: number[] = [];
+    const shas: string[] = [];
+    for (const [id, cands] of sets)
+      for (const s of cands) {
+        ids.push(id);
+        shas.push(s);
+      }
+    await withTx(pool, async (t) => {
+      await t.query('DELETE FROM similar_candidates');
+      await t.query(
+        `INSERT INTO similar_candidates (set_id, sha256)
+         SELECT * FROM unnest($1::bigint[], $2::text[])`,
+        [ids, shas],
+      );
+    });
   }
 
   /** The generation `current` points at, if any. */
@@ -317,6 +369,7 @@ export function makeStaging(deps: Deps) {
     await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     let snap: Snapshot;
     let facts: Awaited<ReturnType<typeof loadFacts>>;
+    let picks: PickInputs;
     try {
       snap = await snapshot(c);
       const skip =
@@ -330,6 +383,7 @@ export function makeStaging(deps: Deps) {
         return { gen: null, entries: 0, skipped: true };
       }
       facts = await loadFacts(c);
+      picks = await loadPickInputs(c);
       await c.query('COMMIT');
     } catch (e) {
       await c.query('ROLLBACK').catch(() => undefined); // never mask the original error
@@ -347,7 +401,7 @@ export function makeStaging(deps: Deps) {
     await unlessEnoent(unlink(tmpLink));
 
     const gen = Math.max(0, snap.lastGen ?? 0, live ?? 0, ...(await gensOnDisk())) + 1;
-    const entries = planStaging(facts.contents, facts.files, settings.liveMaxDurationS);
+    const entries = planStaging(facts.contents, facts.files, settings.liveMaxDurationS, picks);
     try {
       await mkdir(genPath(gen));
       await linkAll(genPath(gen), entries);
@@ -358,6 +412,8 @@ export function makeStaging(deps: Deps) {
     await symlink(`.gen-${String(gen)}`, tmpLink);
     await rename(tmpLink, currentPath);
     await fsyncDir(layout.staging);
+    // Before the build is recorded: should this fail, the next build runs again and rewrites it.
+    await writeCandidates(similarSets(facts.contents, facts.files, settings.liveMaxDurationS));
     await c.query(
       `INSERT INTO staging_builds (gen, watermark, cluster_version, snapshot, built_at, entries)
        VALUES ($1, $2::timestamptz, $3, $4::pg_snapshot, clock_timestamp(), $5)`,

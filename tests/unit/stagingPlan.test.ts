@@ -7,10 +7,12 @@ import {
   compareBestCopy,
   pairLivePhotos,
   planStaging,
+  similarSets,
   type Entry,
   type StageContent,
   type StageFile,
 } from '../../src/stagingPlan.js';
+import { NO_PICKS, type PickInputs } from '../../src/similarPick.js';
 
 const C = (sha: string, o: Partial<StageContent> = {}): StageContent => ({
   sha256: sha,
@@ -135,6 +137,93 @@ test('similar folder is named and dated after the set best, across months', () =
   expect(dests(planStaging([a, b], [Fl(1n, 'A.HEIC', a), Fl(2n, 'B.HEIC', b)], 5))).toEqual([
     'similar/2021/2021-11/s-bbbbbbbb/20211003_140211_A.HEIC',
     'similar/2021/2021-11/s-bbbbbbbb/20211101_000001_B.HEIC',
+  ]);
+});
+
+/** A user pick of each sha, later ones later. */
+const userPicked = (...shas: string[]): PickInputs => ({
+  userPicks: new Map(shas.map((s, i) => [s, i])),
+  scores: new Map(),
+});
+
+/** Three look-alike shots, one of them with a smaller JPEG copy (never a candidate). */
+function threeShots(): { cs: StageContent[]; fs: StageFile[] } {
+  const a = C('a'.repeat(64), { copyGroup: 1, similarSet: 9 });
+  const a2 = C('d'.repeat(64), { copyGroup: 1, similarSet: 9, ext: 'jpg', width: 10, height: 10 });
+  const b = C('b'.repeat(64), { copyGroup: 2, similarSet: 9, width: 10, height: 10 });
+  const c = C('c'.repeat(64), { copyGroup: 3, similarSet: 9, width: 20, height: 10 });
+  return {
+    cs: [a, a2, b, c],
+    fs: [Fl(1n, 'A.HEIC', a), Fl(2n, 'A.JPG', a2), Fl(3n, 'B.HEIC', b), Fl(4n, 'C.HEIC', c)],
+  };
+}
+
+test('with no picks the plan is unchanged', () => {
+  const { cs, fs } = threeShots();
+  expect(planStaging(cs, fs, 5, NO_PICKS)).toEqual(planStaging(cs, fs, 5));
+  expect(dests(planStaging(cs, fs, 5))).toEqual([
+    'copies/g-aaaaaaaa/A.JPG',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_A.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_B.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_C.HEIC',
+  ]);
+});
+
+test('the pick of a set is named 0-best_ in the same set folder', () => {
+  const { cs, fs } = threeShots();
+  expect(dests(planStaging(cs, fs, 5, userPicked('b'.repeat(64))))).toEqual([
+    'copies/g-aaaaaaaa/A.JPG',
+    'similar/2021/2021-10/s-aaaaaaaa/0-best_20211003_140211_B.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_A.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_C.HEIC',
+  ]);
+});
+
+test('a changed pick renames two files and no folder', () => {
+  const { cs, fs } = threeShots();
+  const before = dests(planStaging(cs, fs, 5, userPicked('b'.repeat(64))));
+  const after = dests(planStaging(cs, fs, 5, userPicked('b'.repeat(64), 'c'.repeat(64))));
+  const folders = (ds: string[]) => [...new Set(ds.map((d) => d.slice(0, d.lastIndexOf('/'))))];
+  expect(folders(after)).toEqual(folders(before));
+  expect(before.filter((d) => !after.includes(d))).toEqual([
+    'similar/2021/2021-10/s-aaaaaaaa/0-best_20211003_140211_B.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_C.HEIC',
+  ]);
+  expect(after.filter((d) => !before.includes(d))).toEqual([
+    'similar/2021/2021-10/s-aaaaaaaa/0-best_20211003_140211_C.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_B.HEIC',
+  ]);
+});
+
+test('a pick of a copy group’s non-placed content marks nothing', () => {
+  const { cs, fs } = threeShots();
+  expect(planStaging(cs, fs, 5, userPicked('d'.repeat(64)))).toEqual(planStaging(cs, fs, 5));
+});
+
+test('similar sets: the placed best of each copy group, never its other contents', () => {
+  const { cs, fs } = threeShots();
+  const lone = C('e'.repeat(64), { copyGroup: 4, similarSet: 10 }); // a set of one copy group
+  expect(similarSets([...cs, lone], [...fs, Fl(5n, 'E.HEIC', lone)], 5)).toEqual(
+    new Map([[9, ['a'.repeat(64), 'b'.repeat(64), 'c'.repeat(64)]]]),
+  );
+});
+
+test('a Live motion beside a picked still is never a candidate and shares its base name', () => {
+  const a = C('a'.repeat(64), { copyGroup: 1, similarSet: 9, liveContentId: 'L' });
+  const b = C('b'.repeat(64), { copyGroup: 2, similarSet: 9 });
+  const m = C('f'.repeat(64), {
+    kind: 'motion',
+    ext: 'mov',
+    state: 'INGESTED',
+    liveContentId: 'L',
+    copyGroup: null,
+  });
+  const fs = [Fl(1n, 'A.HEIC', a), Fl(2n, 'B.HEIC', b), Fl(3n, 'A.MOV', m)];
+  expect(similarSets([a, b, m], fs, 5)).toEqual(new Map([[9, ['a'.repeat(64), 'b'.repeat(64)]]]));
+  expect(dests(planStaging([a, b, m], fs, 5, userPicked('a'.repeat(64))))).toEqual([
+    'similar/2021/2021-10/s-aaaaaaaa/0-best_20211003_140211_A.HEIC',
+    'similar/2021/2021-10/s-aaaaaaaa/0-best_20211003_140211_A.MOV',
+    'similar/2021/2021-10/s-aaaaaaaa/20211003_140211_B.HEIC',
   ]);
 });
 
@@ -648,6 +737,35 @@ test('the tree is independent of arrival order and group ids (property)', () => 
         const keys = a.map((e) => e.dest.toLowerCase());
         expect(new Set(keys).size).toBe(keys.length); // never two links at one (APFS) path
         expect(a.map((e) => e.dest)).toEqual(a.map((e) => e.dest).sort());
+      },
+    ),
+    { numRuns: 1000 },
+  );
+});
+
+test('at most one picked photo per set folder; folders never depend on picks (property)', () => {
+  fc.assert(
+    fc.property(
+      world,
+      fc.array(fc.tuple(fc.constantFrom(...SHAS), fc.integer({ min: 0, max: 9 }))),
+      fc.array(fc.tuple(fc.constantFrom(...SHAS), fc.constantFrom(0.1, 0.5, 0.9))),
+      (w, up, sc) => {
+        const picks: PickInputs = { userPicks: new Map(up), scores: new Map(sc) };
+        const plain = planStaging(w.contents, w.files, 5);
+        const picked = planStaging(w.contents, w.files, 5, picks);
+        const folder = (d: string) => d.slice(0, d.lastIndexOf('/'));
+        expect(picked.map((e) => folder(e.dest))).toEqual(plain.map((e) => folder(e.dest)));
+        // A Live MOV beside the pick takes its name too; count the stills.
+        const stills = new Set(
+          w.contents.filter((c) => c.kind === 'still').map((c) => vaultRel(c.sha256, c.ext)),
+        );
+        const best = new Map<string, number>();
+        for (const { dest, src } of picked) {
+          if (!dest.slice(dest.lastIndexOf('/') + 1).startsWith('0-best_')) continue;
+          expect(dest.startsWith('similar/')).toBe(true);
+          if (stills.has(src)) best.set(folder(dest), (best.get(folder(dest)) ?? 0) + 1);
+        }
+        for (const n of best.values()) expect(n).toBe(1);
       },
     ),
     { numRuns: 1000 },

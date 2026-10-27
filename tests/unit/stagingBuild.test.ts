@@ -294,6 +294,99 @@ test('a write committed after a later write still triggers a rebuild', async () 
   }
 });
 
+/** Two look-alike shots (set 9): A is the set best, with a smaller JPEG copy; then B. */
+async function seedSimilarSet(): Promise<{ a: string; a2: string; b: string }> {
+  const [ba, ba2, bb] = [1, 2, 3].map(() => randomBytes(64));
+  await pool.query(
+    `INSERT INTO groups (id, kind, similar_set_id) VALUES (1, 'copy', 9), (2, 'copy', 9)`,
+  );
+  const a = await content(ba!, { ext: 'heic', kind: 'still', state: 'CLUSTERED', w: 40, group: 1 });
+  const a2 = await content(ba2!, {
+    ext: 'jpg',
+    kind: 'still',
+    state: 'CLUSTERED',
+    w: 20,
+    group: 1,
+  });
+  const b = await content(bb!, { ext: 'heic', kind: 'still', state: 'CLUSTERED', w: 30, group: 2 });
+  await file('p/A.HEIC', a, 'heic');
+  await file('p/A.JPG', a2, 'jpg');
+  await file('p/B.HEIC', b, 'heic');
+  await put(vaultRel(a, 'heic'), ba!);
+  await put(vaultRel(a2, 'jpg'), ba2!);
+  await put(vaultRel(b, 'heic'), bb!);
+  return { a, a2, b };
+}
+const candidates = async () =>
+  (
+    await pool.query<{ set_id: bigint; sha256: string }>(
+      'SELECT set_id, sha256 FROM similar_candidates ORDER BY set_id, sha256',
+    )
+  ).rows;
+const setNames = async () =>
+  (await tree(join(layout.staging, 'current')))
+    .map(([p]) => p)
+    .filter((p) => p.startsWith('similar/'))
+    .map((p) => basename(p));
+
+test('a build records each similar set’s candidates, replacing the previous ones', async () => {
+  const { a, b } = await seedSimilarSet();
+  await pool.query(`INSERT INTO similar_candidates (set_id, sha256) VALUES (4, 'stale')`);
+  await build(true);
+  expect(await candidates()).toEqual([a, b].sort().map((sha256) => ({ set_id: 9n, sha256 })));
+  expect(await setNames()).toEqual(['20211003_140211_A.HEIC', '20211003_140211_B.HEIC']);
+});
+
+test('a new user pick rebuilds and marks that file', async () => {
+  const { a, b } = await seedSimilarSet();
+  await build(true);
+  expect(await build(false)).toMatchObject({ skipped: true });
+  await pool.query(
+    `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best)
+     VALUES (9, $1, $2, false)`,
+    [b, [a, b]],
+  );
+  expect((await build(false)).skipped).toBe(false);
+  expect(await setNames()).toEqual(['0-best_20211003_140211_B.HEIC', '20211003_140211_A.HEIC']);
+  expect(await build(false)).toMatchObject({ skipped: true });
+});
+
+test('a later no-clear-best pick is not a user pick', async () => {
+  const { a, b } = await seedSimilarSet();
+  await pool.query(
+    `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best, decided_at)
+     VALUES (9, $1, $2, false, now() - interval '1 day'), (9, NULL, $2, true, now())`,
+    [b, [a, b]],
+  );
+  await build(true);
+  expect(await setNames()).toEqual(['0-best_20211003_140211_B.HEIC', '20211003_140211_A.HEIC']);
+});
+
+test('a newly ranked model rebuilds and marks its top candidate', async () => {
+  const { a, a2, b } = await seedSimilarSet();
+  await build(true);
+  // An unpromoted or unranked model's scores are never used.
+  await pool.query(
+    `INSERT INTO ranker_models (version, feature_version, picks_used, promoted, path, ranked_at)
+     VALUES (1, 1, 0, true, 'm1', now()), (2, 1, 0, false, 'm2', now()), (3, 1, 0, true, 'm3', NULL)`,
+  );
+  await pool.query(
+    `INSERT INTO photo_scores (sha256, model_version, score)
+     VALUES ($1, 1, 0.9), ($2, 1, 0.2), ($3, 1, 0.99),
+            ($1, 2, 0.1), ($2, 2, 0.95), ($1, 3, 0.1), ($2, 3, 0.95)`,
+    [a, b, a2],
+  );
+  expect((await build(false)).skipped).toBe(false);
+  expect(await setNames()).toEqual(['0-best_20211003_140211_A.HEIC', '20211003_140211_B.HEIC']);
+  expect(await build(false)).toMatchObject({ skipped: true });
+});
+
+test('with the AI tables empty an unchanged build still skips', async () => {
+  await seedSimilarSet();
+  await build(true);
+  expect(await build(false)).toMatchObject({ skipped: true, gen: null });
+});
+
 test('a first build runs even with an empty database', async () => {
   expect(await build(false)).toEqual({ gen: 1, entries: 0, skipped: false });
   expect(await readdir(join(layout.staging, 'current'))).toEqual([]);
