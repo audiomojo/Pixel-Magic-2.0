@@ -28,6 +28,10 @@ FEATURE_NAMES = [
 ] + [f"emb_{k}" for k in range(PCA_DIM)]
 N_FEATURES = len(FEATURE_NAMES)
 MIN_PICKS = 20
+FOLDS = 5
+# Fewest usable picks for which every CV training fold still has MIN_PICKS (25 with 5 folds);
+# below it every fold would fall back to RULE_ONLY and the CV would say nothing about the fit.
+MIN_TRAIN_PICKS = -(-MIN_PICKS * FOLDS // (FOLDS - 1))
 LAMS = (0.01, 0.1, 1.0, 10.0)
 _IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
@@ -171,7 +175,7 @@ def cv_agreement(
     picks: list[Pick],
     pca: np.ndarray,
     lam: float,
-    folds: int = 5,
+    folds: int = FOLDS,
     seed: int = 7,
 ) -> float:
     """Share of held-out picks whose chosen candidate scores strictly highest."""
@@ -195,10 +199,11 @@ def train(
     sets: dict[int, list[Described]], picks: list[Pick], current: Model | None
 ) -> tuple[Model, float, bool]:
     """Choose lam by CV and fit on every pick. Promoted when its CV agreement is at least the
-    current model's config (its lam, or the rule score when it is RULE_ONLY) on the same folds."""
+    current model's config (its lam, or the rule score when it is RULE_ONLY) on the same folds.
+    Below MIN_TRAIN_PICKS usable picks the CV cannot test a fit, so it returns RULE_ONLY."""
     pca = fit_pca(sets)
     prepared = _usable(_rows(sets, pca), picks)
-    if len(prepared) < MIN_PICKS:
+    if len(prepared) < MIN_TRAIN_PICKS:
         return RULE_ONLY(pca), _agreement(RULE_ONLY(pca), prepared), current is None
     cvs = {lam: cv_agreement(sets, picks, pca, lam) for lam in LAMS}
     lam = max(LAMS, key=lambda l: cvs[l])  # first of the best on a tie
@@ -207,6 +212,8 @@ def train(
         return model, cvs[lam], True
     if _is_rule_only(current):
         baseline = _agreement(RULE_ONLY(pca), prepared)
+    elif current.lam in cvs:
+        baseline = cvs[current.lam]  # same picks, same folds: the value is identical
     else:
         baseline = cv_agreement(sets, picks, pca, current.lam)
     return model, cvs[lam], cvs[lam] >= baseline

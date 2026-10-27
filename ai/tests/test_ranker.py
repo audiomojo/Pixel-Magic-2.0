@@ -199,3 +199,37 @@ def test_load_rejects_bad_files(tmp_path):
         np.savez(f, weights=np.zeros(44), lam=0.1, feature_version=1)
     with pytest.raises(ValueError):
         load(missing)
+
+
+def test_train_too_few_picks_for_cv_folds_is_rule_only():
+    assert ranker.MIN_TRAIN_PICKS == 25
+    rng = np.random.default_rng(10)
+    sets, picks = synthetic(rng, 22, "u")
+    pca = fit_pca(sets)
+    model, cv, promoted = train(sets, picks, RULE_ONLY(pca))
+    assert np.array_equal(model.weights, RULE_ONLY(pca).weights)
+    assert not promoted and 0 <= cv <= 1
+
+
+def test_train_with_enough_picks_for_cv_fits():
+    rng = np.random.default_rng(11)
+    sets, picks = synthetic(rng, 25, "v")
+    model, _, _ = train(sets, picks, None)
+    assert not np.array_equal(model.weights, RULE_ONLY(fit_pca(sets)).weights)
+    assert model.lam in {0.01, 0.1, 1, 10}
+
+
+def test_train_reuses_grid_cv_for_current_lam(monkeypatch):
+    rng = np.random.default_rng(12)
+    sets, picks = synthetic(rng, 40, "w")
+    current = Model(np.zeros(44), 1.0, fit_pca(sets), 1)
+    calls = []
+
+    def fake(s, p, pca, lam, **kw):
+        calls.append(lam)
+        return {0.01: 0.5, 0.1: 0.6, 1.0: 0.7, 10.0: 0.4}[lam]
+
+    monkeypatch.setattr(ranker, "cv_agreement", fake)
+    model, cv, promoted = train(sets, picks, current)
+    assert sorted(calls) == [0.01, 0.1, 1.0, 10.0]
+    assert model.lam == 1.0 and cv == 0.7 and promoted
