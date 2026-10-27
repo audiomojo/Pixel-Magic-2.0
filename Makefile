@@ -1,5 +1,5 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
-	ai-test corpus-manifest corpus-verify \
+	ai-test ai-install ai-uninstall ai-status ai-worker corpus-manifest corpus-verify \
 	harvest-install harvest-uninstall harvest-stop harvest-start harvester harvest-status \
 	test-smoke test-standard test-harvest update-golden golden-smoke chaos
 
@@ -111,3 +111,18 @@ harvest-status:
 # The Python worker's tests (needs uv and Docker); skips the mac/ml-marked tests.
 ai-test:
 	cd ai && uv run pytest -m "not mac and not ml"
+
+# Similar picks: the AI worker (task queue `ai`) as a launchd agent on the Mac. Install writes
+# ~/Library/LaunchAgents/com.pixelmagic.ai.plist (absolute uv path, this repo) and loads it.
+ai-install:
+	cd ai && uv sync --extra ml --extra mac && uv run python -m pixelmagic_ai.launchd install
+
+ai-uninstall:
+	cd ai && uv run python -m pixelmagic_ai.launchd uninstall
+
+ai-status:
+	launchctl print gui/$$(id -u)/com.pixelmagic.ai
+
+# Run the worker in the foreground (run `make ai-uninstall` first, or two workers share the queue).
+ai-worker:
+	cd ai && uv run --extra ml --extra mac python -m pixelmagic_ai.worker

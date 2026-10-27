@@ -143,6 +143,25 @@ Logs: `DATA_DIR/logs/harvester.log` (rotated by size) and, for crashes only,
 installed with.
 Design: `docs/superpowers/specs/2026-10-19-harvest-design.md`.
 
+## Similar picks (AI worker)
+
+A native Python worker (`ai/`, Temporal task queue `ai`) describes each candidate photo of a
+look-alike set: quality measures, faces (Apple Vision), a SigLIP 2 embedding and an aesthetic
+score, stored in `photo_features`. The `ai-describe` schedule runs `DescribeWorkflow` every
+15 minutes (a run is skipped while one is still going); it reads vault files read-only and
+never changes them. A photo that cannot be decoded is recorded as failed and not retried.
+
+    make ai-install     # write ~/Library/LaunchAgents/com.pixelmagic.ai.plist and load it
+    make ai-uninstall   # unload and remove it
+    make ai-status      # launchctl's view of the agent (state, pid, last exit)
+    make ai-worker      # run in the foreground; needs `make ai-uninstall` first
+
+It needs uv, the stack up (`make up`) and migration 0008 (applied by the stack's normal
+`migrate`). Pause describing with the `ai-describe` schedule in the Temporal UI.
+`AI_DESCRIBE_CONCURRENCY` (default 2) sets how many photos are described at once; run
+`make ai-install` again after changing it or moving the repo. Logs:
+`DATA_DIR/logs/ai.launchd.log`.
+
 ## Upgrading
 
 Up to `MAX_IN_FLIGHT` (5,000) FileWorkflows are always in flight, and a workflow-code change
