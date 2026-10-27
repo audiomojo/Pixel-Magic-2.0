@@ -157,7 +157,8 @@ never changes them. A photo that cannot be decoded is recorded as failed and not
     make ai-worker      # run in the foreground; needs `make ai-uninstall` first
 
 It needs uv, the stack up (`make up`) and migration 0008 (applied by the stack's normal
-`migrate`). Pause describing with the `ai-describe` schedule in the Temporal UI.
+`migrate`). Pause describing from the Picks tab (it also cancels the run in progress), or
+pause the `ai-describe` schedule in the Temporal UI (that only stops new runs).
 `AI_DESCRIBE_CONCURRENCY` (default 2) sets how many photos are described at once; run
 `make ai-install` again after changing it or moving the repo. Logs:
 `DATA_DIR/logs/ai.launchd.log`.

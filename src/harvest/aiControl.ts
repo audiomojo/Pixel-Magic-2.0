@@ -44,8 +44,21 @@ export function temporalAiControl(client: Client): AiControl {
       return 'started';
     },
     async setDescribePaused(paused) {
-      if (paused) await schedule().pause('paused from the Picks tab');
-      else await schedule().unpause('resumed from the Picks tab');
+      if (!paused) {
+        await schedule().unpause('resumed from the Picks tab');
+        return;
+      }
+      // Pausing only stops new starts: also cancel the chain the schedule is running (its
+      // latest run after continue-as-new, never another chain's). Rows are idempotent.
+      await schedule().pause('paused from the Picks tab');
+      for (const a of (await schedule().describe()).info.runningActions) {
+        const { workflowId, firstExecutionRunId } = a.workflow;
+        try {
+          await client.workflow.getHandle(workflowId, undefined, { firstExecutionRunId }).cancel();
+        } catch (e) {
+          if (!(e instanceof WorkflowNotFoundError)) throw e; // closed meanwhile
+        }
+      }
     },
     async describePaused() {
       return (await schedule().describe()).state.paused;

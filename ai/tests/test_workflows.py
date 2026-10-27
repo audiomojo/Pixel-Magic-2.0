@@ -11,6 +11,8 @@ from temporalio.client import (
     ScheduleOverlapPolicy,
     ScheduleRange,
 )
+from temporalio.client import WorkflowFailureError
+from temporalio.exceptions import CancelledError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -31,8 +33,10 @@ class FakeAi:
         page: int = 50,
         broken: frozenset[str] = frozenset(),
         needs_rank: bool = False,
+        delay: float = 0.002,
     ) -> None:
         self.needs_rank = needs_rank
+        self.delay = delay
         self.backlog = [(f"{i:064x}", "jpg") for i in range(n)]
         self.page = page
         self.broken = broken
@@ -57,7 +61,7 @@ class FakeAi:
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
-            await asyncio.sleep(0.002)
+            await asyncio.sleep(self.delay)
             if sha256 in self.broken:
                 raise OSError("share went away")
             self.described.append(sha256)
@@ -115,6 +119,37 @@ def test_rank_sets_runs_with_nothing_described_when_ranking_is_needed():
     result, first_run, last_run = run(fake, concurrency=2)
     assert result == 0
     assert fake.ranked == 1
+
+
+def test_cancel_stops_the_chain_without_ranking():
+    """Pause from the Picks tab cancels the running chain: no new photo starts afterwards."""
+    asyncio.run(_cancel_stops_the_chain_without_ranking())
+
+
+async def _cancel_stops_the_chain_without_ranking():
+    fake = FakeAi(450, page=50, delay=0.05)
+    async with await WorkflowEnvironment.start_time_skipping() as env, Worker(
+        env.client,
+        task_queue=QUEUE,
+        workflows=[DescribeWorkflow],
+        activities=[
+            fake.describe_backlog_page, fake.describe_photo, fake.rank_sets, fake.rank_needed
+        ],
+    ):
+        handle = await env.client.start_workflow(
+            DescribeWorkflow.run, 2, id=f"describe-{uuid.uuid4()}", task_queue=QUEUE
+        )
+        while len(fake.described) < 4:
+            await asyncio.sleep(0.01)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as e:
+            await handle.result()
+        assert isinstance(e.value.cause, CancelledError)
+        started = len(fake.attempts)
+        await asyncio.sleep(0.5)
+        assert len(fake.attempts) == started  # nothing new was started
+        assert started < 50
+        assert fake.ranked == 0
 
 
 def test_rank_sets_skipped_when_nothing_described():

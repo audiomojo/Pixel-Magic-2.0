@@ -41,7 +41,11 @@ class DescribeWorkflow:
         """Photos described (ok or failed) over the whole continue-as-new chain.
 
         Pages walk the backlog by a sha256 cursor (carried through continue-as-new), so a photo
-        that keeps failing is tried once per scheduled run and never hides the ones after it."""
+        that keeps failing is tried once per scheduled run and never hides the ones after it.
+
+        "Pause describing" cancels the chain: the cancel raises asyncio.CancelledError in this
+        task at its current await (never caught here), so nothing new starts and nothing is
+        ranked; activities already running may finish, and their rows are idempotent."""
         sem = asyncio.Semaphore(max(1, concurrency))
 
         async def describe(sha256: str, ext: str) -> bool:
