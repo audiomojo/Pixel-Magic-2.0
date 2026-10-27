@@ -1,5 +1,5 @@
 .PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
-	corpus-manifest corpus-verify \
+	ai-test corpus-manifest corpus-verify \
 	harvest-install harvest-uninstall harvest-stop harvest-start harvester harvest-status \
 	test-smoke test-standard test-harvest update-golden golden-smoke chaos
 
@@ -107,3 +107,7 @@ harvester: build
 # Active run, item counts, gate and the host heartbeat.
 harvest-status:
 	node --env-file-if-exists=.env dist/harvest/cli.js status
+
+# The Python worker's tests (needs uv and Docker); skips the mac/ml-marked tests.
+ai-test:
+	cd ai && uv run pytest -m "not mac and not ml"

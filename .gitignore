@@ -13,6 +13,7 @@ tests/e2e/golden/
 __pycache__/
 *.py[cod]
 .venv/
+ai/.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

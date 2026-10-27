@@ -10,6 +10,7 @@ export default tseslint.config(
       'data/',
       'data-test/',
       'architecturte/',
+      'ai/',
       'test-automation/',
     ],
   },

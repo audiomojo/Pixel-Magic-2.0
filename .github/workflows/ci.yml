@@ -42,3 +42,17 @@ jobs:
           name: coverage
           path: coverage/
           if-no-files-found: ignore
+
+  # The Python worker (ai/): core and dev dependencies only; the ml and mac extras and their
+  # tests need macOS hardware and model weights, so they stay local.
+  ai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.0
+      - run: uv sync --frozen
+      - run: uv run pytest -m "not mac and not ml"
