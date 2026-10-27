@@ -11,6 +11,8 @@ export default defineConfig({
         },
       },
       { test: { name: 'workflow', include: ['tests/workflow/**/*.test.ts'] } },
+      // The harvester page in Chromium (needs `npx playwright install chromium`).
+      { test: { name: 'ui', include: ['tests/ui/**/*.test.ts'], testTimeout: 30_000 } },
       { test: { name: 'corpus', include: ['tests/**/*.corpus.test.ts'] } },
       {
         // The real compose stack against a seeded corpus subset; TIER picks the suite.
@@ -40,7 +42,7 @@ export default defineConfig({
         'src/harvest/system.ts',
         'src/harvest/host.ts',
         'src/harvest/hostLogEnv.ts',
-        'src/harvest/ui/{app.js,index.html,app.css}', // the browser page: checked by hand
+        'src/harvest/ui/{app.js,index.html,app.css}', // the browser page: tests/ui (npm run test:ui)
         'src/worker.ts',
         'src/decodeWorker.ts',
         'tools/corpus/{buildManifest,seed,verify,synth}.ts',

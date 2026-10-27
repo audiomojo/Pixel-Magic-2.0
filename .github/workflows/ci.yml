@@ -1,4 +1,5 @@
-# Static checks plus the unit and workflow tests on every push and pull request.
+# Static checks plus the unit, workflow and browser (harvester page) tests on every push and
+# pull request.
 # The Postgres-backed tests start throwaway containers (testcontainers), which the
 # Ubuntu runner's Docker provides. The corpus, e2e and chaos tiers need the private
 # sample corpus (git-ignored), so they stay local: see `make test-smoke` etc.
@@ -33,6 +34,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run test:coverage
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:ui
       - if: always()
         uses: actions/upload-artifact@v4
         with:

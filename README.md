@@ -27,6 +27,7 @@ generation is cleaned up, never deleted.
 
     npm install
     npm test            # unit + workflow tests
+    npm run test:ui     # the harvester page in Chromium (first: npx playwright install chromium)
     npm run lint && npm run format:check && npm run typecheck && npm run build
 
 Configuration is via environment variables: copy `.env.example` to `.env` (compose reads it).
