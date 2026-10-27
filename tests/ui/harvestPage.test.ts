@@ -422,15 +422,15 @@ test('picks: N stores no clear best', async () => {
   expect(await pickRows()).toEqual([{ chosen: null, none: true }]);
 });
 
-test('picks: S shows a set again without storing anything', async () => {
+test('picks: S shows a different set without storing anything', async () => {
   const e = await setup();
   await seedSet(1, 2);
+  await seedSet(2, 2);
   await e.open('#/picks');
   await eventually(() => shownNames(e).then((n) => n.length), 2);
-  const next = e.page.waitForResponse((r) => r.url().endsWith('/api/picks/next'));
+  const first = (await shownNames(e))[0]!.slice(0, 1);
   await e.page.keyboard.press('s');
-  await next;
-  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await eventually(async () => (await shownNames(e))[0]?.slice(0, 1) !== first, true);
   expect(await pickRows()).toEqual([]);
   await eventually(() => e.page.locator('.counter').textContent(), '0/10 today');
 });

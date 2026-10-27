@@ -136,6 +136,15 @@ const pickBody = z
     message: 'give exactly one of chosen and noClearBest',
   });
 
+/** `?skip=1,2,3`: at most 50 decimal set ids to leave out of the next selection. */
+function parseSkip(raw: string | null): Set<string> {
+  if (raw === null || raw === '') return new Set();
+  const ids = raw.split(',');
+  if (ids.length > 50 || !ids.every((x) => /^\d{1,19}$/.test(x)))
+    throw new HttpError(400, 'invalid skip');
+  return new Set(ids.map((x) => BigInt(x).toString()));
+}
+
 export interface PicksDeps {
   pool: pg.Pool;
   settings: HarvestSettings;
@@ -192,7 +201,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
   }
 
   // ---- next ---------------------------------------------------------------------------
-  async function next(): Promise<Json> {
+  async function next(skip: ReadonlySet<string>): Promise<Json> {
     const version = await currentModel();
     // The described (non-failed) candidates of every set: what a set shows.
     const cands = await pool.query<{ set_id: string; sha256: string; score: number | null }>(
@@ -226,7 +235,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
       .filter(([id, shas]) => {
         if (shas.length < 2) return false;
         const shown = lastShown.get(id);
-        return shown === undefined || !sameList(shown, shas);
+        return !skip.has(id) && (shown === undefined || !sameList(shown, shas));
       })
       .sort(([a], [b]) => bySetId(a, b));
     if (eligible.length === 0) return { set: null };
@@ -518,7 +527,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     };
     let m: RegExpMatchArray | null;
     if (method === 'GET') {
-      if (path === '/api/picks/next') return ok(await next());
+      if (path === '/api/picks/next') return ok(await next(parseSkip(query.get('skip'))));
       if (path === '/api/picks/scoreboard') return ok(await scoreboard());
       if ((m = path.match(/^\/api\/preview\/([^/]+)$/))) {
         await preview(m[1]!, query, res);

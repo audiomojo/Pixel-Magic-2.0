@@ -6,7 +6,6 @@ import { paintScoreboard } from './scoreboard.js';
 
 const REASONS = ['sharper', 'eyes open', 'expression', 'framing', 'exposure'];
 const preview = (sha, w) => `/api/preview/${sha}?w=${w}`;
-const SKIP_TRIES = 3;
 
 /** What the reveal says: the pick response against the user's choice. */
 function revealText(r, none) {
@@ -71,9 +70,9 @@ export function openPicks(ui) {
   };
 
   async function load() {
-    let data = await api('/api/picks/next');
-    for (let i = 1; i < SKIP_TRIES && data.set && skipped.has(data.set.id); i++)
-      data = await api('/api/picks/next');
+    const data = await api(
+      `/api/picks/next${skipped.size ? `?skip=${[...skipped].join(',')}` : ''}`,
+    );
     if (ended) return;
     cur = data;
     choice = null;

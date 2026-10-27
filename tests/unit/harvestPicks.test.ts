@@ -292,6 +292,27 @@ describe('GET /api/picks/next', () => {
     expect((await e.get('/api/picks/next')).json).toEqual({ set: null });
   });
 
+  test('skip leaves the listed sets out; a bad skip is a 400', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await set(2, [C, D]);
+    await rankedModel({ [A]: 5, [B]: 1, [C]: 2, [D]: 1.5 }); // set 2 is the less confident
+    expect((await e.get('/api/picks/next')).json.set.id).toBe('2');
+    expect((await e.get('/api/picks/next?skip=2')).json.set.id).toBe('1');
+    expect((await e.get('/api/picks/next?skip=2,1')).json).toEqual({ set: null });
+    for (const bad of [
+      'x',
+      '1,,2',
+      '-1',
+      '1.5',
+      Array.from({ length: 51 }, (_, i) => i).join(','),
+    ]) {
+      const r = await e.get(`/api/picks/next?skip=${bad}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe('invalid skip');
+    }
+  });
+
   test('a failed description does not count as described', async () => {
     const e = await setup();
     await set(1, [A, B], [A]);
