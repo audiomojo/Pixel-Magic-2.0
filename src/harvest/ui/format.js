@@ -186,3 +186,10 @@ export function scoreLine({ matched, of }) {
     ? `${of} random picks so far (the score needs ${SCORE_NEEDS})`
     : `Matched your pick ${matched} of your last ${of} random sets`;
 }
+
+const MAX_SKIPPED = 50;
+
+/** The skipped set ids with `id` added as the most recent, keeping the newest 50 (the API's cap). */
+export function addSkipped(list, id) {
+  return [...list.filter((x) => x !== id), id].slice(-MAX_SKIPPED);
+}

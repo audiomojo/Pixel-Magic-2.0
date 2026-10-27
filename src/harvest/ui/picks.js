@@ -2,6 +2,7 @@
 // what it picked, and watch the scoreboard. Server text goes in with textContent only.
 // Reasons travel with the pick POST (the API takes them there), so the reason chips are shown
 // BEFORE confirming: choose, tick any reasons, then Confirm (or Enter) stores the pick and reveals.
+import { addSkipped } from './format.js';
 import { paintScoreboard } from './scoreboard.js';
 
 const REASONS = ['sharper', 'eyes open', 'expression', 'framing', 'exposure'];
@@ -32,7 +33,7 @@ export function openPicks(ui) {
   let goal = 10;
   let counter, live, grid, actions;
   let ended = false;
-  let skipped = new Set();
+  let skipped = [];
 
   // ---- session end: once per visit, on leaving the tab and on pagehide ----------------
   const end = () => {
@@ -70,10 +71,12 @@ export function openPicks(ui) {
   };
 
   async function load() {
-    const data = await api(
-      `/api/picks/next${skipped.size ? `?skip=${[...skipped].join(',')}` : ''}`,
-    );
+    const data = await api(`/api/picks/next${skipped.length ? `?skip=${skipped.join(',')}` : ''}`);
     if (ended) return;
+    if (!data.set && skipped.length > 0) {
+      skipped = []; // every set was skipped this visit: offer them again
+      return load();
+    }
     cur = data;
     choice = null;
     reasons = new Set();
@@ -188,12 +191,12 @@ export function openPicks(ui) {
 
   const skip = () => {
     if (revealed || !cur?.set) return;
-    skipped.add(cur.set.id);
+    skipped = addSkipped(skipped, cur.set.id);
     guarded(load);
   };
 
   function confirm() {
-    if (revealed || choice === null) return;
+    if (revealed || choice === null) return false;
     guarded(async () => {
       const body = { token: cur.token, reasons: [...reasons] };
       if (choice === 'none') body.noClearBest = true;
@@ -209,6 +212,7 @@ export function openPicks(ui) {
       actions.querySelector('button')?.focus();
       await paintBoard();
     });
+    return true;
   }
 
   // ---- zoom, with the scroll position linked across candidates -------------------------------
@@ -246,10 +250,10 @@ export function openPicks(ui) {
       return;
     const k = ev.key.toLowerCase();
     if (k === 'enter') {
-      // A focused button handles its own Enter, except the reason chips (Enter confirms).
-      if (t instanceof HTMLButtonElement && !t.dataset.chip) return;
+      // Links, buttons and disclosures handle their own Enter, except the reason chips.
+      if (t instanceof HTMLElement && t.closest('a, button, summary') && !t.dataset.chip) return;
       if (revealed) guarded(load);
-      else confirm();
+      else if (!confirm()) return;
     } else if (/^[1-9]$/.test(k)) {
       if (Number(k) <= (cur?.set?.candidates.length ?? 0)) choose(Number(k) - 1);
     } else if (k === 'n') choose('none');

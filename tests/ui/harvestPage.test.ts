@@ -486,3 +486,37 @@ test('picks: with no set left it says so', async () => {
   await e.open('#/picks');
   await e.page.getByText(/No look-alike sets are waiting/).waitFor();
 });
+
+test('picks: Enter on a focused nav link follows it and does not confirm a pick', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.keyboard.press('1'); // a choice is pending
+  await e.page.getByRole('link', { name: 'History' }).focus();
+  await e.page.keyboard.press('Enter');
+  await e.page.waitForURL(/#\/history$/);
+  expect(await pickRows()).toEqual([]);
+});
+
+test('picks: after 51 skips the skip list stays within the API cap', async () => {
+  const e = await setup();
+  for (let i = 1; i <= 53; i++) await seedSet(i, 2);
+  const lens: number[] = [];
+  e.page.on('request', (r) => {
+    const m = /\/api\/picks\/next(?:\?skip=([\d,]+))?$/.exec(r.url());
+    if (m) lens.push(m[1] ? m[1].split(',').length : 0);
+  });
+  await e.open('#/picks');
+  let prev = '';
+  for (let i = 0; i < 51; i++) {
+    await eventually(async () => {
+      const n = (await shownNames(e))[0] ?? '';
+      return n !== '' && n !== prev;
+    }, true);
+    prev = (await shownNames(e))[0]!;
+    await e.page.keyboard.press('s');
+  }
+  await eventually(async () => ((await shownNames(e))[0] ?? '') !== prev, true);
+  expect(Math.max(...lens)).toBe(50);
+});

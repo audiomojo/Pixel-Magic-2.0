@@ -10,6 +10,7 @@ import {
   isStalled,
   junkSummary,
   parseHash,
+  addSkipped,
   rateText,
   runTotals,
   scoreLine,
@@ -283,5 +284,17 @@ describe('scoreLine', () => {
   it('states the count so far before that', () => {
     expect(scoreLine({ matched: 3, of: 7 })).toBe('7 random picks so far (the score needs 50)');
     expect(scoreLine({ matched: 0, of: 49 })).toBe('49 random picks so far (the score needs 50)');
+  });
+});
+
+describe('addSkipped', () => {
+  it('appends, moves a repeat to the end and keeps the newest 50', () => {
+    expect(addSkipped(['1', '2'], '3')).toEqual(['1', '2', '3']);
+    expect(addSkipped(['1', '2'], '1')).toEqual(['2', '1']);
+    const many = Array.from({ length: 50 }, (_, i) => String(i));
+    const r = addSkipped(many, '99');
+    expect(r).toHaveLength(50);
+    expect(r[0]).toBe('1');
+    expect(r.at(-1)).toBe('99');
   });
 });
