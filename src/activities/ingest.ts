@@ -102,6 +102,19 @@ export function makeIngestFile(deps: Deps) {
     return { fileId: row.id, sha256: sha, ext, state: 'COPY', kind: null };
   }
 
+  /** Moves the claimed file into .copies (durably), then commits COPY. */
+  async function parkAsCopy(
+    row: Row,
+    claimed: string,
+    sha: string,
+    ext: string,
+  ): Promise<IngestResult> {
+    await rename(claimed, layout.copiesFile(row.id, ext));
+    await fsyncDir(layout.vaultCopies); // the rename is durable before COPY is committed
+    await deps.checkpoint?.('copies_rename');
+    return commitCopy(row, sha, ext);
+  }
+
   /** Step 6 for the vault owner: contents (idempotent) and the guarded INGESTED, in one transaction. */
   async function commitOwner(
     row: Row,
@@ -307,17 +320,20 @@ export function makeIngestFile(deps: Deps) {
     const ext = extOf(meta);
     await guarded(pool, row.id, `ext = $3`, ['CLAIMED'], [ext]);
 
+    // A retired (pixel-identical) content has no vault file on purpose: these exact bytes are a
+    // copy of it, never linked back into the vault.
+    const retired = await pool.query(
+      `SELECT 1 FROM contents WHERE sha256 = $1 AND state = 'DUPLICATE'`,
+      [sha],
+    );
+    if (retired.rowCount === 1) return parkAsCopy(row, claimed, sha, ext);
+
     // Step 5: vault link. A different inode already there means a byte-identical copy.
     const outcome = await linkIntoVault(claimed, layout.vaultFile(sha, ext), sha, {
       onChunk: () => heartbeat(),
     });
     await deps.checkpoint?.('link');
-    if (outcome === 'EXISTS_OTHER') {
-      await rename(claimed, layout.copiesFile(row.id, ext));
-      await fsyncDir(layout.vaultCopies); // the rename is durable before COPY is committed
-      await deps.checkpoint?.('copies_rename');
-      return commitCopy(row, sha, ext);
-    }
+    if (outcome === 'EXISTS_OTHER') return parkAsCopy(row, claimed, sha, ext);
     // Steps 6–7.
     return commitOwner(row, sha, ext, meta, size);
   };

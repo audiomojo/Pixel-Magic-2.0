@@ -308,3 +308,57 @@ test('the vault owner and a different file are never touched by the sweep', asyn
   expect(await sweep(10)).toMatchObject({ examined: 0 });
   for (const r of [owner, other]) expect(await sha256File(vaultPath(r))).toBe(r.sha256);
 });
+
+/** Ingests `bytes` and JPEG_B, then retires the first content by hand (vault file gone). */
+async function retire(bytes: Buffer): Promise<IngestResult> {
+  const owner = await ingest('retired-owner.jpg', bytes);
+  const survivor = await ingest('survivor.jpg', JPEG_B);
+  await pool.query(
+    `UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2, duplicate_removed_at = now()
+      WHERE sha256 = $1`,
+    [owner.sha256, survivor.sha256],
+  );
+  await unlink(vaultPath(owner));
+  return owner;
+}
+
+test('a retired content dropped again is COPY, reclaimed without a vault file, never re-vaulted', async () => {
+  const owner = await retire(JPEG_A);
+  const c = await ingest('again.jpg', JPEG_A);
+  expect(c.state).toBe('COPY');
+  expect(existsSync(vaultPath(owner))).toBe(false);
+  expect(existsSync(copyPath(c))).toBe(true);
+  expect(await reclaim(c)).toBe('REMOVED');
+  expect(existsSync(copyPath(c))).toBe(false);
+  expect(existsSync(vaultPath(owner))).toBe(false);
+  expect((await marks(c)).copy_removed_at).toBeInstanceOf(Date);
+  const st = await pool.query<{ state: string }>(`SELECT state FROM contents WHERE sha256 = $1`, [
+    owner.sha256,
+  ]);
+  expect(st.rows[0]!.state).toBe('DUPLICATE');
+});
+
+test('a retired content whose .copies bytes differ is flagged, not deleted', async () => {
+  const owner = await retire(JPEG_A);
+  const c = await ingest('again.jpg', JPEG_A);
+  await corrupt(copyPath(c), JPEG_B);
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect(existsSync(copyPath(c))).toBe(true);
+  expect((await marks(c)).copy_mismatch).toBe(true);
+  expect(owner.sha256).toBe(c.sha256);
+});
+
+test('a retired content whose .copies file is already gone is marked removed', async () => {
+  await retire(JPEG_A);
+  const c = await ingest('again.jpg', JPEG_A);
+  await unlink(copyPath(c));
+  expect(await reclaim(c)).toBe('REMOVED');
+});
+
+test('the sweep removes a retired content copy too', async () => {
+  await retire(JPEG_A);
+  const c = await ingest('again.jpg', JPEG_A);
+  const r = await sweep(10);
+  expect(r.removed).toBe(1);
+  expect(existsSync(copyPath(c))).toBe(false);
+});
