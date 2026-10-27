@@ -10,7 +10,8 @@ const THUMB_PX = 256;
 /** Sources bigger than this are not thumbnailed (the whole file is read into memory). */
 const MAX_SOURCE_BYTES = 256 * 1024 * 1024;
 
-async function readSource(src: SourcePath): Promise<Buffer> {
+/** Reads a whole source file read-only; refuses one above 256 MB. */
+export async function readSource(src: SourcePath): Promise<Buffer> {
   const fh = await readFsOps.openRead(src);
   try {
     if ((await fh.stat()).size > MAX_SOURCE_BYTES) throw new Error('source too large to thumbnail');
@@ -20,17 +21,18 @@ async function readSource(src: SourcePath): Promise<Buffer> {
   }
 }
 
-async function render(input: Buffer): Promise<Buffer> {
+/** A JPEG of `input` (HEIC or anything sharp decodes) fitting inside `px` × `px`, oriented. */
+export async function renderJpeg(input: Buffer, px: number): Promise<Buffer> {
   if (isHeifHead(input)) {
     const { width, height, data } = await heicDecode({ buffer: input });
     return sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), {
       raw: { width, height, channels: 4 },
     })
-      .resize(THUMB_PX, THUMB_PX, { fit: 'inside' })
+      .resize(px, px, { fit: 'inside' })
       .jpeg()
       .toBuffer();
   }
-  return sharp(input).rotate().resize(THUMB_PX, THUMB_PX, { fit: 'inside' }).jpeg().toBuffer();
+  return sharp(input).rotate().resize(px, px, { fit: 'inside' }).jpeg().toBuffer();
 }
 
 /**
@@ -38,13 +40,17 @@ async function render(input: Buffer): Promise<Buffer> {
  * then a rename inside the cache. Throws on a decode failure, leaving nothing behind.
  */
 export async function makeThumb(srcAbs: SourcePath, outAbs: string, fs: GuardedFs): Promise<void> {
-  const jpeg = await render(await readSource(srcAbs));
+  await writeCacheFile(outAbs, await renderJpeg(await readSource(srcAbs), THUMB_PX), fs);
+}
+
+/** Writes `bytes` to `outAbs` through `fs`: a unique `.part` first, then a rename. */
+export async function writeCacheFile(outAbs: string, bytes: Buffer, fs: GuardedFs): Promise<void> {
   await fs.mkdirp(dirname(outAbs));
   const part = join(dirname(outAbs), `.${basename(outAbs)}.${process.pid}.${Date.now()}.part`);
   try {
     const fh = await fs.openForWrite(part);
     try {
-      await fh.writeFile(jpeg);
+      await fh.writeFile(bytes);
     } finally {
       await fh.close();
     }

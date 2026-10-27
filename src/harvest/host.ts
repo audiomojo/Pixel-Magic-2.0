@@ -1,6 +1,7 @@
 // Harvester host process (startup wiring only): `npm run harvester`. One Temporal worker on the
 // `harvest` queue, the local HTTP server, and the host heartbeat. Excluded from coverage.
 import './hostLogEnv.js'; // must stay first: points the logger at DATA_DIR/logs/harvester.log
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { join } from 'node:path';
@@ -14,9 +15,11 @@ import {
   type LogLevel,
 } from '@temporalio/worker';
 import { createPool } from '../db.js';
+import { endDecodeResources } from '../decode.js';
 import { DataLayout } from '../fsops.js';
 import { logDestination, logger } from '../logger.js';
 import { createHarvestActivities } from './activities.js';
+import { temporalAiControl } from './aiControl.js';
 import { loadHarvestSettings } from './config.js';
 import { HARVEST_TASK_QUEUE, temporalRunControl } from './control.js';
 import { rotateIfLarge } from './logRotate.js';
@@ -154,9 +157,13 @@ async function main(): Promise<void> {
       settings,
       sys: realSystem,
       control,
+      ai: temporalAiControl(client),
+      // Per process: a restart invalidates the Picks page's tokens ("reload the page").
+      picksSecret: randomBytes(32),
       staticDir: here('../../src/harvest/ui'),
       temporalHealthy,
     });
+    cleanup.push(endDecodeResources); // the RAW-preview exiftool of /api/preview, if started
     cleanup.push(
       () =>
         new Promise<void>((resolve) => {

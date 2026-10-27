@@ -97,6 +97,11 @@ async function setup(o: { spec?: TreeSpec; temporal?: boolean } = {}): Promise<E
     settings,
     sys,
     control,
+    ai: {
+      startTrain: () => Promise.resolve('started' as const),
+      setDescribePaused: () => Promise.resolve(),
+      describePaused: () => Promise.resolve(false),
+    },
     staticDir: UI_DIR,
     temporalHealthy: () => Promise.resolve(o.temporal ?? true),
     detectOpts: { volumes: `${dirname(root)}/` },

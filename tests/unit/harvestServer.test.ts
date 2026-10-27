@@ -141,6 +141,11 @@ async function setup(
     settings,
     sys,
     control,
+    ai: {
+      startTrain: () => Promise.resolve('started' as const),
+      setDescribePaused: () => Promise.resolve(),
+      describePaused: () => Promise.resolve(false),
+    },
     staticDir,
     temporalHealthy: () => Promise.resolve(temporal.value),
     detectOpts: { volumes },

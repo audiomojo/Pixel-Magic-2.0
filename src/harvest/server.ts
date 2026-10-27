@@ -1,7 +1,9 @@
 // HTTP API and static files of the harvester (spec §8). Local only: 127.0.0.1, no login, so
 // every request is checked against DNS rebinding (Host) and every POST against cross-site
-// requests (X-Pixel-Magic, Origin). The only disk writes are thumbnails, through GuardedFs.
+// requests (X-Pixel-Magic, Origin). The only disk writes are thumbnails and previews, through
+// GuardedFs. The Picks tab's routes live in picks.ts.
 import { lstat, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { extname, join, sep } from 'node:path';
@@ -10,9 +12,12 @@ import { z } from 'zod';
 import { logger } from '../logger.js';
 import { errCode, errText, isMissing } from '../fsops.js';
 import type { RunControl } from './activities.js';
+import type { AiControl } from './aiControl.js';
 import { childContext, keepDir, ROOT_CONTEXT, type DirContext } from './classify.js';
 import type { HarvestSettings } from './config.js';
+import { HttpError, parse, send, type Json } from './http.js';
 import { GuardedFs, sourcePath } from './paths.js';
+import { createPicksRoutes } from './picks.js';
 import {
   ACTIVE_STATES_SQL,
   addRunItems,
@@ -37,6 +42,12 @@ export interface HarvestServerDeps {
   settings: HarvestSettings;
   sys: SystemProbe;
   control: RunControl;
+  /** The AI worker's training and describe control (the Picks tab). */
+  ai: AiControl;
+  /** HMAC key of the Picks tokens (default: 32 random bytes, so per process). */
+  picksSecret?: Buffer;
+  /** Random draws and shuffles of the Picks tab (tests make them deterministic). */
+  picksRng?: () => number;
   /** Directory of the static page (`src/harvest/ui`). */
   staticDir: string;
   /** A lightweight Temporal call succeeded (the host passes a real one; tests fake it). */
@@ -64,15 +75,6 @@ const PERMISSION_HINT =
   'macOS does not let the harvester read this drive (permission denied). In System Settings → ' +
   'Privacy & Security → Files & Folders, turn on Removable Volumes (or Network Volumes) for ' +
   'pixel-magic-harvester, then run make harvest-stop and make harvest-start.';
-
-class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -126,18 +128,6 @@ const parentDir = (rel: string): string =>
 /** SQL for the parent folder of a rel_path column. */
 const parentSql = (col: string): string => `regexp_replace(${col}, '/?[^/]*$', '')`;
 
-type Json = Record<string, unknown>;
-
-function send(res: http.ServerResponse, status: number, body: Json): void {
-  const text = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(text),
-    'Cache-Control': 'no-store',
-  });
-  res.end(text);
-}
-
 /** The JSON body, up to 1 MB; a larger body is read to the end and discarded, then 413. */
 function readBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -165,17 +155,6 @@ function readBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
-function parse<T extends z.ZodType>(schema: T, value: unknown): z.output<T> {
-  const r = schema.safeParse(value);
-  if (!r.success) {
-    throw new HttpError(
-      400,
-      r.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`.replace(/^: /, '')).join('; '),
-    );
-  }
-  return r.data;
-}
-
 const timeout = <T>(work: Promise<T>, ms: number, what: string): Promise<T> =>
   withTimeout(work, ms, () => {
     throw new HttpError(504, `${what} timed out`);
@@ -190,6 +169,13 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
   const treeTimeoutMs = d.treeTimeoutMs ?? 10_000;
   const ttl = d.sourcesTtlMs ?? 10_000;
   const statfsTimeoutMs = d.statfsTimeoutMs ?? 2000;
+  const picks = createPicksRoutes({
+    pool,
+    settings,
+    ai: d.ai,
+    secret: d.picksSecret ?? randomBytes(32),
+    ...(d.picksRng ? { rng: d.picksRng } : {}),
+  });
 
   // ---- drives -------------------------------------------------------------------------
   interface Detection {
@@ -824,6 +810,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       }
       if (path === '/api/review') return ok(await reviewPost(body));
     }
+    if (await picks(method, path, q, body, res)) return;
     throw new HttpError(404, 'not found');
   }
 

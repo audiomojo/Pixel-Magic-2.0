@@ -211,13 +211,41 @@ async function fromBmp(absPath: string): Promise<ImageFacts> {
 
 /**
  * RAW files are hashed from their embedded preview, extracted to a temp file and removed.
- * Previews usually carry no orientation (it lives in the RAW's IFD0), so the RAW's numeric
- * Orientation is copied onto the preview before the usual `.rotate()` pipeline. Width and
- * height are the RAW's own (oriented) image size, not the smaller preview's, so a RAW outranks
- * the camera's JPEG on pixels (best-copy rule 1); a size below the preview's is not believed.
- * Only a missing preview is permanent; any other exiftool failure (spawn, timeout) is transient.
+ * Width and height are the RAW's own (oriented) image size, not the smaller preview's, so a RAW
+ * outranks the camera's JPEG on pixels (best-copy rule 1); a size below the preview's is not
+ * believed.
  */
 async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts> {
+  return withRawPreview(absPath, async (preview, { Orientation, ImageWidth, ImageHeight }) => {
+    const facts = { ...(await factsFrom(preview)), mime };
+    if (!isDim(ImageWidth) || !isDim(ImageHeight)) return facts;
+    const swap = typeof Orientation === 'number' && Orientation >= 5 && Orientation <= 8;
+    const [width, height] = swap ? [ImageHeight, ImageWidth] : [ImageWidth, ImageHeight];
+    return width * height >= facts.width * facts.height ? { ...facts, width, height } : facts;
+  });
+}
+
+/**
+ * The embedded preview JPEG of a RAW file, carrying the RAW's orientation (so a `.rotate()`
+ * pipeline shows it upright). Throws `QuarantineError` when the RAW has no preview.
+ */
+export async function rawPreview(absPath: string): Promise<Buffer> {
+  return withRawPreview(absPath, (preview) => readFile(preview));
+}
+
+/**
+ * Extracts the RAW's embedded preview to a temp file, hands it to `use`, then removes it.
+ * Previews usually carry no orientation (it lives in the RAW's IFD0), so the RAW's numeric
+ * Orientation is copied onto the preview first. Only a missing preview is permanent; any other
+ * exiftool failure (spawn, timeout) is transient.
+ */
+async function withRawPreview<T>(
+  absPath: string,
+  use: (
+    preview: string,
+    tags: { Orientation?: unknown; ImageWidth?: unknown; ImageHeight?: unknown },
+  ) => Promise<T>,
+): Promise<T> {
   await stat(absPath); // a missing or unreadable source is transient, not the file's fault
   exiftool ??= new ExifTool({ maxProcs: 1 });
   const dir = await mkdtemp(join(tmpdir(), 'pm-raw-'));
@@ -231,9 +259,10 @@ async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts
       throw err;
     }
     if (await isMissing(preview)) throw new QuarantineError('decode_error', 'RAW has no preview');
-    const { Orientation, ImageWidth, ImageHeight } = await exiftool.readRaw(absPath, {
+    const tags = await exiftool.readRaw(absPath, {
       readArgs: ['-Orientation', '-ImageWidth', '-ImageHeight', '-n'],
     });
+    const { Orientation } = tags;
     if (typeof Orientation === 'number' && Orientation !== 1)
       await exiftool.write(
         preview,
@@ -242,11 +271,7 @@ async function fromRawPreview(absPath: string, mime: string): Promise<ImageFacts
           writeArgs: [`-Orientation#=${Orientation}`, '-overwrite_original'],
         },
       );
-    const facts = { ...(await factsFrom(preview)), mime };
-    if (!isDim(ImageWidth) || !isDim(ImageHeight)) return facts;
-    const swap = typeof Orientation === 'number' && Orientation >= 5 && Orientation <= 8;
-    const [width, height] = swap ? [ImageHeight, ImageWidth] : [ImageWidth, ImageHeight];
-    return width * height >= facts.width * facts.height ? { ...facts, width, height } : facts;
+    return await use(preview, tags);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
