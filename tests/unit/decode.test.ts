@@ -364,3 +364,33 @@ test('pixelDigest: RAW is unsupported, corrupt files quarantine', async () => {
     reason: 'truncated',
   });
 });
+
+test('pixelDigest: multi-frame and 16-bit inputs are unsupported, never digested partially', async () => {
+  const d = await tmpDir();
+  const [w, h] = [16, 16];
+  const frame = (v: number) => Buffer.alloc(w * h * 3, v);
+  const gif = join(d, 'two.gif');
+  const pngFrame = (v: number) =>
+    sharp(frame(v), { raw: { width: w, height: h, channels: 3 } })
+      .png()
+      .toBuffer();
+  await sharp([await pngFrame(10), await pngFrame(200)], { join: { animated: true } })
+    .gif({ loop: 0 })
+    .toFile(gif);
+  expect((await sharp(gif, { pages: -1 }).metadata()).pages).toBe(2);
+  await expect(pixelDigest(gif, 'gif')).rejects.toMatchObject({
+    name: 'QuarantineError',
+    reason: 'unsupported',
+  });
+
+  const png16 = join(d, 'deep.png');
+  await sharp(frame(100), { raw: { width: w, height: h, channels: 3 } })
+    .toColourspace('rgb16')
+    .png()
+    .toFile(png16);
+  expect((await sharp(png16).metadata()).depth).toBe('ushort');
+  await expect(pixelDigest(png16, 'png')).rejects.toMatchObject({
+    name: 'QuarantineError',
+    reason: 'unsupported',
+  });
+});

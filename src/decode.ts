@@ -93,8 +93,10 @@ export interface PixelDigest {
 
 /**
  * SHA-256 over the oriented, full-resolution, 8-bit pixel buffer (alpha kept only if the
- * source has it, so channel count is part of identity). RAW is `unsupported`: its preview is
- * not its picture. Same quarantine mapping as `computeImageFacts`.
+ * source has it, so channel count is part of identity). `unsupported`: RAW (its preview is not
+ * its picture), multi-page/animated images (only one frame would be hashed) and anything deeper
+ * than 8 bits per channel (it would be truncated). HEIC and BMP arrive as single-frame 8-bit
+ * raw buffers, so they always pass those checks. Same quarantine mapping as `computeImageFacts`.
  */
 export async function pixelDigest(absPath: string, ext: string): Promise<PixelDigest> {
   const e = ext.toLowerCase();
@@ -106,9 +108,15 @@ export async function pixelDigest(absPath: string, ext: string): Promise<PixelDi
     const meta = await img.metadata();
     if (!meta.format || (!SHARP_MIME[meta.format] && !opts.raw))
       throw new QuarantineError('unsupported', `unsupported image format ${meta.format}`);
+    // Only the first page/frame would be digested, and `.raw()` would drop 16-bit precision:
+    // either could call two different pictures identical, so refuse rather than approximate.
+    if ((meta.pages ?? 1) > 1)
+      throw new QuarantineError('unsupported', `${meta.pages}-page/frame image`);
+    if (meta.depth !== 'uchar')
+      throw new QuarantineError('unsupported', `${meta.depth ?? 'unknown'} bit depth`);
     const { data, info } = await img.rotate().raw().toBuffer({ resolveWithObject: true });
     if (data.length !== info.width * info.height * info.channels)
-      throw new Error(`unexpected raw buffer size ${data.length}`);
+      throw new QuarantineError('decode_error', `unexpected raw buffer size ${data.length}`);
     return {
       width: info.width,
       height: info.height,
