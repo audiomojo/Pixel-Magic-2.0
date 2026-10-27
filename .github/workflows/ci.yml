@@ -56,3 +56,16 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.0
       - run: uv sync --frozen
       - run: uv run pytest -m "not mac and not ml"
+
+  # Apple Vision face measures need macOS; the corpus-backed portrait test skips on CI.
+  ai-mac:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.0
+      - run: uv sync --frozen --extra mac
+      - run: uv run pytest -m mac
