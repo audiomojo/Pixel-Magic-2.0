@@ -13,7 +13,7 @@ from temporalio.worker import Worker
 from .activities import Activities, Deps
 from .config import Settings, load_settings
 from .schedules import TASK_QUEUE, ensure_schedules
-from .workflows import DescribeWorkflow
+from .workflows import DescribeWorkflow, TrainWorkflow
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -40,7 +40,7 @@ def build_worker(client: Client, deps: Deps, executor: ThreadPoolExecutor) -> Wo
     return Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[DescribeWorkflow],
+        workflows=[DescribeWorkflow, TrainWorkflow],
         activities=Activities(deps).all(),
         activity_executor=executor,
         max_concurrent_activities=n,

@@ -1,4 +1,5 @@
 """DescribeWorkflow: describes every candidate photo without features, then re-ranks.
+TrainWorkflow: learns from the picks, then re-ranks when the new model was promoted.
 
 Deterministic: no I/O here, only activities. Activities are called by name so this module
 imports nothing outside the SDK.
@@ -14,8 +15,16 @@ from temporalio.exceptions import ActivityError
 PAGE_SIZE = 200
 PAGES_PER_RUN = 5  # then continue-as-new, so the history stays small
 
+# Every start of TrainWorkflow (nightly schedule, the TypeScript server) uses this id with the
+# USE_EXISTING id-conflict policy, so a trigger while one runs joins it instead of a second run.
+TRAIN_WORKFLOW_ID = "ai-train"
+
 _SHORT = dict(start_to_close_timeout=timedelta(minutes=2))
-_RANK = dict(start_to_close_timeout=timedelta(minutes=30))
+# train_ranker and rank_sets
+_LONG = dict(
+    start_to_close_timeout=timedelta(minutes=30),
+    retry_policy=RetryPolicy(maximum_attempts=3),
+)
 _DESCRIBE = dict(
     start_to_close_timeout=timedelta(minutes=10),
     retry_policy=RetryPolicy(maximum_attempts=5),
@@ -63,5 +72,18 @@ class DescribeWorkflow:
             workflow.continue_as_new(args=[concurrency, described, after_sha])
 
         if described > 0:
-            await workflow.execute_activity("rank_sets", result_type=int, **_RANK)
+            await workflow.execute_activity("rank_sets", result_type=int, **_LONG)
         return described
+
+
+@workflow.defn(name="TrainWorkflow")
+class TrainWorkflow:
+    @workflow.run
+    async def run(self) -> int | None:
+        """The promoted model version, or None when the new model was kept unpromoted."""
+        version = await workflow.execute_activity(
+            "train_ranker", result_type=int | None, **_LONG
+        )
+        if version is not None:
+            await workflow.execute_activity("rank_sets", result_type=int, **_LONG)
+        return version

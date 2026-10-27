@@ -219,6 +219,13 @@ def train(
     return model, cvs[lam], cvs[lam] >= baseline
 
 
+def picks_used(model: Model, sets: dict[int, list[Described]], picks: list[Pick]) -> int:
+    """Picks the model was fitted on: the usable ones, or 0 for the rule score."""
+    if _is_rule_only(model):
+        return 0
+    return len(_usable(_rows(sets, model.pca), picks))
+
+
 def score(model: Model, sets: dict[int, list[Described]]) -> dict[str, float]:
     """sha256 → score for every described candidate, each scored within its own set."""
     out: dict[str, float] = {}

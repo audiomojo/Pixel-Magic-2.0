@@ -6,8 +6,10 @@ import pytest
 from temporalio import activity
 from temporalio.client import (
     Client,
+    ScheduleCalendarSpec,
     ScheduleIntervalSpec,
     ScheduleOverlapPolicy,
+    ScheduleRange,
 )
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -138,7 +140,7 @@ def settings(concurrency: int = 2) -> Settings:
 
 
 def test_schedule_definitions():
-    (sid, sched), = schedules.schedule_definitions(settings(3))
+    (sid, sched), (tid, train) = schedules.schedule_definitions(settings(3))
     assert sid == "ai-describe"
     assert sched.action.workflow == "DescribeWorkflow"
     assert sched.action.args == [3]
@@ -147,6 +149,27 @@ def test_schedule_definitions():
     assert sched.spec.intervals == [ScheduleIntervalSpec(every=schedules.DESCRIBE_EVERY)]
     assert schedules.DESCRIBE_EVERY.total_seconds() == 900
     assert sched.policy.overlap == ScheduleOverlapPolicy.SKIP
+    assert tid == "ai-train-nightly"
+    assert train.action.workflow == "TrainWorkflow"
+    assert train.action.args == []
+    assert train.action.id == "ai-train"
+    assert train.action.task_queue == "ai"
+    assert train.spec.calendars == [
+        ScheduleCalendarSpec(hour=[ScheduleRange(3)], minute=[ScheduleRange(0)],
+                             second=[ScheduleRange(0)])
+    ]
+    assert train.spec.time_zone_name == schedules.local_time_zone()
+    assert train.policy.overlap == ScheduleOverlapPolicy.SKIP
+
+
+def test_local_time_zone(monkeypatch, tmp_path):
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    assert schedules.local_time_zone() == "Europe/Berlin"
+    monkeypatch.setenv("TZ", "Not/AZone")
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/America/Denver")
+    assert schedules.local_time_zone(link) == "America/Denver"
+    assert schedules.local_time_zone(tmp_path / "missing") == "UTC"
 
 
 def test_ensure_schedules_creates_then_updates_keeping_pause():
@@ -166,3 +189,5 @@ async def _ensure_schedules_creates_then_updates_keeping_pause():
         assert desc.schedule.spec.intervals == [ScheduleIntervalSpec(every=schedules.DESCRIBE_EVERY)]
         assert desc.schedule.state.paused
         assert desc.schedule.state.note == "operator"
+        nightly = await client.get_schedule_handle("ai-train-nightly").describe()
+        assert nightly.schedule.spec.time_zone_name == schedules.local_time_zone()

@@ -66,6 +66,15 @@ def describe_backlog(
     return [(sha, ext) for sha, ext in rows]
 
 
+def ranking_feature_version(conn: psycopg.Connection, latest: int) -> int:
+    """The newest feature version (<= latest) whose describe backlog is empty: old features stay
+    in use until the new ones are done. None complete: `latest` (sets rank on what's described)."""
+    for version in range(latest, 0, -1):
+        if not describe_backlog(conn, version, 1):
+            return version
+    return latest
+
+
 def upsert_features(conn: psycopg.Connection, row: FeatureRow) -> None:
     """A failed row stores an empty embedding/quality/faces (the columns are NOT NULL)."""
     conn.execute(
@@ -144,6 +153,21 @@ def current_model(conn: psycopg.Connection) -> ModelRow | None:
     return ModelRow(*row) if row else None
 
 
+def promoted_models(conn: psycopg.Connection) -> list[ModelRow]:
+    """Every promoted model, newest first (the first is the current one)."""
+    rows = conn.execute(
+        """
+        SELECT version, feature_version, picks_used, cv_agreement, promoted, path, ranked_at
+        FROM ranker_models WHERE promoted ORDER BY version DESC
+        """
+    ).fetchall()
+    return [ModelRow(*row) for row in rows]
+
+
+def set_model_path(conn: psycopg.Connection, version: int, path: str) -> None:
+    conn.execute("UPDATE ranker_models SET path = %s WHERE version = %s", (path, version))
+
+
 def write_scores(conn: psycopg.Connection, version: int, scores: dict[str, float]) -> None:
     with conn.cursor() as cur:
         cur.executemany(
@@ -156,4 +180,6 @@ def write_scores(conn: psycopg.Connection, version: int, scores: dict[str, float
 
 
 def mark_ranked(conn: psycopg.Connection, version: int) -> None:
+    """Always moves ranked_at, also on a re-rank of the same version: staging notices new scores
+    only through this row changing."""
     conn.execute("UPDATE ranker_models SET ranked_at = now() WHERE version = %s", (version,))
