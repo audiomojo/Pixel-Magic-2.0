@@ -186,3 +186,22 @@ test('harvest_host_state singleton seeded; contents_size_idx exists', async () =
     1,
   );
 });
+
+test('picks CHECK rejects no_clear_best=false with a null chosen_sha256', async () => {
+  const pick = `INSERT INTO picks(set_id, chosen_sha256, shown_sha256, no_clear_best, random_draw, reasons, decided_at)
+    VALUES (1,$1,'{a,b}',$2,false,'{}',now())`;
+  await expect(pool.query(pick, [null, false])).rejects.toMatchObject({ code: '23514' });
+  await pool.query(pick, [null, true]);
+  await pool.query(pick, ['a', false]);
+});
+test('photo_features PK rejects a duplicate (sha256, feature_version)', async () => {
+  const f = `INSERT INTO photo_features(sha256, feature_version, embedding, quality, faces, described_at)
+    VALUES ('s',1,'{0.1}','{}','[]',now())`;
+  await pool.query(f);
+  await expect(pool.query(f)).rejects.toMatchObject({ code: '23505' });
+});
+test('similar_candidates PK rejects a duplicate (set_id, sha256)', async () => {
+  const c = `INSERT INTO similar_candidates(set_id, sha256) VALUES (1,'s')`;
+  await pool.query(c);
+  await expect(pool.query(c)).rejects.toMatchObject({ code: '23505' });
+});
