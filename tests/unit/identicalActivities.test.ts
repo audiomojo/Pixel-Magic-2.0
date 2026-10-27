@@ -8,9 +8,12 @@ import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 import type { WorkerPool } from '../../src/activities/hashing.js';
 import {
+  dedupeIdenticalAll,
   dedupeIdenticalWith,
   findFamily,
   removeRetired,
+  planFamily,
+  reportCsv,
   retireFamily,
   type IdenticalCtx,
 } from '../../src/activities/identical.js';
@@ -519,4 +522,114 @@ test('recordHash on a retired content reports HASHED (a replayed workflow then d
   expect(await dedupe(n)).toBe('DUPLICATE');
   const facts = { width: 640, height: 480, phash: '1', dhash: '1', mime: 'image/jpeg' };
   expect(await runActivity(acts.recordHash, [n, { facts, quarantineReason: null }])).toBe('HASHED');
+});
+
+// ---------------------------------------------------------------- the one-time cleanup
+
+/** Every column of every contents row, to prove a dry run changed nothing. */
+async function snapshot(): Promise<string> {
+  const r = await pool.query(
+    `SELECT (SELECT json_agg(c ORDER BY sha256) FROM contents c) AS c,
+            (SELECT json_agg(f ORDER BY rel_path) FROM files f) AS f,
+            (SELECT version::text FROM cluster_state WHERE id = 1) AS v`,
+  );
+  return JSON.stringify(r.rows[0]);
+}
+
+async function seedFamilies() {
+  const cam = await hashed(await variant({}), { name: 'cam,1.jpg' });
+  const pic = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic "x".jpg' });
+  const lone = await hashed(await photo(await tmpDir(), 'jpg', { scene: 4 }), { name: 'lone.jpg' });
+  return { cam, pic, lone };
+}
+
+test('planFamily picks keeper and losers without writing', async () => {
+  const { cam, pic } = await seedFamilies();
+  const before = await snapshot();
+  const plan = await withTx(pool, (tx) => planFamily(ctx(), tx, [pic, cam]));
+  expect(plan.keeper).toBe(cam);
+  expect(plan.losers).toEqual([{ sha256: pic, rule: 'camera-original' }]);
+  expect(await snapshot()).toBe(before);
+});
+
+test('dedupeIdenticalAll dry run: report rows and totals; only pixel_compares written', async () => {
+  const { cam, pic } = await seedFamilies();
+  const picSize = (await row(pic)).size_bytes;
+  const before = await snapshot();
+  const r = await dedupeIdenticalAll(ctx(), { apply: false });
+  expect(r).toMatchObject({ families: 1, files: 1, bytes: Number(picSize), errors: 0 });
+  expect(r.rows).toEqual([
+    {
+      keeper_sha256: cam,
+      keeper_vault_path: vaultRel(cam, 'jpg'),
+      keeper_names: 'cam,1.jpg',
+      removed_sha256: pic,
+      removed_vault_path: vaultRel(pic, 'jpg'),
+      removed_names: 'pic "x".jpg',
+      rule: 'camera-original',
+      bytes: Number(picSize),
+    },
+  ]);
+  expect(await snapshot()).toBe(before);
+  expect(await exists(await vaultPath(pic))).toBe(true);
+  expect((await compares()).map((c) => c.verdict)).toEqual(['identical']);
+  const csv = reportCsv(r.rows);
+  expect(csv.split('\n')[0]).toBe(
+    'keeper_sha256,keeper_vault_path,keeper_names,removed_sha256,removed_vault_path,removed_names,rule,bytes',
+  );
+  expect(csv).toContain('"cam,1.jpg"');
+  expect(csv).toContain('"pic ""x"".jpg"');
+});
+
+test('dedupeIdenticalAll apply retires and removes; a re-run is a no-op', async () => {
+  const { cam, pic, lone } = await seedFamilies();
+  const r = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(r).toMatchObject({ families: 1, files: 1, errors: 0 });
+  expect(await row(pic)).toMatchObject({ state: 'DUPLICATE', duplicate_of: cam });
+  expect((await row(pic)).duplicate_removed_at).toBeInstanceOf(Date);
+  expect(await exists(await vaultPath(pic))).toBe(false);
+  expect(await exists(await vaultPath(cam))).toBe(true);
+  expect((await row(lone)).state).toBe('HASHED');
+  digests = [];
+  const again = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(again).toMatchObject({ families: 0, files: 0, bytes: 0, errors: 0, rows: [] });
+  expect(digests).toEqual([]);
+});
+
+test('apply first removes a retired row whose unlink was lost; a dry run does not', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  const c = ctx();
+  await withTx(pool, async (tx) => retireFamily(c, tx, await findFamily(c, tx, cam)));
+  expect(await exists(await vaultPath(n))).toBe(true);
+  await dedupeIdenticalAll(ctx(), { apply: false });
+  expect(await exists(await vaultPath(n))).toBe(true);
+  const r = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(r.families).toBe(0);
+  expect(await exists(await vaultPath(n))).toBe(false);
+  expect((await row(n)).duplicate_removed_at).toBeInstanceOf(Date);
+});
+
+test('same key but different pixels is not a family; compared pairs are not decoded twice; errors count', async () => {
+  const a = await hashed(await variant({}), { name: 'a.jpg' });
+  const b = await hashed(await photo(await tmpDir(), 'jpg', { scene: 5 }), { name: 'b.jpg' });
+  await sameKey(b, a);
+  expect(await dedupeIdenticalAll(ctx(), { apply: false })).toMatchObject({ families: 0 });
+  expect((await compares()).map((x) => x.verdict)).toEqual(['different']);
+  digests = [];
+  await dedupeIdenticalAll(ctx(), { apply: false });
+  expect(digests).toEqual([]);
+  await unlink(await vaultPath(b));
+  await pool.query('DELETE FROM pixel_compares');
+  const r = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(r).toMatchObject({ families: 0, errors: 1 });
+  expect((await compares()).map((x) => x.verdict)).toEqual(['error']);
+});
+
+test('RAW and non-still contents never form families', async () => {
+  const a = await hashed(await variant({}), { name: 'a.jpg' });
+  const b = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'b.jpg' });
+  await pool.query(`UPDATE contents SET ext = 'cr2' WHERE sha256 = $1`, [b]);
+  expect(await dedupeIdenticalAll(ctx(), { apply: true })).toMatchObject({ families: 0 });
+  expect((await row(a)).state).toBe('HASHED');
 });

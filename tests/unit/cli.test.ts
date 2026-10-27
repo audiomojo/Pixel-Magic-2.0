@@ -1,5 +1,6 @@
-import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Client } from '@temporalio/client';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
@@ -7,6 +8,8 @@ import type { Deps } from '../../src/activities/index.js';
 import { main, run } from '../../src/cli.js';
 import { DataLayout, vaultRel } from '../../src/fsops.js';
 import { testDeps } from '../helpers/activityEnv.js';
+import { photo } from '../helpers/images.js';
+import { tmpDir } from '../helpers/layout.js';
 import { startPg, type PgHandle } from '../helpers/pg.js';
 
 interface Executed {
@@ -94,6 +97,7 @@ beforeEach(async () => {
   await pgh.truncate();
   await rm(layout.vault, { recursive: true, force: true });
   await rm(layout.claimed, { recursive: true, force: true });
+  await rm(join(layout.root, 'reports'), { recursive: true, force: true });
   await layout.ensure();
 });
 
@@ -372,4 +376,82 @@ test('doctor counts retired duplicates and identical-duplicate mismatches', asyn
   const out = capture('stdout');
   expect(await main(['doctor'], deps)).toBe(0);
   expect(JSON.parse(out())).toMatchObject({ duplicatesRetired: 2, duplicatesMismatched: 1 });
+});
+
+// ---- dedupe-identical ----
+
+/** Two vaulted JPEGs with identical pixels (the second has a trailing byte) and a lone one. */
+async function seedDupes(): Promise<{ keep: string; lose: string }> {
+  const src = await readFile(await photo(await tmpDir(), 'jpg'));
+  const seed = async (bytes: Buffer, name: string) => {
+    const h = createHash('sha256').update(bytes).digest('hex');
+    const path = layout.vaultFile(h, 'jpg');
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, bytes);
+    await pgh.pool.query(
+      `INSERT INTO contents (sha256, ext, kind, mime, size_bytes, state, phash, dhash, width, height)
+       VALUES ($1, 'jpg', 'still', 'image/jpeg', $2, 'HASHED', 1, 1, 640, 480)`,
+      [h, bytes.length],
+    );
+    await pgh.pool.query(
+      `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state)
+       VALUES ($1, $2, $3, 1, 'jpg', $4, 'INGESTED')`,
+      [`drop/${name}`, name, bytes.length, h],
+    );
+    return h;
+  };
+  const keep = await seed(src, 'IMG_1.jpg');
+  const lose = await seed(Buffer.concat([src, Buffer.from('x')]), 'IMG_1 copy.jpg');
+  return { keep, lose };
+}
+const reports = async () => {
+  const dir = join(layout.root, 'reports');
+  return (await readdir(dir).catch(() => [])).sort().map((f) => join(dir, f));
+};
+const exists = (p: string) =>
+  stat(p).then(
+    () => true,
+    () => false,
+  );
+
+test('dedupe-identical rejects unknown flags and --apply elsewhere', async () => {
+  const err = capture('stderr');
+  expect(await main(['dedupe-identical', '--bogus'], deps)).toBe(2);
+  expect(await main(['dedupe-identical', 'x'], deps)).toBe(2);
+  expect(await main(['stage', '--apply'], deps)).toBe(2);
+  expect(err()).toMatch(/usage/i);
+});
+
+test('dedupe-identical dry run writes a report and totals, deletes nothing', async () => {
+  const { keep, lose } = await seedDupes();
+  const out = capture('stdout');
+  expect(await main(['dedupe-identical'], { ...deps, identical: deps })).toBe(0);
+  expect(out()).toMatch(/^families 1, files to remove 1, bytes to free \d+, errors 0$/m);
+  const files = await reports();
+  expect(files).toHaveLength(1);
+  expect(files[0]).toMatch(/dedupe-identical-\d{8}-\d{6}\.csv$/);
+  const csv = await readFile(files[0]!, 'utf8');
+  expect(csv.split('\n')[0]).toBe(
+    'keeper_sha256,keeper_vault_path,keeper_names,removed_sha256,removed_vault_path,removed_names,rule,bytes',
+  );
+  expect(csv).toContain(vaultRel(lose, 'jpg'));
+  expect(csv).toContain(keep);
+  expect(await exists(layout.vaultFile(lose, 'jpg'))).toBe(true);
+  expect(
+    (await pgh.pool.query('SELECT state FROM contents WHERE state = $1', ['DUPLICATE'])).rowCount,
+  ).toBe(0);
+});
+
+test('dedupe-identical --apply retires, removes, names the report -applied; re-run is a no-op', async () => {
+  const { keep, lose } = await seedDupes();
+  const out = capture('stdout');
+  expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
+  expect(out()).toMatch(/families 1, files to remove 1, bytes to free \d+, errors 0/);
+  // A full tie falls to ingest time then sha: exactly one of the two stays.
+  const left = [keep, lose].filter((h) => existsSync(layout.vaultFile(h, 'jpg')));
+  expect(left).toHaveLength(1);
+  expect((await reports())[0]).toMatch(/dedupe-identical-\d{8}-\d{6}-applied\.csv$/);
+  const again = capture('stdout');
+  expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
+  expect(again()).toMatch(/families 0, files to remove 0, bytes to free 0, errors 0/);
 });

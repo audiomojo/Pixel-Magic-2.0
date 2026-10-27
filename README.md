@@ -165,6 +165,31 @@ pause the `ai-describe` schedule in the Temporal UI (that only stops new runs).
 After installing, run `make stage FORCE=1` once so staging records the similar sets the
 worker describes.
 
+## Identical-picture dedupe
+
+A photo whose full-resolution pixels are exactly equal to another's (same picture, different
+bytes: an editor re-saved the metadata, say) is retired and its vault file deleted, keeping
+one. New photos are checked automatically after hashing; this one-time cleanup handles the
+library already in the vault. Only stills are compared; RAW files never are. A photo that
+differs by even one pixel is left alone for the similar-picks flow.
+
+Which file stays, first rule that separates them: (1) one not tagged by an editor (Picasa,
+Photoshop, Lightroom, GIMP, Photos, ...) beats an edited one; (2) more of DateTimeOriginal,
+Make, Model, GPS; (3) the larger file; (4) the earlier ingested. The deciding rule is
+recorded per removed file.
+
+    make dedupe-identical          # dry run: deletes nothing, writes the report
+    make dedupe-identical APPLY=1  # retire and delete, after you have read the report
+    make stage FORCE=1             # then refresh staging
+
+The dry run writes `DATA_DIR/reports/dedupe-identical-<YYYYMMDD-HHMMSS>.csv` (columns
+`keeper_sha256,keeper_vault_path,keeper_names,removed_sha256,removed_vault_path,removed_names,rule,bytes`;
+several names are joined by `;`) and prints `families N, files to remove N, bytes to free X,
+errors N`. Its only database writes are the cached pair comparisons. `APPLY=1` writes the
+same report as `...-applied.csv`. It is safe to re-run or interrupt: a file is deleted only
+after a fresh checksum of it matches, and a re-run first finishes any deletion left half
+done. A pair that cannot be decoded is an error, retires nothing and is retried next run.
+
 ## Upgrading
 
 Up to `MAX_IN_FLIGHT` (5,000) FileWorkflows are always in flight, and a workflow-code change

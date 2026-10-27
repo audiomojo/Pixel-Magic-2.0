@@ -1,4 +1,4 @@
-.PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies trickle \
+.PHONY: test fs-check build up down stage retry-failed verify-vault doctor copies sweep-copies dedupe-identical trickle \
 	ai-test ai-install ai-uninstall ai-status ai-worker corpus-manifest corpus-verify \
 	harvest-install harvest-uninstall harvest-stop harvest-start harvester harvest-status \
 	test-smoke test-standard test-harvest update-golden golden-smoke chaos
@@ -23,6 +23,11 @@ fs-check:
 # Rebuild staging now (FORCE=1 rebuilds even when nothing changed).
 stage:
 	docker compose exec -T worker node dist/cli.js stage $(if $(FORCE),--force,)
+
+# Retire pixel-identical duplicates already in the vault. Dry run by default (writes a CSV
+# report under DATA_DIR/reports, deletes nothing); APPLY=1 deletes.
+dedupe-identical:
+	docker compose exec -T worker node dist/cli.js dedupe-identical $(if $(APPLY),--apply,)
 
 # Start a ContentWorkflow for each FAILED content (the workflow reopens it); safe to re-run.
 retry-failed:

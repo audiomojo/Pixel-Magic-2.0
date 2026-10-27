@@ -1,11 +1,22 @@
 import { realpathSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { Client, Connection } from '@temporalio/client';
 import type pg from 'pg';
+import { createDecodePool } from './activities/hashing.js';
+import {
+  dedupeIdenticalAll,
+  reportCsv,
+  type CleanupSummary,
+  type IdenticalCtx,
+} from './activities/identical.js';
+import type { Deps } from './activities/index.js';
 import { loadSettings } from './config.js';
 import { createPool } from './db.js';
 import { DataLayout, errText } from './fsops.js';
+import { MetadataReader } from './metadata.js';
 import { doctor, listCopies, removedCopies, retryFailed, verifyVault } from './operator.js';
 import type { CopySweepWorkflow, StagingWorkflow } from './workflows.js';
 
@@ -15,10 +26,12 @@ export interface CliDeps {
   layout?: DataLayout;
   /** `POISON_ATTEMPTS` for retried contents; defaults to the configured value. */
   poisonAttempts?: number;
+  /** `dedupe-identical`'s pool, settings, layout, metadata and decode pool (tests); else built and closed here. */
+  identical?: Deps;
 }
 
 const USAGE =
-  'usage: cli stage [--force] | retry-failed | verify-vault [--sample N] | doctor | copies | sweep-copies\n';
+  'usage: cli stage [--force] | retry-failed | verify-vault [--sample N] | doctor | copies | sweep-copies | dedupe-identical [--apply]\n';
 
 async function connect(): Promise<{ client: Client; close: () => Promise<void> }> {
   const s = loadSettings();
@@ -29,6 +42,7 @@ async function connect(): Promise<{ client: Client; close: () => Promise<void> }
   };
 }
 
+const here = (file: string) => fileURLToPath(new URL(file, import.meta.url));
 const out = (line: string) => process.stdout.write(line + '\n');
 
 async function stage(client: Client, force: boolean): Promise<number> {
@@ -83,6 +97,36 @@ async function verify(
   return r.mismatches.length === 0 ? 0 : 1;
 }
 
+const stamp = (d: Date): string =>
+  d
+    .toISOString()
+    .replace(/\.\d+Z$/, '')
+    .replace(/[-:]/g, '')
+    .replace('T', '-');
+
+/** Dry run (default) or `--apply` of the identical-picture cleanup; writes the CSV report. */
+async function dedupeIdentical(deps: Deps, apply: boolean): Promise<number> {
+  const ctx: IdenticalCtx = {
+    ...deps,
+    beat: () => undefined,
+    log: {
+      info: (m, meta) => process.stderr.write(`${m} ${JSON.stringify(meta)}\n`),
+      warn: (m, meta) => process.stderr.write(`warning: ${m} ${JSON.stringify(meta)}\n`),
+    },
+  };
+  const r: CleanupSummary = await dedupeIdenticalAll(ctx, { apply });
+  const dir = join(deps.settings.dataDir, 'reports');
+  await mkdir(dir, { recursive: true });
+  const file = join(dir, `dedupe-identical-${stamp(new Date())}${apply ? '-applied' : ''}.csv`);
+  await writeFile(file, reportCsv(r.rows));
+  out(
+    `families ${String(r.families)}, files to remove ${String(r.files)}, ` +
+      `bytes to free ${String(r.bytes)}, errors ${String(r.errors)}`,
+  );
+  out(`report: ${file}`);
+  return 0;
+}
+
 /** Operator commands; returns the exit code (2 for usage errors). */
 export async function main(argv: string[], deps: CliDeps = {}): Promise<number> {
   let parsed;
@@ -90,21 +134,34 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
     parsed = parseArgs({
       args: argv,
       allowPositionals: true,
-      options: { force: { type: 'boolean', default: false }, sample: { type: 'string' } },
+      options: {
+        force: { type: 'boolean', default: false },
+        apply: { type: 'boolean', default: false },
+        sample: { type: 'string' },
+      },
     });
   } catch {
     process.stderr.write(USAGE);
     return 2;
   }
   const [command, ...extra] = parsed.positionals;
-  const { force, sample: sampleArg } = parsed.values;
+  const { force, apply, sample: sampleArg } = parsed.values;
   const sample = sampleArg === undefined ? undefined : Number(sampleArg);
   const ok =
     extra.length === 0 &&
     (!force || command === 'stage') &&
+    (!apply || command === 'dedupe-identical') &&
     (sampleArg === undefined ||
       (command === 'verify-vault' && Number.isInteger(sample) && sample! > 0));
-  const commands = ['stage', 'retry-failed', 'verify-vault', 'doctor', 'copies', 'sweep-copies'];
+  const commands = [
+    'stage',
+    'retry-failed',
+    'verify-vault',
+    'doctor',
+    'copies',
+    'sweep-copies',
+    'dedupe-identical',
+  ];
   if (!ok || !commands.includes(command ?? '')) {
     process.stderr.write(USAGE);
     return 2;
@@ -140,6 +197,23 @@ export async function main(argv: string[], deps: CliDeps = {}): Promise<number> 
         return await copies(needPool());
       case 'sweep-copies':
         return await sweep(await needClient());
+      case 'dedupe-identical': {
+        if (deps.identical) return await dedupeIdentical(deps.identical, apply);
+        const settings = loadSettings();
+        const layout = needLayout();
+        await layout.ensure();
+        const metadata = new MetadataReader();
+        cleanups.push(() => metadata.end());
+        // This command owns its decode pool (the worker's is not reachable): terminate it on exit.
+        const decodePool = createDecodePool(here('./decodeWorker.js'), settings.cpuConcurrency);
+        cleanups.push(async () => {
+          await decodePool.terminate();
+        });
+        return await dedupeIdentical(
+          { pool: needPool(), settings, layout, metadata, decodePool },
+          apply,
+        );
+      }
       default:
         out(JSON.stringify(await doctor(needPool(), needLayout())));
         return 0;

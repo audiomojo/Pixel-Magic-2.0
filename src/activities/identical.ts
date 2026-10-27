@@ -77,7 +77,7 @@ async function waitForLock(
 }
 
 /** The transaction-scoped lock serializing every dedupe of one suspect key. */
-async function lockKey(ctx: IdenticalCtx, c: pg.PoolClient, sha256: string): Promise<void> {
+export async function lockKey(ctx: IdenticalCtx, c: pg.PoolClient, sha256: string): Promise<void> {
   await waitForLock(
     ctx,
     c,
@@ -187,6 +187,40 @@ interface MemberFacts extends Member {
   live_content_id: string | null;
 }
 
+/** Who stays and who goes in a proven family, and by which rule (nothing is written). */
+export interface FamilyPlan {
+  keeper: string;
+  losers: { sha256: string; rule: KeeperRule }[];
+}
+
+/**
+ * The keeper rule applied to a family (spec §4): reads each member's facts (row + embedded
+ * tags) and picks one. Writes nothing; `retireFamily` and the dry run both call it.
+ */
+export async function planFamily(
+  ctx: IdenticalCtx,
+  c: pg.PoolClient,
+  members: string[],
+): Promise<FamilyPlan> {
+  if (new Set(members).size < 2) throw new Error('planFamily: a family has at least two members');
+  const rows = (
+    await c.query<MemberFacts>(
+      `SELECT sha256, ext, state, size_bytes, ingested_at, live_content_id FROM contents
+        WHERE sha256 = ANY($1::text[]) ORDER BY sha256`,
+      [members],
+    )
+  ).rows;
+  if (rows.length !== new Set(members).size)
+    throw new Error(`planFamily: ${String(members.length - rows.length)} member(s) missing`);
+  const facts: KeeperFacts[] = [];
+  for (const r of rows) {
+    const tags = await ctx.metadata.keeperTags(ctx.layout.vaultFile(r.sha256, r.ext));
+    facts.push({ sha256: r.sha256, ...tags, sizeBytes: r.size_bytes, ingestedAt: r.ingested_at });
+    ctx.beat();
+  }
+  return chooseKeeper(facts);
+}
+
 /**
  * One transaction (the caller's, under the suspect-key lock): the keeper rule picks one member;
  * every other becomes DUPLICATE of it, older duplicates of a loser are re-pointed to it, the
@@ -201,27 +235,16 @@ export async function retireFamily(
   members: string[],
 ): Promise<Retired> {
   if (new Set(members).size < 2) throw new Error('retireFamily: a family has at least two members');
-  const read = async (lock: boolean) =>
-    (
-      await c.query<MemberFacts>(
-        `SELECT sha256, ext, state, size_bytes, ingested_at, live_content_id FROM contents
-          WHERE sha256 = ANY($1::text[]) ORDER BY sha256 ${lock ? 'FOR UPDATE' : ''}`,
-        [members],
-      )
-    ).rows;
-  const rows = await read(false);
-  if (rows.length !== new Set(members).size)
-    throw new Error(`retireFamily: ${String(members.length - rows.length)} member(s) missing`);
-  const facts: KeeperFacts[] = [];
-  for (const r of rows) {
-    const tags = await ctx.metadata.keeperTags(ctx.layout.vaultFile(r.sha256, r.ext));
-    facts.push({ sha256: r.sha256, ...tags, sizeBytes: r.size_bytes, ingestedAt: r.ingested_at });
-    ctx.beat();
-  }
-  const { keeper, losers } = chooseKeeper(facts);
+  const { keeper, losers } = await planFamily(ctx, c, members);
 
   await waitForLock(ctx, c, `SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
-  const locked = await read(true);
+  const locked = (
+    await c.query<MemberFacts>(
+      `SELECT sha256, ext, state, size_bytes, ingested_at, live_content_id FROM contents
+        WHERE sha256 = ANY($1::text[]) ORDER BY sha256 FOR UPDATE`,
+      [members],
+    )
+  ).rows;
   const bad = locked.filter((r) => r.state !== 'HASHED' && r.state !== 'CLUSTERED');
   if (bad.length > 0)
     throw new Error(`retireFamily: ${bad.map((r) => `${r.sha256} is ${r.state}`).join(', ')}`);
@@ -420,6 +443,177 @@ async function removePending(ctx: IdenticalCtx, shas: string[]): Promise<void> {
     await removeRetired(ctx, s);
     ctx.beat();
   }
+}
+
+// ---------------------------------------------------------------- the one-time cleanup (spec §8)
+
+export const REPORT_COLUMNS = [
+  'keeper_sha256',
+  'keeper_vault_path',
+  'keeper_names',
+  'removed_sha256',
+  'removed_vault_path',
+  'removed_names',
+  'rule',
+  'bytes',
+] as const;
+export type ReportRow = Record<(typeof REPORT_COLUMNS)[number], string | number>;
+
+export interface CleanupSummary {
+  families: number;
+  /** Losers retired (apply) or that would be (dry run). */
+  files: number;
+  /** Bytes freed (apply: actually reclaimed) or that would be. */
+  bytes: number;
+  /** Distinct pairs that failed to compare (they are retried by the next run). */
+  errors: number;
+  rows: ReportRow[];
+}
+
+/** `field` quoted for CSV only when it must be. */
+const csvField = (v: string | number): string => {
+  const t = String(v);
+  return /[",\n\r]/.test(t) ? `"${t.replaceAll('"', '""')}"` : t;
+};
+
+/** The report: header plus one line per removed file. */
+export function reportCsv(rows: ReportRow[]): string {
+  const lines = [REPORT_COLUMNS.join(',')];
+  for (const r of rows) lines.push(REPORT_COLUMNS.map((k) => csvField(r[k])).join(','));
+  return lines.join('\n') + '\n';
+}
+
+/** Report rows for a family's losers, read inside the family's transaction. */
+async function reportRows(
+  ctx: IdenticalCtx,
+  c: pg.PoolClient,
+  keeper: string,
+  losers: { sha256: string; rule: string }[],
+): Promise<ReportRow[]> {
+  const info = async (sha: string) => {
+    const r = (
+      await c.query<{ ext: string; size_bytes: bigint }>(
+        'SELECT ext, size_bytes FROM contents WHERE sha256 = $1',
+        [sha],
+      )
+    ).rows[0]!;
+    return {
+      path: ctx.layout.rel(ctx.layout.vaultFile(sha, r.ext)),
+      names: (await namesOf(c, sha)).join(';'),
+      bytes: Number(r.size_bytes),
+    };
+  };
+  const k = await info(keeper);
+  const rows: ReportRow[] = [];
+  for (const l of losers) {
+    const x = await info(l.sha256);
+    rows.push({
+      keeper_sha256: keeper,
+      keeper_vault_path: k.path,
+      keeper_names: k.names,
+      removed_sha256: l.sha256,
+      removed_vault_path: x.path,
+      removed_names: x.names,
+      rule: l.rule,
+      bytes: x.bytes,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Every suspect family in the vault. Dry run (`apply: false`): finds families and picks keepers
+ * but retires and deletes nothing; its only database writes are `pixel_compares` rows. Apply:
+ * first finishes any retire-without-unlink left by a crash, then retires family by family (one
+ * transaction each, under the suspect-key lock) and removes the losers' vault files.
+ * Both modes take the suspect-key lock (a dry run holds it only while comparing that key), so a
+ * running worker never races a scan. Re-runnable: a retired content is no longer a suspect.
+ */
+export async function dedupeIdenticalAll(
+  ctx: IdenticalCtx,
+  opts: { apply: boolean },
+): Promise<CleanupSummary> {
+  const failed = new Set<string>();
+  const run: IdenticalCtx = {
+    ...ctx,
+    log: {
+      info: ctx.log.info,
+      warn: (m, meta) => {
+        if (meta && typeof meta['a'] === 'string' && typeof meta['b'] === 'string')
+          failed.add(`${meta['a']}:${meta['b']}`);
+        ctx.log.warn(m, meta);
+      },
+    },
+  };
+  const out: CleanupSummary = { families: 0, files: 0, bytes: 0, errors: 0, rows: [] };
+
+  if (opts.apply) {
+    const pending = await ctx.pool.query<{ sha256: string }>(
+      `SELECT s.sha256 FROM contents s WHERE ${PENDING} ORDER BY s.sha256`,
+    );
+    await removePending(
+      run,
+      pending.rows.map((r) => r.sha256),
+    );
+  }
+
+  const keys = await ctx.pool.query<{ sha256: string; n: number }>(
+    `SELECT min(s.sha256) AS sha256, count(*)::int AS n
+       FROM contents s
+      WHERE s.kind = 'still' AND s.phash IS NOT NULL AND ${SUSPECT.replace('$2', '$1')}
+      GROUP BY s.phash, s.dhash, s.width, s.height
+     HAVING count(*) > 1
+      ORDER BY min(s.sha256)`,
+    [RAW_EXTS],
+  );
+  for (const key of keys.rows) {
+    const members = (
+      await ctx.pool.query<{ sha256: string }>(
+        `SELECT s.sha256 FROM contents n JOIN contents s ON ${SAME_KEY} AND ${SUSPECT}
+          WHERE n.sha256 = $1 ORDER BY s.sha256`,
+        [key.sha256, RAW_EXTS],
+      )
+    ).rows.map((r) => r.sha256);
+    const handled = new Set<string>();
+    for (const sha of members) {
+      if (handled.has(sha)) continue;
+      handled.add(sha);
+      const done = await withTx(ctx.pool, async (c) => {
+        await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${LONG_TX}'`);
+        await lockKey(run, c, sha);
+        const now = (
+          await c.query<{ state: string }>('SELECT state FROM contents WHERE sha256 = $1', [sha])
+        ).rows[0]?.state;
+        if (now !== 'HASHED' && now !== 'CLUSTERED') return null; // retired meanwhile
+        const family = await findFamily(run, c, sha);
+        for (const f of family) handled.add(f);
+        if (family.length < 2) return null;
+        const plan = opts.apply
+          ? await retireFamily(run, c, family).then((r) => ({
+              keeper: r.keeper,
+              losers: r.retired,
+            }))
+          : await planFamily(run, c, family);
+        return { plan, rows: await reportRows(run, c, plan.keeper, plan.losers) };
+      });
+      if (!done) continue;
+      out.families += 1;
+      if (opts.apply) {
+        await ctx.checkpoint?.('identical_retired');
+        for (const [i, l] of done.plan.losers.entries()) {
+          const outcome = await removeRetired(run, l.sha256);
+          const row = done.rows[i]!;
+          if (outcome !== 'REMOVED') row.bytes = 0; // nothing reclaimed
+          ctx.beat();
+        }
+      }
+      out.files += done.plan.losers.length;
+      out.bytes += done.rows.reduce((n, r) => n + Number(r.bytes), 0);
+      out.rows.push(...done.rows);
+    }
+  }
+  out.errors = failed.size;
+  return out;
 }
 
 export function makeIdentical(deps: Deps) {
