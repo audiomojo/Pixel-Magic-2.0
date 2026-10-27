@@ -163,3 +163,8 @@ def test_raw_without_preview_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(rawpy, "imread", lambda path: fake)
     with pytest.raises(UndecodableError):
         load_rgb(p, "nef")
+
+
+def test_missing_raw_file_propagates(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_rgb(tmp_path / "nope.dng", "dng")

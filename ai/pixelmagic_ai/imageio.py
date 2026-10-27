@@ -26,6 +26,9 @@ class UndecodableError(Exception):
 
 
 def _raw_preview(path: Path) -> Image.Image:
+    # libraw reports a missing/unreadable file as a generic LibRawError; open it
+    # first so I/O errors propagate as transient instead of "undecodable".
+    path.open("rb").close()
     try:
         with rawpy.imread(str(path)) as raw:
             thumb = raw.extract_thumb()
