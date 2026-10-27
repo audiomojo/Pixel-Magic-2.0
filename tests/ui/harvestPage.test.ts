@@ -57,6 +57,8 @@ interface Env {
   sourceId: string;
   /** Calls made to the fake Temporal control, e.g. `start 1`, `signal 1 pause`. */
   calls: string[];
+  /** Calls made to the fake AiControl: `train`, `pause`, `resume`. */
+  ai: string[];
   /** Opens a page route (`#/review`, …) and waits for the first paint. */
   open(hash?: string): Promise<void>;
 }
@@ -75,6 +77,7 @@ async function setup(o: { spec?: TreeSpec; temporal?: boolean } = {}): Promise<E
     { identity: 'local:U-1', labelBase: 'Drive', kind: 'local', mountPath: root },
   ]);
   const calls: string[] = [];
+  const ai: string[] = [];
   const control: RunControl = {
     // As the real workflow does first: the started run leaves the queue.
     start: async (id) => {
@@ -98,10 +101,18 @@ async function setup(o: { spec?: TreeSpec; temporal?: boolean } = {}): Promise<E
     sys,
     control,
     ai: {
-      startTrain: () => Promise.resolve('started' as const),
-      setDescribePaused: () => Promise.resolve(),
+      startTrain: () => {
+        ai.push('train');
+        return Promise.resolve('started' as const);
+      },
+      setDescribePaused: (p: boolean) => {
+        ai.push(p ? 'pause' : 'resume');
+        return Promise.resolve();
+      },
       describePaused: () => Promise.resolve(false),
     },
+    // Never a random draw, so the next set is the lowest-confidence one.
+    picksRng: () => 0.5,
     staticDir: UI_DIR,
     temporalHealthy: () => Promise.resolve(o.temporal ?? true),
     detectOpts: { volumes: `${dirname(root)}/` },
@@ -123,6 +134,7 @@ async function setup(o: { spec?: TreeSpec; temporal?: boolean } = {}): Promise<E
     page,
     sourceId: src!.id,
     calls,
+    ai,
     open: async (hash = '') => {
       await page.goto(`${base}${hash}`);
     },
@@ -287,4 +299,190 @@ test('folder names are shown as text, never run as HTML', async () => {
   await e.open(`#/source/${e.sourceId}`);
   await e.page.getByRole('checkbox', { name }).waitFor();
   expect(await e.page.evaluate(() => (globalThis as { pwned?: number }).pwned)).toBeUndefined();
+});
+
+// ---- the Picks tab ----------------------------------------------------------------------
+const sha = (n: number): string => n.toString(16).padStart(64, '0');
+const q = (text: string, params: unknown[] = []) => pgh.pool.query(text, params);
+
+/** A set of look-alikes named `<set>-<i>.jpg`, all described; returns the shas in order. */
+async function seedSet(setId: number, count: number, base = setId * 100): Promise<string[]> {
+  const shas: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const s = sha(base + i);
+    shas.push(s);
+    await q(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state, captured_at)
+       VALUES ($1, 'jpg', 'still', 1000, 'CLUSTERED', '2024-05-01T10:00:00Z')`,
+      [s],
+    );
+    await q(
+      `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state)
+       VALUES ($1, $2, 1000, 1, 'jpg', $3, 'INGESTED')`,
+      [`dir/${setId}-${i}.jpg`, `${setId}-${i}.jpg`, s],
+    );
+    await q('INSERT INTO similar_candidates (set_id, sha256) VALUES ($1, $2)', [setId, s]);
+    await q(
+      `INSERT INTO photo_features (sha256, feature_version, embedding, quality, faces)
+       VALUES ($1, 1, '{}', '{}', '[]')`,
+      [s],
+    );
+  }
+  return shas;
+}
+
+/** A ranked model scoring `scores` (sha to score). */
+async function rank(scores: Record<string, number>): Promise<void> {
+  const { rows } = await q(
+    `INSERT INTO ranker_models (feature_version, picks_used, promoted, path, ranked_at)
+     VALUES (1, 0, true, 'm', now()) RETURNING version`,
+  );
+  for (const [s, v] of Object.entries(scores))
+    await q('INSERT INTO photo_scores (sha256, model_version, score) VALUES ($1, $2, $3)', [
+      s,
+      (rows[0] as { version: number }).version,
+      v,
+    ]);
+}
+
+const pickRows = async (): Promise<{ chosen: string | null; none: boolean }[]> =>
+  (await q('SELECT chosen_sha256 AS chosen, no_clear_best AS none FROM picks ORDER BY id'))
+    .rows as { chosen: string | null; none: boolean }[];
+
+const shownNames = (e: Env): Promise<string[]> =>
+  e.page.locator('.picks-grid figcaption .name').allTextContents();
+
+test('picks: the model pick stays out of the page until the user chooses', async () => {
+  const e = await setup();
+  const [a, b, c] = await seedSet(1, 3);
+  await rank({ [a!]: 3, [b!]: 2, [c!]: 1 });
+  const next = e.page.waitForResponse((r) => r.url().endsWith('/api/picks/next'));
+  await e.open('#/picks');
+  const body = await (await next).text();
+  expect(body).not.toContain('modelPick');
+  await eventually(() => shownNames(e).then((n) => n.length), 3);
+  expect(await e.page.getByText(/It picked/).count()).toBe(0);
+  expect(await e.page.locator('.model-pick').count()).toBe(0);
+  await eventually(() => e.page.locator('.counter').textContent(), '0/10 today');
+
+  // Choose the second one shown; the reason chips come first and Enter confirms.
+  const names = await shownNames(e);
+  await e.page.keyboard.press('2');
+  await e.page.getByRole('button', { name: 'sharper' }).click();
+  await e.page.keyboard.press('Enter');
+  const reveal = e.page.locator('[aria-live]').filter({ hasText: /It picked/ });
+  await reveal.waitFor();
+  const modelName = '1-0.jpg'; // the top-scored one
+  const want = names[1] === modelName ? 'It picked the same' : 'It picked this one';
+  await eventually(() => reveal.textContent(), want);
+  expect(await e.page.locator('.model-pick').count()).toBe(1);
+  expect(await e.page.locator('.model-pick figcaption .name').textContent()).toBe(modelName);
+  const rows = await pickRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.chosen).toBe(sha(100 + Number(names[1]!.slice(2, 3))));
+  const stored = (await q('SELECT reasons FROM picks')).rows[0] as { reasons: string[] };
+  expect(stored.reasons).toEqual(['sharper']);
+  await eventually(() => e.page.locator('.counter').textContent(), '1/10 today');
+});
+
+test("picks: choosing the model's favourite says it picked the same", async () => {
+  const e = await setup();
+  const [a, b] = await seedSet(1, 2);
+  await rank({ [a!]: 5, [b!]: 1 });
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  const i = (await shownNames(e)).indexOf('1-0.jpg');
+  await e.page.keyboard.press(String(i + 1));
+  await e.page.getByRole('button', { name: 'Confirm' }).click();
+  await e.page.getByText('It picked the same').waitFor();
+  expect((await pickRows())[0]!.chosen).toBe(a);
+});
+
+test('picks: choosing another photo says which one the model picked', async () => {
+  const e = await setup();
+  const [a, b] = await seedSet(1, 2);
+  await rank({ [a!]: 5, [b!]: 1 });
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  const i = (await shownNames(e)).indexOf('1-1.jpg');
+  await e.page.keyboard.press(String(i + 1));
+  await e.page.keyboard.press('Enter');
+  await e.page.getByText('It picked this one').waitFor();
+  expect((await pickRows())[0]!.chosen).toBe(b);
+});
+
+test('picks: N stores no clear best', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.keyboard.press('n');
+  await e.page.keyboard.press('Enter');
+  await e.page.getByText('No clear best stored.').waitFor();
+  expect(await pickRows()).toEqual([{ chosen: null, none: true }]);
+});
+
+test('picks: S shows a set again without storing anything', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  const next = e.page.waitForResponse((r) => r.url().endsWith('/api/picks/next'));
+  await e.page.keyboard.press('s');
+  await next;
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  expect(await pickRows()).toEqual([]);
+  await eventually(() => e.page.locator('.counter').textContent(), '0/10 today');
+});
+
+test('picks: keys are ignored while typing in a field', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.evaluate(`(() => {
+    const i = document.createElement('input');
+    document.body.append(i);
+    i.focus();
+  })()`);
+  await e.page.keyboard.press('n');
+  await e.page.keyboard.press('Enter');
+  expect(await e.page.locator('.pending').count()).toBe(0);
+  expect(await pickRows()).toEqual([]);
+});
+
+test('picks: leaving the tab ends the session and trains once', async () => {
+  const e = await setup();
+  await seedSet(1, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.keyboard.press('1');
+  await e.page.keyboard.press('Enter');
+  await e.page.getByText(/It picked|No model pick/).waitFor();
+  expect(e.ai).toEqual([]);
+  await e.page.getByRole('link', { name: 'History' }).click();
+  await eventually(() => e.ai, ['train']);
+});
+
+test('picks: the scoreboard counts random picks so far', async () => {
+  const e = await setup();
+  const [a, b] = await seedSet(1, 2);
+  for (let i = 0; i < 7; i++)
+    await q(
+      `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best, random_draw,
+                          model_pick_sha256)
+       VALUES (1, $1, $2, false, true, $3)`,
+      [a, [a, b], i < 3 ? a : b],
+    );
+  await e.open('#/picks');
+  await e.page.getByText('7 random picks so far (the score needs 50)').waitFor();
+  await e.page.getByText('7 picks in all').waitFor();
+  await e.page.getByRole('button', { name: 'Pause describing' }).click();
+  await eventually(() => e.ai, ['pause']);
+});
+
+test('picks: with no set left it says so', async () => {
+  const e = await setup();
+  await e.open('#/picks');
+  await e.page.getByText(/No look-alike sets are waiting/).waitFor();
 });

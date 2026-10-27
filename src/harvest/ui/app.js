@@ -16,6 +16,7 @@ import {
   rateText,
   runTotals,
 } from './format.js';
+import { openPicks as paintPicks } from './picks.js';
 
 const POLL_MS = 2000;
 const $ = (id) => document.getElementById(id);
@@ -351,6 +352,7 @@ function navigate() {
     'review-files': 'review',
     where: 'where',
     history: 'history',
+    picks: 'picks',
   }[route.name];
   for (const a of document.querySelectorAll('nav a')) {
     if (a.dataset.nav === top) a.setAttribute('aria-current', 'page');
@@ -366,7 +368,11 @@ function navigate() {
     'review-files': openReviewFiles,
     where: openWhere,
     history: openHistory,
+    picks: openPicks,
   })[route.name]();
+}
+function openPicks() {
+  paintPicks({ main, h, api, post, button, message, routeIs: (name) => route.name === name });
 }
 window.addEventListener('hashchange', navigate);
 

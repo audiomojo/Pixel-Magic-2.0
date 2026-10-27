@@ -332,3 +332,64 @@ dialog {
 dialog::backdrop {
   background: rgb(0 0 0 / 0.45);
 }
+.picks-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.6rem;
+  margin: 0.5rem 0;
+}
+.picks-grid figure {
+  margin: 0;
+  background: var(--surface);
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  padding: 0.4rem;
+}
+.picks-grid figure.chosen {
+  border-color: var(--accent, #2563eb);
+}
+.picks-grid figure.model-pick {
+  outline: 3px dashed var(--accent, #2563eb);
+  outline-offset: 2px;
+}
+.picks-grid .frame {
+  overflow: auto;
+  background: var(--bg);
+}
+.picks-grid img {
+  display: block;
+  width: 100%;
+  cursor: zoom-in;
+}
+.picks-grid.zoomed .frame {
+  max-height: 70vh;
+}
+.picks-grid.zoomed img {
+  width: 250%;
+  max-width: none;
+  cursor: zoom-out;
+}
+.picks-grid figcaption {
+  font-size: 0.85rem;
+  margin: 0.3rem 0;
+}
+.chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.chip[aria-pressed='true'] {
+  background: var(--accent, #2563eb);
+  color: #fff;
+}
+.counter,
+.headline {
+  font-weight: 600;
+}
+.reveal {
+  min-height: 1.5em;
+}
+.disagree img {
+  height: 3rem;
+  vertical-align: middle;
+}

@@ -12,6 +12,7 @@ import {
   parseHash,
   rateText,
   runTotals,
+  scoreLine,
 } from '../../src/harvest/ui/format.js';
 
 describe('bytes', () => {
@@ -217,6 +218,7 @@ describe('parseHash', () => {
     expect(parseHash('#/review')).toEqual({ name: 'review' });
     expect(parseHash('#/where')).toEqual({ name: 'where' });
     expect(parseHash('#history')).toEqual({ name: 'history' });
+    expect(parseHash('#/picks')).toEqual({ name: 'picks' });
   });
   it('decodes a review path, keeping its slashes', () => {
     expect(parseHash('#/review/3/My%20Pics/2020/caf%C3%A9')).toEqual({
@@ -269,5 +271,17 @@ describe('rateText', () => {
     expect(rateText(2.345)).toBe('2.3');
     expect(rateText(9.96)).toBe('10.0');
     expect(rateText(12.6)).toBe('13');
+  });
+});
+
+describe('scoreLine', () => {
+  it('states the match once 50 random sets are graded', () => {
+    expect(scoreLine({ matched: 41, of: 50 })).toBe(
+      'Matched your pick 41 of your last 50 random sets',
+    );
+  });
+  it('states the count so far before that', () => {
+    expect(scoreLine({ matched: 3, of: 7 })).toBe('7 random picks so far (the score needs 50)');
+    expect(scoreLine({ matched: 0, of: 49 })).toBe('49 random picks so far (the score needs 50)');
   });
 });

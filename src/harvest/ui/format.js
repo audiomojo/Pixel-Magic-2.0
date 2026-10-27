@@ -135,7 +135,7 @@ export function junkSummary(folders) {
 
 /**
  * The page's route from `location.hash`: `#/source/<id>`, `#/review`, `#/review/<id>/<path>`,
- * `#/where`, `#/history`; anything else is the sources list.
+ * `#/where`, `#/history`, `#/picks`; anything else is the sources list.
  */
 export function parseHash(hash) {
   const parts = hash
@@ -153,6 +153,7 @@ export function parseHash(hash) {
   if (a === 'source' && b) return { name: 'source', id: b };
   if (a === 'review')
     return b ? { name: 'review-files', id: b, path: rest.join('/') } : { name: 'review' };
+  if (a === 'picks') return { name: 'picks' };
   if (a === 'where') return { name: 'where' };
   if (a === 'history') return { name: 'history' };
   return { name: 'sources' };
@@ -175,4 +176,13 @@ export function filesPerMinute(samples, now, sent) {
 /** A files-per-minute rate: whole numbers from 10 up, one decimal below. */
 export function rateText(rate) {
   return rate >= 10 ? String(Math.round(rate)) : rate.toFixed(1);
+}
+
+const SCORE_NEEDS = 50;
+
+/** The scoreboard headline from the graded random sets (the last 50 at most). */
+export function scoreLine({ matched, of }) {
+  return of < SCORE_NEEDS
+    ? `${of} random picks so far (the score needs ${SCORE_NEEDS})`
+    : `Matched your pick ${matched} of your last ${of} random sets`;
 }
