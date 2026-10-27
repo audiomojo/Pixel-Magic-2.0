@@ -75,6 +75,14 @@ def add_smile_picks(conn, sets: dict[int, list[str]], n: int) -> None:
         )
 
 
+def add_unsure_pick(conn) -> None:
+    conn.execute(
+        "INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best)"
+        " VALUES (1, NULL, %s, true)",
+        ([sha(1, 0), sha(1, 1)],),
+    )
+
+
 def models(conn) -> list[tuple]:
     return conn.execute(
         "SELECT version, picks_used, promoted, path, ranked_at FROM ranker_models ORDER BY version"
@@ -127,6 +135,32 @@ def test_consistent_picks_promote_version_2_and_rank_it(acts, conn):
         assert max(sets[s], key=s2.__getitem__) == sets[s][SIZE - 1]
 
 
+def test_train_skips_without_new_picks_and_runs_after_one(acts, conn, tmp_path):
+    sets = add_sets(conn)
+    acts.train_ranker()
+    add_smile_picks(conn, sets, 30)
+    assert acts.train_ranker() == 2
+    files = sorted((tmp_path / "ai" / "models").iterdir())
+    assert acts.train_ranker() is None
+    assert len(models(conn)) == 2
+    assert sorted((tmp_path / "ai" / "models").iterdir()) == files
+    add_unsure_pick(conn)  # a no_clear_best pick counts as a change
+    assert acts.train_ranker() == 3
+    assert len(models(conn)) == 3
+
+
+def test_ranking_keeps_only_the_ranked_versions_scores(acts, conn):
+    sets = add_sets(conn)
+    acts.train_ranker()
+    acts.rank_sets()
+    add_smile_picks(conn, sets, 30)
+    acts.train_ranker()
+    acts.rank_sets()
+    versions = conn.execute("SELECT DISTINCT model_version FROM photo_scores").fetchall()
+    assert versions == [(2,)]
+    assert len(models(conn)) == 2 and Path(models(conn)[0][3]).is_file()
+
+
 def test_rerank_of_the_same_version_moves_ranked_at(acts, conn):
     add_sets(conn)
     acts.train_ranker()
@@ -146,6 +180,7 @@ def test_worse_candidate_is_kept_unpromoted_and_scores_not_rewritten(acts, conn,
     before_scores = scores(conn, 2)
     before_ranked = models(conn)[1][4]
 
+    add_unsure_pick(conn)  # something new, so training runs
     real = ranker.train
     monkeypatch.setattr(ranker, "train", lambda *a: (real(*a)[0], 0.1, False))
     assert acts.train_ranker() is None

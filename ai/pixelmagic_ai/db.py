@@ -168,6 +168,25 @@ def set_model_path(conn: psycopg.Connection, version: int, path: str) -> None:
     conn.execute("UPDATE ranker_models SET path = %s WHERE version = %s", (path, version))
 
 
+def picks_since_model(conn: psycopg.Connection, version: int) -> bool:
+    """Whether any pick (no_clear_best ones included) was decided after the model was created."""
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+          SELECT 1 FROM picks
+          WHERE decided_at > (SELECT created_at FROM ranker_models WHERE version = %s))
+        """,
+        (version,),
+    ).fetchone()
+    assert row is not None
+    return bool(row[0])
+
+
+def delete_other_scores(conn: psycopg.Connection, version: int) -> None:
+    """Only the ranked version's scores are kept; older versions re-rank if ever needed."""
+    conn.execute("DELETE FROM photo_scores WHERE model_version <> %s", (version,))
+
+
 def write_scores(conn: psycopg.Connection, version: int, scores: dict[str, float]) -> None:
     with conn.cursor() as cur:
         cur.executemany(

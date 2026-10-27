@@ -153,8 +153,14 @@ class Activities:
 
     @activity.defn(name="train_ranker")
     def train_ranker(self) -> int | None:
-        """The promoted version, else None (see _train_locked)."""
+        """The promoted version, else None (see _train_locked). Skipped (None, nothing stored)
+        when no pick was decided since the current model was created: the same picks would
+        only re-promote an identical model."""
         with self._connect() as conn, advisory_lock(conn, TRAIN_LOCK):
+            current = db.current_model(conn)
+            if current is not None and not db.picks_since_model(conn, current.version):
+                log.info("train_ranker: no new picks since version %d, skipped", current.version)
+                return None
             version, promoted = self._train_locked(conn)
             return version if promoted else None
 
@@ -199,6 +205,7 @@ class Activities:
         scores = ranker.score(model, sets)
         db.write_scores(conn, version, scores)
         db.mark_ranked(conn, version)
+        db.delete_other_scores(conn, version)
         conn.commit()
         log.info(
             "rank_sets: %d candidates scored under version %d (features v%d)",
