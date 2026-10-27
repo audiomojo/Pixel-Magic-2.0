@@ -93,7 +93,12 @@ async function seedHashed(...facts: Facts[]): Promise<string[]> {
   return facts.map((f) => hex(f.sha256));
 }
 
-const cluster = (sha: string) => runActivity(acts.clusterContent, [sha]);
+/** clusterContent, asserting it clustered (null means the content was a retired DUPLICATE). */
+async function cluster(sha: string): Promise<number> {
+  const g = await runActivity(acts.clusterContent, [sha]);
+  if (g === null) throw new Error(`clusterContent ${sha}: unexpectedly DUPLICATE`);
+  return g;
+}
 async function similarSetOf(groupId: number): Promise<bigint | null> {
   const r = await pool.query<{ s: bigint | null }>(
     'SELECT similar_set_id AS s FROM groups WHERE id = $1',
@@ -567,7 +572,7 @@ test('restart with merged sets reproduces the in-memory partition, in any order'
   const byName = new Map(facts.map((f, i) => [f.sha256, sha[i]!]));
   const run = async (names: string[]) => {
     const worker = createActivities(deps); // a fresh worker process: empty cache
-    const out: number[] = [];
+    const out: (number | null)[] = [];
     for (const n of names) out.push(await runActivity(worker.clusterContent, [byName.get(n)!]));
     return out;
   };

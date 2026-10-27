@@ -76,6 +76,7 @@ beforeEach(() => {
     ingestFile: () => STILL,
     decodeContent: () => DECODED,
     recordHash: () => 'HASHED',
+    dedupeIdentical: () => 'UNIQUE',
     clusterContent: () => 1,
     markFailed: () => undefined,
     reopenFailed: () => undefined,
@@ -91,7 +92,13 @@ const optsOf = (name: string) => h.calls.find((c) => c.name === name)?.opts as A
 
 test('a new still runs every step, each with its queue, timeouts and retry policy', async () => {
   expect(await wf.FileWorkflow(REF as never)).toBe('CLUSTERED');
-  expect(names()).toEqual(['ingestFile', 'decodeContent', 'recordHash', 'clusterContent']);
+  expect(names()).toEqual([
+    'ingestFile',
+    'decodeContent',
+    'recordHash',
+    'dedupeIdentical',
+    'clusterContent',
+  ]);
   const forever = { initialInterval: '1s', backoffCoefficient: 2, maximumInterval: '5m' };
   expect(optsOf('ingestFile')).toEqual({
     taskQueue: 'io',
@@ -109,6 +116,12 @@ test('a new still runs every step, each with its queue, timeouts and retry polic
     startToCloseTimeout: '1m',
     retry: forever,
   });
+  expect(optsOf('dedupeIdentical')).toEqual({
+    taskQueue: 'cpu', // it decodes
+    startToCloseTimeout: '10m',
+    heartbeatTimeout: '60s',
+    retry: forever,
+  });
   expect(optsOf('clusterContent')).toEqual({
     taskQueue: 'cluster',
     startToCloseTimeout: '15m', // a cache reload at 300k+ contents
@@ -123,6 +136,7 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
   expect(all.map(([k]) => k).sort()).toEqual([
     'clusterContent',
     'decodeContent',
+    'dedupeIdentical',
     'ingestFile',
     'markFailed',
     'maybeBuildStaging',
@@ -204,6 +218,31 @@ test('quarantine ends before clustering', async () => {
   h.impl['recordHash'] = () => 'QUARANTINED';
   expect(await wf.runContentSteps(SHA, 'jpg', 5)).toBe('QUARANTINED');
   expect(names()).not.toContain('clusterContent');
+});
+
+test('a pixel-identical duplicate ends after dedupe, before clustering', async () => {
+  h.impl['dedupeIdentical'] = () => 'DUPLICATE';
+  expect(await wf.runContentSteps(SHA, 'jpg', 5)).toBe('DUPLICATE');
+  expect(names()).toEqual(['decodeContent', 'recordHash', 'dedupeIdentical']);
+  expect(h.calls[2]).toMatchObject({ args: [SHA] });
+});
+
+test.each(['UNIQUE', 'KEPT'])('dedupe %s goes on to cluster', async (o) => {
+  h.impl['dedupeIdentical'] = () => o;
+  expect(await wf.runContentSteps(SHA, 'jpg', 5)).toBe('CLUSTERED');
+  expect(names().at(-1)).toBe('clusterContent');
+});
+
+test('clusterContent finding the content retired (null) ends DUPLICATE', async () => {
+  h.impl['clusterContent'] = () => null;
+  expect(await wf.runContentSteps(SHA, 'jpg', 5)).toBe('DUPLICATE');
+});
+
+test('a history from before dedupe existed replays without the step, unchanged', async () => {
+  h.patches['dedupe-identical'] = false;
+  h.impl['clusterContent'] = () => null; // the old path ignored the group id
+  expect(await wf.runContentSteps(SHA, 'jpg', 5)).toBe('CLUSTERED');
+  expect(names()).toEqual(['decodeContent', 'recordHash', 'clusterContent']);
 });
 
 test('a COPY outcome removes the confirmed duplicate, then ends', async () => {

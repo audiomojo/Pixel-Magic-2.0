@@ -195,7 +195,7 @@ export function makeClusterContent(deps: Deps) {
     if (r.rowCount !== 1) throw new Error(`content ${sha256} left HASHED under the cluster lock`);
   }
 
-  async function clusterOnce(sha256: string): Promise<number> {
+  async function clusterOnce(sha256: string): Promise<number | null> {
     try {
       const out = await withTx(pool, async (c) => {
         // A cache reload is pure JS while this transaction sits idle, so the pool's 120 s
@@ -209,6 +209,8 @@ export function makeClusterContent(deps: Deps) {
         ).rows[0];
         if (row?.state === 'CLUSTERED' && row.copy_group_id !== null)
           return { group: Number(row.copy_group_id), added: null };
+        // Retired as pixel-identical to another content (dedupeIdentical): never clustered.
+        if (row?.state === 'DUPLICATE') return { group: null, added: null };
         if (row?.state !== 'HASHED')
           throw ApplicationFailure.nonRetryable(
             `clusterContent ${sha256}: content is ${row?.state ?? 'missing'}, not HASHED`,
@@ -252,8 +254,11 @@ export function makeClusterContent(deps: Deps) {
     }
   }
 
-  /** Queue `cluster` (single-active). Returns the content's root copy group id. */
-  return function clusterContent(sha256: string): Promise<number> {
+  /**
+   * Queue `cluster` (single-active). Returns the content's root copy group id, or null when the
+   * content was retired as a pixel-identical DUPLICATE (then nothing is clustered).
+   */
+  return function clusterContent(sha256: string): Promise<number | null> {
     const run = tail.then(() => clusterOnce(sha256));
     tail = run.catch(() => undefined);
     return run;

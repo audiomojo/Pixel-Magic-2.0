@@ -43,10 +43,14 @@ function isSignalDeath(e: WireError): boolean {
   return typeof e.message === 'string' && /signalCode: `?SIG[A-Z0-9]+/.test(e.message);
 }
 
-/** HASHED/CLUSTERED and QUARANTINED are where a recorded hash can already be. */
+/**
+ * HASHED/CLUSTERED, QUARANTINED and DUPLICATE (retired after hashing; the dedupe step then
+ * reports it) are where a recorded hash can already be.
+ */
 const RECORDED: Partial<Record<string, 'HASHED' | 'QUARANTINED'>> = {
   HASHED: 'HASHED',
   CLUSTERED: 'HASHED',
+  DUPLICATE: 'HASHED',
   QUARANTINED: 'QUARANTINED',
 };
 

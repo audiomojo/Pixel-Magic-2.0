@@ -6,6 +6,7 @@ import type { MetadataReader } from '../metadata.js';
 import { makeClusterContent } from './cluster.js';
 import { makeCopies } from './copies.js';
 import { makeHashing, type WorkerPool } from './hashing.js';
+import { makeIdentical } from './identical.js';
 import { makeIngestFile } from './ingest.js';
 import { makeScan } from './scan.js';
 import { makeStaging } from './staging.js';
@@ -27,6 +28,7 @@ export function createActivities(deps: Deps) {
   return {
     ingestFile: makeIngestFile(deps),
     ...makeHashing(deps),
+    ...makeIdentical(deps),
     clusterContent: makeClusterContent(deps),
     ...makeCopies(deps),
     maybeBuildStaging: makeStaging(deps),

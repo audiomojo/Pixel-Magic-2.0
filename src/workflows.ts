@@ -41,6 +41,16 @@ export const ACTIVITY_OPTIONS = {
     retry: { ...TRANSIENT_RETRY, maximumAttempts: 1 },
   },
   recordHash: { taskQueue: 'io', startToCloseTimeout: '1m', retry: TRANSIENT_RETRY },
+  /**
+   * Decodes (cpu) every not-yet-compared suspect pair under one transaction, heartbeating
+   * between pairs; then deletes the retired vault files.
+   */
+  dedupeIdentical: {
+    taskQueue: 'cpu',
+    startToCloseTimeout: '10m',
+    heartbeatTimeout: '60s',
+    retry: TRANSIENT_RETRY,
+  },
   /** 15 min: a cache reload after a worker restart scans every clustered content (heartbeats). */
   clusterContent: {
     taskQueue: 'cluster',
@@ -79,6 +89,7 @@ export const ACTIVITY_OPTIONS = {
 
 const { ingestFile } = proxyActivities<Activities>(ACTIVITY_OPTIONS.ingestFile);
 const { recordHash } = proxyActivities<Activities>(ACTIVITY_OPTIONS.recordHash);
+const { dedupeIdentical } = proxyActivities<Activities>(ACTIVITY_OPTIONS.dedupeIdentical);
 const { clusterContent } = proxyActivities<Activities>(ACTIVITY_OPTIONS.clusterContent);
 const { markFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.markFailed);
 const { reopenFailed } = proxyActivities<Activities>(ACTIVITY_OPTIONS.reopenFailed);
@@ -92,14 +103,16 @@ const DECODE_KILLED: DecodeKilledType = 'DecodeKilled';
 export const MAX_DECODE_ATTEMPTS = 10;
 const MAX_BACKOFF_S = 300;
 
-export type ContentOutcome = 'CLUSTERED' | 'QUARANTINED' | 'FAILED';
+export type ContentOutcome = 'CLUSTERED' | 'QUARANTINED' | 'FAILED' | 'DUPLICATE';
 
 /**
- * decode (cpu) → record (io) → cluster (cluster). Decode is retried here, one attempt per call,
- * with the transient backoff (1 s ×2, max 5 min). `poisonAttempts` failures other than a killed
- * child are poison; `MAX_DECODE_ATTEMPTS` attempts of any kind (a child killed again and again
- * by the OOM killer) are `decode_killed`. Either way: `markFailed`, then `FAILED`, which
- * `retry-failed` can reset. Any other activity failure (only non-retryable ones can reach here,
+ * decode (cpu) → record (io) → dedupe (cpu) → cluster (cluster). A content retired as a
+ * pixel-identical duplicate ends `DUPLICATE`, never clustered; `patched`: histories started
+ * before the dedupe step existed replay without it, exactly as before. Decode is retried here,
+ * one attempt per call, with the transient backoff (1 s ×2, max 5 min). `poisonAttempts`
+ * failures other than a killed child are poison; `MAX_DECODE_ATTEMPTS` attempts of any kind (a
+ * child killed again and again by the OOM killer) are `decode_killed`. Either way:
+ * `markFailed`, then `FAILED`, which `retry-failed` can reset. Any other activity failure (only non-retryable ones can reach here,
  * e.g. `UnexpectedState`) fails the workflow, visibly.
  */
 export async function runContentSteps(
@@ -130,6 +143,11 @@ export async function runContentSteps(
     }
   }
   if ((await recordHash(sha256, decoded)) === 'QUARANTINED') return 'QUARANTINED';
+  if (patched('dedupe-identical')) {
+    if ((await dedupeIdentical(sha256)) === 'DUPLICATE') return 'DUPLICATE';
+    // null: retired by a later newcomer's dedupe between the two steps.
+    return (await clusterContent(sha256)) === null ? 'DUPLICATE' : 'CLUSTERED';
+  }
   await clusterContent(sha256);
   return 'CLUSTERED';
 }

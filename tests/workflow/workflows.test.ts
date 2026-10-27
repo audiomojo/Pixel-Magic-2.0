@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { ApplicationFailure } from '@temporalio/activity';
 import { WorkflowFailedError } from '@temporalio/client';
+import { temporal } from '@temporalio/proto';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
-import { bundleWorkflowCode, DefaultLogger, Runtime, Worker } from '@temporalio/worker';
+import {
+  bundleWorkflowCode,
+  DefaultLogger,
+  Runtime,
+  Worker,
+  type WorkflowBundleWithSourceMap,
+} from '@temporalio/worker';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { Activities } from '../../src/activities/index.js';
 import { fileWorkflowId } from '../../src/ids.js';
@@ -29,7 +37,8 @@ interface Overrides {
   ingest?: Fakeable<IngestResult>;
   decode?: Fakeable<DecodeResult>;
   record?: Fakeable<'HASHED' | 'QUARANTINED'>;
-  cluster?: Fakeable<number>;
+  dedupe?: Fakeable<'UNIQUE' | 'KEPT' | 'DUPLICATE'>;
+  cluster?: Fakeable<number | null>;
   stage?: (force: boolean) => BuildResult;
   scan?: Fakeable<ScanResult>;
   reclaim?: Fakeable<ReclaimOutcome>;
@@ -40,6 +49,7 @@ type Impl = Pick<
   | 'ingestFile'
   | 'decodeContent'
   | 'recordHash'
+  | 'dedupeIdentical'
   | 'markFailed'
   | 'reopenFailed'
   | 'clusterContent'
@@ -103,9 +113,12 @@ function fakes(o: Overrides): Fakes {
       ingestFile: rec('ingestFile', () => value(o.ingest, INGESTED_STILL)),
       decodeContent: rec('decodeContent', () => value(o.decode, DECODED)),
       recordHash: rec('recordHash', () => value<'HASHED' | 'QUARANTINED'>(o.record, 'HASHED')),
+      dedupeIdentical: rec('dedupeIdentical', () =>
+        value<'UNIQUE' | 'KEPT' | 'DUPLICATE'>(o.dedupe, 'UNIQUE'),
+      ),
       markFailed: rec('markFailed', () => Promise.resolve()),
       reopenFailed: rec('reopenFailed', () => Promise.resolve()),
-      clusterContent: rec('clusterContent', () => value(o.cluster, 7)),
+      clusterContent: rec('clusterContent', () => value<number | null>(o.cluster, 7)),
       maybeBuildStaging: rec('maybeBuildStaging', (force: boolean) =>
         Promise.resolve(o.stage ? o.stage(force) : { gen: 1, entries: 2, skipped: false }),
       ),
@@ -124,11 +137,13 @@ let env: TestWorkflowEnvironment;
 let current: Fakes = fakes({});
 const workers: Worker[] = [];
 let running: Promise<unknown>;
+let workflowBundle: WorkflowBundleWithSourceMap;
 
 const NAMES = [
   'ingestFile',
   'decodeContent',
   'recordHash',
+  'dedupeIdentical',
   'markFailed',
   'reopenFailed',
   'clusterContent',
@@ -153,7 +168,7 @@ beforeAll(async () => {
     telemetryOptions: { logging: { filter: { core: 'ERROR', other: 'ERROR' }, forward: {} } },
   });
   env = await TestWorkflowEnvironment.createTimeSkipping();
-  const workflowBundle = await bundleWorkflowCode({
+  workflowBundle = await bundleWorkflowCode({
     workflowsPath: fileURLToPath(new URL('../../src/workflows.ts', import.meta.url)),
     logger: new DefaultLogger('ERROR'),
   });
@@ -195,10 +210,17 @@ test('new still runs all steps', async () =>
 test('new still passes each step its inputs', async () => {
   const f = fakes({ ingest: INGESTED_STILL });
   await runFile(f);
-  expect(f.calls).toEqual(['ingestFile', 'decodeContent', 'recordHash', 'clusterContent']);
+  expect(f.calls).toEqual([
+    'ingestFile',
+    'decodeContent',
+    'recordHash',
+    'dedupeIdentical',
+    'clusterContent',
+  ]);
   expect(f.args['ingestFile']).toEqual([[REF]]);
   expect(f.args['decodeContent']).toEqual([[SHA, 'heic']]);
   expect(f.args['recordHash']).toEqual([[SHA, DECODED]]);
+  expect(f.args['dedupeIdentical']).toEqual([[SHA]]);
   expect(f.args['clusterContent']).toEqual([[SHA]]);
 });
 
@@ -239,6 +261,42 @@ test('a quarantined file stops after ingest', async () => {
   });
   expect(await runFile(f)).toBe('QUARANTINED');
   expect(f.calls).toEqual(['ingestFile']);
+});
+
+test('a pixel-identical duplicate ends after dedupe: DUPLICATE, never clustered', async () => {
+  const f = fakes({ ingest: INGESTED_STILL, dedupe: 'DUPLICATE' });
+  expect(await runFile(f)).toBe('DUPLICATE');
+  expect(f.calls).toEqual(['ingestFile', 'decodeContent', 'recordHash', 'dedupeIdentical']);
+});
+
+test.each(['UNIQUE', 'KEPT'] as const)('dedupe %s continues to clustering', async (dedupe) => {
+  const f = fakes({ ingest: INGESTED_STILL, dedupe });
+  expect(await runFile(f)).toBe('CLUSTERED');
+  expect(f.calls.slice(-2)).toEqual(['dedupeIdentical', 'clusterContent']);
+});
+
+test('a content retired before clustering (clusterContent null) ends DUPLICATE', async () =>
+  expect(await runContent(fakes({ cluster: () => null }), SHA, 'heic')).toBe('DUPLICATE'));
+
+test('the dedupe step retries through an outage', async () =>
+  expect(await runFile(fakes({ ingest: INGESTED_STILL, dedupe: failNTimes(5, 'KEPT') }))).toBe(
+    'CLUSTERED',
+  ));
+
+test('a FileWorkflow history recorded before dedupe-identical replays without the step', async () => {
+  const bytes = await readFile(
+    fileURLToPath(
+      new URL('../fixtures/fileWorkflow-pre-dedupe-identical.history.bin', import.meta.url),
+    ),
+  );
+  const history = temporal.api.history.v1.History.decode(bytes);
+  const scheduled = (history.events ?? []).flatMap((e) => {
+    const name = e.activityTaskScheduledEventAttributes?.activityType?.name;
+    return name ? [name] : [];
+  });
+  // Recorded from the workflow code before the patch: no dedupe step, no patch marker.
+  expect(scheduled).toEqual(['ingestFile', 'decodeContent', 'recordHash', 'clusterContent']);
+  await Worker.runReplayHistory({ workflowBundle }, history);
 });
 
 test('quarantine stops before cluster', async () => {
@@ -343,7 +401,13 @@ test('UnexpectedState from recordHash fails the workflow visibly', async () => {
 test('ContentWorkflow runs content steps only', async () => {
   const f = fakes({});
   expect(await runContent(f, 'a'.repeat(64), 'heic')).toBe('CLUSTERED');
-  expect(f.calls).toEqual(['reopenFailed', 'decodeContent', 'recordHash', 'clusterContent']);
+  expect(f.calls).toEqual([
+    'reopenFailed',
+    'decodeContent',
+    'recordHash',
+    'dedupeIdentical',
+    'clusterContent',
+  ]);
   expect(f.args['reopenFailed']).toEqual([['a'.repeat(64)]]);
 });
 
