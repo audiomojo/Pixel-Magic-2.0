@@ -207,7 +207,11 @@ export function makeStaging(deps: Deps) {
     };
   }
 
-  /** Replaces `similar_candidates` with this build's sets, so the worker can find sets to rank. */
+  /**
+   * Replaces `similar_candidates` with this build's sets, so the worker can find sets to rank.
+   * Only a change of membership rewrites them, and it stamps `similar_state`: scores are
+   * set-relative, so the worker re-ranks when sets merged or split since its last ranking.
+   */
   async function writeCandidates(sets: Map<number, string[]>): Promise<void> {
     const ids: number[] = [];
     const shas: string[] = [];
@@ -217,12 +221,21 @@ export function makeStaging(deps: Deps) {
         shas.push(s);
       }
     await withTx(pool, async (t) => {
+      const r = await t.query<{ changed: boolean }>(
+        `WITH n AS (SELECT * FROM unnest($1::bigint[], $2::text[]) AS n(set_id, sha256))
+         SELECT EXISTS (SELECT set_id, sha256 FROM similar_candidates EXCEPT SELECT * FROM n)
+             OR EXISTS (SELECT * FROM n EXCEPT SELECT set_id, sha256 FROM similar_candidates)
+                AS changed`,
+        [ids, shas],
+      );
+      if (!r.rows[0]!.changed) return;
       await t.query('DELETE FROM similar_candidates');
       await t.query(
         `INSERT INTO similar_candidates (set_id, sha256)
          SELECT * FROM unnest($1::bigint[], $2::text[])`,
         [ids, shas],
       );
+      await t.query('UPDATE similar_state SET candidates_changed_at = now() WHERE id = 1');
     });
   }
 

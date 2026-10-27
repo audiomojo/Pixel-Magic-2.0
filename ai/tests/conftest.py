@@ -18,6 +18,7 @@ TRUNCATES = [
     "UPDATE harvest_host_state SET heartbeat_at = NULL, version = NULL WHERE id = 1",
     "TRUNCATE photo_features, picks, photo_scores, ranker_models, similar_candidates"
     " RESTART IDENTITY",
+    "UPDATE similar_state SET candidates_changed_at = NULL WHERE id = 1",
     "UPDATE copy_sweep_state SET after_id = 0 WHERE id = 1",
 ]
 

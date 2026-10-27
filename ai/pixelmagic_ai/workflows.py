@@ -1,4 +1,5 @@
-"""DescribeWorkflow: describes every candidate photo without features, then re-ranks.
+"""DescribeWorkflow: describes every candidate photo without features, then re-ranks when it
+described something or the sets changed since the last ranking.
 TrainWorkflow: learns from the picks, then re-ranks when the new model was promoted.
 
 Deterministic: no I/O here, only activities. Activities are called by name so this module
@@ -71,7 +72,11 @@ class DescribeWorkflow:
         else:
             workflow.continue_as_new(args=[concurrency, described, after_sha])
 
-        if described > 0:
+        # Scores are set-relative: sets that merged or split need ranking again even when
+        # nothing new was described.
+        if described > 0 or await workflow.execute_activity(
+            "rank_needed", result_type=bool, **_SHORT
+        ):
             await workflow.execute_activity("rank_sets", result_type=int, **_LONG)
         return described
 

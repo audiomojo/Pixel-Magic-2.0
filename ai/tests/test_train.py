@@ -391,3 +391,26 @@ def test_train_skips_after_a_losing_training_without_newer_picks(acts, conn, tmp
     assert acts.train_ranker() is None
     assert len(models(conn)) == 2
     assert sorted((tmp_path / "ai" / "models").iterdir()) == files
+
+
+def stamp_candidates_changed(conn) -> None:
+    conn.execute("UPDATE similar_state SET candidates_changed_at = clock_timestamp() WHERE id = 1")
+
+
+def test_rank_needed(acts, conn):
+    assert acts.rank_needed() is False  # nothing described: nothing to rank
+    sets = add_sets(conn)
+    assert acts.rank_needed() is True  # described candidates, no ranked model
+    acts.train_ranker()
+    assert acts.rank_needed() is True  # promoted but not ranked yet
+    acts.rank_sets()
+    assert acts.rank_needed() is False
+    stamp_candidates_changed(conn)  # staging changed set membership after the ranking
+    assert acts.rank_needed() is True
+    acts.rank_sets()
+    assert acts.rank_needed() is False
+    add_smile_picks(conn, sets, 30)
+    acts.train_ranker()  # v2 promoted, not ranked
+    assert acts.rank_needed() is True
+    acts.rank_sets()
+    assert acts.rank_needed() is False

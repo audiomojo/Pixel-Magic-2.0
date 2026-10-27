@@ -25,7 +25,14 @@ class FakeAi:
     """In-memory backlog. Pages are shorter than PAGE_SIZE so 450 items take 9 pages and the
     workflow must continue-as-new (every 5 pages) to finish."""
 
-    def __init__(self, n: int, page: int = 50, broken: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        n: int,
+        page: int = 50,
+        broken: frozenset[str] = frozenset(),
+        needs_rank: bool = False,
+    ) -> None:
+        self.needs_rank = needs_rank
         self.backlog = [(f"{i:064x}", "jpg") for i in range(n)]
         self.page = page
         self.broken = broken
@@ -64,13 +71,19 @@ class FakeAi:
         self.ranked += 1
         return 0
 
+    @activity.defn(name="rank_needed")
+    async def rank_needed(self) -> bool:
+        return self.needs_rank
+
 
 async def _run(fake: FakeAi, concurrency: int):
     async with await WorkflowEnvironment.start_time_skipping() as env, Worker(
         env.client,
         task_queue=QUEUE,
         workflows=[DescribeWorkflow],
-        activities=[fake.describe_backlog_page, fake.describe_photo, fake.rank_sets],
+        activities=[
+            fake.describe_backlog_page, fake.describe_photo, fake.rank_sets, fake.rank_needed
+        ],
     ):
         handle = await env.client.start_workflow(
             DescribeWorkflow.run, concurrency, id=f"describe-{uuid.uuid4()}", task_queue=QUEUE
@@ -93,6 +106,14 @@ def test_every_item_described_once_across_continue_as_new():
     assert len(set(fake.described)) == 450
     assert set(fake.limits) == {PAGE_SIZE}
     assert first_run != last_run  # continued as new
+    assert fake.ranked == 1
+
+
+def test_rank_sets_runs_with_nothing_described_when_ranking_is_needed():
+    """Sets merged or split since the last ranking: scores are set-relative, so re-rank."""
+    fake = FakeAi(0, needs_rank=True)
+    result, first_run, last_run = run(fake, concurrency=2)
+    assert result == 0
     assert fake.ranked == 1
 
 

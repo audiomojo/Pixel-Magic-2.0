@@ -182,6 +182,30 @@ def picks_since_last_model(conn: psycopg.Connection) -> bool:
     return bool(row[0])
 
 
+def rank_needed(conn: psycopg.Connection) -> bool:
+    """Whether the sets need (re-)ranking without anything newly described: the current
+    (newest promoted) model has not ranked yet, or staging changed set membership since it
+    did (scores are set-relative). With no promoted model at all, only once a candidate is
+    described: there is nothing to rank before that."""
+    row = conn.execute(
+        """
+        WITH m AS (SELECT ranked_at FROM ranker_models WHERE promoted
+                    ORDER BY version DESC LIMIT 1)
+        SELECT CASE
+          WHEN NOT EXISTS (SELECT 1 FROM m) THEN EXISTS (
+            SELECT 1 FROM similar_candidates sc
+            JOIN photo_features f ON f.sha256 = sc.sha256 AND f.failed IS NULL)
+          ELSE (SELECT ranked_at IS NULL OR coalesce(
+                  (SELECT candidates_changed_at FROM similar_state WHERE id = 1) > ranked_at,
+                  false)
+                FROM m)
+        END
+        """
+    ).fetchone()
+    assert row is not None
+    return bool(row[0])
+
+
 def delete_other_scores(conn: psycopg.Connection, version: int) -> None:
     """Only the ranked version's scores are kept; older versions re-rank if ever needed."""
     conn.execute("DELETE FROM photo_scores WHERE model_version <> %s", (version,))

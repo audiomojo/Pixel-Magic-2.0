@@ -164,6 +164,12 @@ class Activities:
             version, promoted = self._train_locked(conn)
             return version if promoted else None
 
+    @activity.defn(name="rank_needed")
+    def rank_needed(self) -> bool:
+        """See db.rank_needed: DescribeWorkflow re-ranks on this even when it described nothing."""
+        with self._connect() as conn:
+            return db.rank_needed(conn)
+
     @activity.defn(name="rank_sets")
     def rank_sets(self) -> int:
         """Scores every described candidate with the current model; candidates scored.
@@ -218,5 +224,6 @@ class Activities:
             self.describe_photo,
             self.describe_backlog_page,
             self.train_ranker,
+            self.rank_needed,
             self.rank_sets,
         ]

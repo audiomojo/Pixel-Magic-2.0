@@ -59,8 +59,17 @@ CREATE TABLE similar_candidates (
 );
 CREATE INDEX similar_candidates_sha256_idx ON similar_candidates (sha256);
 
+-- When staging last changed which photos make up the similar sets. Scores are set-relative,
+-- so the worker re-ranks when this is newer than the current model's ranked_at.
+CREATE TABLE similar_state (
+  id int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  candidates_changed_at timestamptz
+);
+INSERT INTO similar_state (id) VALUES (1);
+
 -- Down Migration
 
+DROP TABLE similar_state;
 DROP INDEX similar_candidates_sha256_idx;
 DROP TABLE similar_candidates;
 DROP TABLE ranker_models;

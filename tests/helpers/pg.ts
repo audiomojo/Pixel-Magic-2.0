@@ -40,6 +40,7 @@ export async function startPg(): Promise<PgHandle> {
       await pool.query(
         'TRUNCATE photo_features, picks, photo_scores, ranker_models, similar_candidates RESTART IDENTITY',
       );
+      await pool.query('UPDATE similar_state SET candidates_changed_at = NULL WHERE id = 1');
       await pool.query('UPDATE copy_sweep_state SET after_id = 0 WHERE id = 1');
     },
     async stop() {

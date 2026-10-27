@@ -337,6 +337,30 @@ test('a build records each similar set’s candidates, replacing the previous on
   expect(await setNames()).toEqual(['20211003_140211_A.HEIC', '20211003_140211_B.HEIC']);
 });
 
+const changedAt = async () =>
+  (
+    await pool.query<{ t: string | null }>(
+      'SELECT candidates_changed_at::text AS t FROM similar_state WHERE id = 1',
+    )
+  ).rows[0]!.t;
+
+test('the candidates stamp moves only when set membership changes', async () => {
+  await seedSimilarSet();
+  expect(await changedAt()).toBeNull();
+  await build(true);
+  const first = await changedAt();
+  expect(first).not.toBeNull();
+  await build(true); // identical sets: no bump
+  expect(await changedAt()).toBe(first);
+  // Group 2 leaves set 9: one copy group left, so no set at all.
+  await pool.query(`UPDATE groups SET similar_set_id = NULL WHERE id = 2`);
+  await build(true);
+  expect(await candidates()).toEqual([]);
+  const second = await changedAt();
+  expect(second).not.toBeNull();
+  expect(second! > first!).toBe(true);
+});
+
 test('a new user pick rebuilds and marks that file', async () => {
   const { a, b } = await seedSimilarSet();
   await build(true);
