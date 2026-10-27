@@ -4,10 +4,13 @@ import {
   bytes,
   count,
   defaultTicked,
+  filesPerMinute,
   folderStatus,
   gateLine,
   isStalled,
   junkSummary,
+  parseHash,
+  rateText,
   runTotals,
 } from '../../src/harvest/ui/format.js';
 
@@ -203,5 +206,68 @@ describe('edge cases', () => {
     expect(runTotals([{ dirs: 'x' }]).dirs).toBe(0);
     expect(junkSummary([{}, { junk: { b: 2, a: 2 } }])).toBe('a 2, b 2');
     expect(junkSummary(undefined)).toBe('');
+  });
+});
+
+describe('parseHash', () => {
+  it('reads each route', () => {
+    expect(parseHash('')).toEqual({ name: 'sources' });
+    expect(parseHash('#/')).toEqual({ name: 'sources' });
+    expect(parseHash('#/source/3')).toEqual({ name: 'source', id: '3' });
+    expect(parseHash('#/review')).toEqual({ name: 'review' });
+    expect(parseHash('#/where')).toEqual({ name: 'where' });
+    expect(parseHash('#history')).toEqual({ name: 'history' });
+  });
+  it('decodes a review path, keeping its slashes', () => {
+    expect(parseHash('#/review/3/My%20Pics/2020/caf%C3%A9')).toEqual({
+      name: 'review-files',
+      id: '3',
+      path: 'My Pics/2020/café',
+    });
+  });
+  it('keeps a malformed escape as typed', () => {
+    expect(parseHash('#/review/3/100%')).toEqual({ name: 'review-files', id: '3', path: '100%' });
+  });
+  it('falls back to the sources list', () => {
+    expect(parseHash('#/source')).toEqual({ name: 'sources' });
+    expect(parseHash('#/nope/1')).toEqual({ name: 'sources' });
+  });
+});
+
+describe('filesPerMinute', () => {
+  it('is 0 until there are two samples', () => {
+    expect(filesPerMinute([], 1000, 5)).toEqual({ samples: [[1000, 5]], rate: 0 });
+  });
+  it('measures from the oldest kept sample', () => {
+    const { rate } = filesPerMinute([[0, 0]], 30_000, 10);
+    expect(rate).toBe(20); // 10 files in 30 s
+  });
+  it('keeps about the last minute, never fewer than two samples', () => {
+    const old = [
+      [0, 0],
+      [50_000, 100],
+      [90_000, 160],
+    ];
+    const r = filesPerMinute(old, 120_000, 190);
+    expect(r.samples).toEqual([
+      [90_000, 160],
+      [120_000, 190],
+    ]);
+    expect(r.rate).toBe(60); // 30 files in 30 s
+    expect(filesPerMinute([[0, 0]], 600_000, 10).samples).toHaveLength(2);
+  });
+  it('does not change the samples it is given', () => {
+    const s = [[0, 0]];
+    filesPerMinute(s, 1000, 1);
+    expect(s).toEqual([[0, 0]]);
+  });
+});
+
+describe('rateText', () => {
+  it('rounds from 10 up and keeps one decimal below', () => {
+    expect(rateText(0)).toBe('0.0');
+    expect(rateText(2.345)).toBe('2.3');
+    expect(rateText(9.96)).toBe('10.0');
+    expect(rateText(12.6)).toBe('13');
   });
 });

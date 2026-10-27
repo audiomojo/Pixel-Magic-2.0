@@ -391,8 +391,11 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       });
     }
     const runId = await createRun(pool, folders, b.dryRun);
-    await viaTemporal('starting the run (it stays queued)', () => startNextQueued(pool, control));
-    return { runId, state: (await requireRun(runId)).state };
+    const startedId = await viaTemporal('starting the run (it stays queued)', () =>
+      startNextQueued(pool, control),
+    );
+    // `started`: its workflow was started; the row says queued until that workflow moves it on.
+    return { runId, state: (await requireRun(runId)).state, started: startedId === runId };
   }
 
   async function runAction(id: string, action: string): Promise<Json> {

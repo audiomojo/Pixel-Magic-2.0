@@ -132,3 +132,47 @@ export function junkSummary(folders) {
     .map(([k, n]) => `${k} ${n}`)
     .join(', ');
 }
+
+/**
+ * The page's route from `location.hash`: `#/source/<id>`, `#/review`, `#/review/<id>/<path>`,
+ * `#/where`, `#/history`; anything else is the sources list.
+ */
+export function parseHash(hash) {
+  const parts = hash
+    .replace(/^#\/?/, '')
+    .split('/')
+    .filter(Boolean)
+    .map((p) => {
+      try {
+        return decodeURIComponent(p);
+      } catch {
+        return p; // a malformed escape: keep it as typed
+      }
+    });
+  const [a, b, ...rest] = parts;
+  if (a === 'source' && b) return { name: 'source', id: b };
+  if (a === 'review')
+    return b ? { name: 'review-files', id: b, path: rest.join('/') } : { name: 'review' };
+  if (a === 'where') return { name: 'where' };
+  if (a === 'history') return { name: 'history' };
+  return { name: 'sources' };
+}
+
+const RATE_WINDOW_MS = 60_000;
+
+/**
+ * Files per minute over about the last minute. `samples` are one run's `[time, sent]` pairs,
+ * oldest first; returns the samples to keep (this one added) and the rate.
+ */
+export function filesPerMinute(samples, now, sent) {
+  const kept = [...samples, [now, sent]];
+  while (kept.length > 2 && now - kept[0][0] > RATE_WINDOW_MS) kept.shift();
+  const [t0, sent0] = kept[0];
+  const rate = kept.length > 1 && now > t0 ? ((sent - sent0) * RATE_WINDOW_MS) / (now - t0) : 0;
+  return { samples: kept, rate };
+}
+
+/** A files-per-minute rate: whole numbers from 10 up, one decimal below. */
+export function rateText(rate) {
+  return rate >= 10 ? String(Math.round(rate)) : rate.toFixed(1);
+}

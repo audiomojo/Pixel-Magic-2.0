@@ -421,7 +421,8 @@ describe('runs', () => {
       dryRun: true,
     });
     expect(r.status).toBe(200);
-    expect(r.json).toEqual({ runId: expect.any(String), state: 'queued' });
+    // Started, though its workflow has not yet moved the row on from queued.
+    expect(r.json).toEqual({ runId: expect.any(String), state: 'queued', started: true });
     expect(e.calls).toEqual([`start ${r.json.runId}`]);
     const { rows } = await pgh.pool.query(
       `SELECT f.rel_path, r.dry_run FROM harvest_run_folders rf
@@ -441,7 +442,7 @@ describe('runs', () => {
     const a = await e.post('/api/runs', body);
     await setRunState(pgh.pool, a.json.runId, 'scanning');
     const b = await e.post('/api/runs', body);
-    expect(b.json.state).toBe('queued');
+    expect(b.json).toMatchObject({ state: 'queued', started: false });
     expect(b.json.runId).not.toBe(a.json.runId);
     expect(e.calls).toEqual([`start ${a.json.runId}`]);
   });

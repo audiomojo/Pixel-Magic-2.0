@@ -7,10 +7,13 @@ import {
   count,
   day,
   defaultTicked,
+  filesPerMinute,
   folderStatus,
   gateLine,
   isStalled,
   junkSummary,
+  parseHash,
+  rateText,
   runTotals,
 } from './format.js';
 
@@ -98,7 +101,7 @@ async function loadInto(routeName, head, url) {
 let state = null;
 let stateError = null;
 let route = { name: 'sources' };
-const samples = []; // [time, sent] of the active run, for files per minute
+let samples = []; // [time, sent] of the active run, for files per minute
 let samplesRun = null;
 
 async function refreshState() {
@@ -212,7 +215,7 @@ function paintRunPanel() {
   const queue = (state && state.queue) || [];
   root.hidden = !run && queue.length === 0;
   if (root.hidden) {
-    samples.length = 0;
+    samples = [];
     return;
   }
   if (!panel.title) buildPanel();
@@ -245,11 +248,11 @@ function paintRunPanel() {
       : '';
     const cur = run.folders.find((f) => f.state !== 'done');
     panel.current.textContent = cur ? `Now: ${cur.label}/${cur.relPath} (${cur.state})` : '';
-    const rate = filesPerMinute(run.id, t.sent);
+    const rate = sampleRate(run.id, t.sent);
     panel.counts.replaceChildren(
       ...countItems([
         ...Object.entries(COUNT_LABELS).map(([k, label]) => [label, count(t[k])]),
-        ['Files / min', rate >= 10 ? String(Math.round(rate)) : rate.toFixed(1)],
+        ['Files / min', rateText(rate)],
         ['Bytes sent', bytes(t.bytesSent)],
       ]),
     );
@@ -264,17 +267,15 @@ function paintRunPanel() {
   paintQueue(queue);
 }
 
-/** Files per minute of run `runId`, over about the last minute of samples. */
-function filesPerMinute(runId, sent) {
-  const now = Date.now();
+/** Files per minute of run `runId`; a new run starts a new window. */
+function sampleRate(runId, sent) {
   if (samplesRun !== runId) {
-    samples.length = 0;
+    samples = [];
     samplesRun = runId;
   }
-  samples.push([now, sent]);
-  while (samples.length > 2 && now - samples[0][0] > 60000) samples.shift();
-  const first = samples[0];
-  return samples.length > 1 && now > first[0] ? ((sent - first[1]) * 60000) / (now - first[0]) : 0;
+  const r = filesPerMinute(samples, Date.now(), sent);
+  samples = r.samples;
+  return r.rate;
 }
 
 /** The waiting runs, repainted only when the queue changed. */
@@ -341,28 +342,8 @@ async function removeQueued(id) {
 // ---------------------------------------------------------------- router
 const main = () => $('main');
 let sourcesFrame = null; // the sources view's fixed parts, rebuilt only on navigation
-function parseHash() {
-  const parts = location.hash
-    .replace(/^#\/?/, '')
-    .split('/')
-    .filter(Boolean)
-    .map((p) => {
-      try {
-        return decodeURIComponent(p);
-      } catch {
-        return p;
-      }
-    });
-  const [a, b, ...rest] = parts;
-  if (a === 'source' && b) return { name: 'source', id: b };
-  if (a === 'review')
-    return b ? { name: 'review-files', id: b, path: rest.join('/') } : { name: 'review' };
-  if (a === 'where') return { name: 'where' };
-  if (a === 'history') return { name: 'history' };
-  return { name: 'sources' };
-}
 function navigate() {
-  route = parseHash();
+  route = parseHash(location.hash);
   const top = {
     sources: 'sources',
     source: 'sources',
@@ -698,7 +679,7 @@ async function startRun(dryRun) {
     const r = await post('/api/runs', { folders, dryRun });
     msg.replaceChildren(
       message(
-        `${runName(dryRun, r.runId)} ${r.state === 'queued' ? 'queued behind the active run' : 'started'}.`,
+        `${runName(dryRun, r.runId)} ${r.started ? 'started' : 'queued behind the active run'}.`,
       ),
     );
     src.ticked.clear();
