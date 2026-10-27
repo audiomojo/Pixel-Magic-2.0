@@ -95,3 +95,13 @@ def test_write_scores_upserts_and_mark_ranked(conn):
     assert db.current_model(conn).ranked_at is None
     db.mark_ranked(conn, v)
     assert db.current_model(conn).ranked_at is not None
+
+
+def test_describe_backlog_after_cursor(conn):
+    for sha in (A, B, C):
+        add_content(conn, sha)
+    add_candidates(conn, 1, A, B, C)
+    assert db.describe_backlog(conn, V, 10, after_sha=A) == [(B, "jpg"), (C, "jpg")]
+    assert db.describe_backlog(conn, V, 1, after_sha=A) == [(B, "jpg")]
+    assert db.describe_backlog(conn, V, 10, after_sha=C) == []
+    assert db.describe_backlog(conn, V, 10, after_sha=None) == [(A, "jpg"), (B, "jpg"), (C, "jpg")]

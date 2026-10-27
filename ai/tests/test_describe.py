@@ -98,3 +98,10 @@ def test_rerun_is_a_noop(acts, conn, tmp_path):
 
 def test_rank_sets_placeholder_returns_zero(acts):
     assert acts.rank_sets() == 0
+
+
+def test_backlog_page_after_cursor(acts, conn):
+    add_candidate(conn, A, "jpg")
+    add_candidate(conn, B, "jpg")
+    assert acts.describe_backlog_page(200, A) == [(B, "jpg")]
+    assert acts.describe_backlog_page(200, None) == [(A, "jpg"), (B, "jpg")]

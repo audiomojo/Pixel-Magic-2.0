@@ -65,9 +65,11 @@ class Activities:
         return "failed" if row.failed else "ok"
 
     @activity.defn(name="describe_backlog_page")
-    def describe_backlog_page(self, limit: int) -> list[tuple[str, str]]:
+    def describe_backlog_page(
+        self, limit: int, after_sha: str | None = None
+    ) -> list[tuple[str, str]]:
         with self._connect() as conn:
-            return db.describe_backlog(conn, FEATURE_VERSION, limit)
+            return db.describe_backlog(conn, FEATURE_VERSION, limit, after_sha=after_sha)
 
     @activity.defn(name="rank_sets")
     def rank_sets(self) -> int:

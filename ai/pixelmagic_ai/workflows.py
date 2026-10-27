@@ -25,8 +25,13 @@ _DESCRIBE = dict(
 @workflow.defn(name="DescribeWorkflow")
 class DescribeWorkflow:
     @workflow.run
-    async def run(self, concurrency: int, described: int = 0) -> int:
-        """Photos described (ok or failed) over the whole continue-as-new chain."""
+    async def run(
+        self, concurrency: int, described: int = 0, after_sha: str | None = None
+    ) -> int:
+        """Photos described (ok or failed) over the whole continue-as-new chain.
+
+        Pages walk the backlog by a sha256 cursor (carried through continue-as-new), so a photo
+        that keeps failing is tried once per scheduled run and never hides the ones after it."""
         sem = asyncio.Semaphore(max(1, concurrency))
 
         async def describe(sha256: str, ext: str) -> bool:
@@ -38,23 +43,24 @@ class DescribeWorkflow:
                     return True
                 except ActivityError as e:
                     # Out of retries (e.g. a vault file that cannot be read): it stays in the
-                    # backlog for the next scheduled run; the rest carries on.
+                    # backlog; the cursor moves past it and the next scheduled run tries again.
                     workflow.logger.warning("describe_photo %s gave up: %s", sha256, e.cause)
                     return False
 
         for _ in range(PAGES_PER_RUN):
             page = await workflow.execute_activity(
-                "describe_backlog_page", PAGE_SIZE, result_type=list[tuple[str, str]], **_SHORT
+                "describe_backlog_page",
+                args=[PAGE_SIZE, after_sha],
+                result_type=list[tuple[str, str]],
+                **_SHORT,
             )
             if not page:
                 break
             done = await asyncio.gather(*(describe(sha, ext) for sha, ext in page))
-            ok = sum(done)
-            described += ok
-            if ok == 0:
-                break  # only stuck photos are left: stop until the next scheduled run
+            described += sum(done)
+            after_sha = page[-1][0]
         else:
-            workflow.continue_as_new(args=[concurrency, described])
+            workflow.continue_as_new(args=[concurrency, described, after_sha])
 
         if described > 0:
             await workflow.execute_activity("rank_sets", result_type=int, **_RANK)

@@ -32,14 +32,19 @@ class FakeAi:
         self.in_flight = 0
         self.max_in_flight = 0
         self.ranked = 0
+        self.attempts: dict[str, list[int]] = {}
 
     @activity.defn(name="describe_backlog_page")
-    async def describe_backlog_page(self, limit: int) -> list[tuple[str, str]]:
+    async def describe_backlog_page(
+        self, limit: int, after_sha: str | None = None
+    ) -> list[tuple[str, str]]:
         self.limits.append(limit)
-        return self.backlog[: min(limit, self.page)]
+        rest = [it for it in self.backlog if after_sha is None or it[0] > after_sha]
+        return rest[: min(limit, self.page)]
 
     @activity.defn(name="describe_photo")
     async def describe_photo(self, sha256: str, ext: str) -> str:
+        self.attempts.setdefault(sha256, []).append(activity.info().attempt)
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
@@ -107,10 +112,24 @@ def test_concurrency_never_exceeds_setting(concurrency):
 def test_a_photo_that_keeps_failing_does_not_stop_the_rest():
     stuck = f"{0:064x}"
     fake = FakeAi(120, page=50, broken=frozenset({stuck}))
-    result = (run(fake, concurrency=2))[0]
+    result = run(fake, concurrency=2)[0]
     assert result == 119
     assert stuck not in fake.described
     assert fake.backlog == [(stuck, "jpg")]
+    assert fake.attempts[stuck] == [1, 2, 3, 4, 5]  # one activity (5 attempts) per run
+    assert fake.ranked == 1
+
+
+def test_more_stuck_photos_than_a_page_do_not_hide_the_rest():
+    """60 stuck photos sort before 40 good ones; pages of 20 (3 pages of stuck only)."""
+    stuck = frozenset(f"{i:064x}" for i in range(60))
+    fake = FakeAi(100, page=20, broken=stuck)
+    result, first_run, last_run = run(fake, concurrency=4)
+    assert result == 40
+    assert sorted(fake.described) == [f"{i:064x}" for i in range(60, 100)]
+    assert sorted(fake.backlog) == sorted((s, "jpg") for s in stuck)
+    assert all(fake.attempts[s] == [1, 2, 3, 4, 5] for s in stuck)
+    assert first_run != last_run  # 5 pages, then continue-as-new carried the cursor
     assert fake.ranked == 1
 
 

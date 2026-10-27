@@ -44,8 +44,11 @@ class ModelRow:
     ranked_at: datetime | None
 
 
-def describe_backlog(conn: psycopg.Connection, feature_version: int, limit: int) -> list[tuple[str, str]]:
-    """(sha256, ext) of candidates with no photo_features row (failed or not) for the version."""
+def describe_backlog(
+    conn: psycopg.Connection, feature_version: int, limit: int, after_sha: str | None = None
+) -> list[tuple[str, str]]:
+    """(sha256, ext) of candidates with no photo_features row (failed or not) for the version,
+    in sha256 order, after the `after_sha` cursor when given."""
     rows = conn.execute(
         """
         SELECT c.sha256, c.ext
@@ -54,10 +57,11 @@ def describe_backlog(conn: psycopg.Connection, feature_version: int, limit: int)
           AND NOT EXISTS (
             SELECT 1 FROM photo_features f
             WHERE f.sha256 = c.sha256 AND f.feature_version = %s)
+          AND (%s::text IS NULL OR c.sha256 > %s)
         ORDER BY c.sha256
         LIMIT %s
         """,
-        (feature_version, limit),
+        (feature_version, after_sha, after_sha, limit),
     ).fetchall()
     return [(sha, ext) for sha, ext in rows]
 
