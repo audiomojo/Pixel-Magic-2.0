@@ -108,10 +108,26 @@ export function makeIngestFile(deps: Deps) {
     return { fileId: id, sha256: null, ext: null, state: 'QUARANTINED', kind: null };
   }
 
+  /**
+   * A COPY owns no content, so its kind is null — except a copy of a content restored from
+   * PURGED (purge spec §9) that is still INGESTED: then the content's kind, so FileWorkflow runs
+   * the content steps nothing else would (the restore made no file its owner). Derived from the
+   * database, so a retry after a crash anywhere past the restore commit gets the same answer.
+   * Content steps are idempotent, so a second copy dropped meanwhile running them too is harmless.
+   */
+  async function copyKind(sha: string): Promise<Kind> {
+    const r = await pool.query<{ kind: Kind }>(
+      `SELECT c.kind FROM contents c JOIN purged p ON p.sha256 = c.sha256
+        WHERE c.sha256 = $1 AND c.state = 'INGESTED' AND p.unblocked_at IS NOT NULL`,
+      [sha],
+    );
+    return r.rows[0]?.kind ?? null;
+  }
+
   async function commitCopy(row: Row, sha: string, ext: string): Promise<IngestResult> {
     await guarded(pool, row.id, `state = 'COPY'`, ['CLAIMED']);
     await finish(row.id, layout.copiesFile(row.id, ext), sha);
-    return { fileId: row.id, sha256: sha, ext, state: 'COPY', kind: null };
+    return { fileId: row.id, sha256: sha, ext, state: 'COPY', kind: await copyKind(sha) };
   }
 
   /** Moves the claimed file into .copies (durably), then commits COPY. */
@@ -261,12 +277,18 @@ export function makeIngestFile(deps: Deps) {
     // BLOCKED keeps nothing: its claimed file was deleted (durably) before it was committed.
     if (row.sha256 && row.ext && row.state !== 'BLOCKED')
       await finish(id, keptPath(id, row.state, row.sha256, row.ext), row.sha256);
+    const kind =
+      row.state === 'INGESTED'
+        ? row.kind
+        : row.state === 'COPY' && row.sha256
+          ? await copyKind(row.sha256)
+          : null;
     return {
       fileId: id,
       sha256: row.sha256,
       ext: row.ext,
       state: row.state,
-      kind: row.state === 'INGESTED' ? row.kind : null,
+      kind,
     };
   }
 

@@ -322,6 +322,50 @@ test('a FileWorkflow history recorded before dedupe-identical replays without th
   await Worker.runReplayHistory({ workflowBundle }, history);
 });
 
+// Purge spec §9: an unblocked purged content restored while its vault file was still there
+// comes back as a COPY that carries the content's kind; a still then runs the content steps.
+test('a restored COPY of a still removes the copy, then runs the content steps', async () => {
+  const f = fakes({ ingest: { ...COPY, kind: 'still' } });
+  expect(await runFile(f)).toBe('CLUSTERED');
+  expect(f.calls).toEqual([
+    'ingestFile',
+    'reclaimCopy',
+    'decodeContent',
+    'recordHash',
+    'dedupeIdentical',
+    'clusterContent',
+  ]);
+  expect(f.args['decodeContent']).toEqual([[SHA, 'heic']]);
+});
+
+test('a restored COPY of a motion stops after the reclaim, like a new motion', async () => {
+  const f = fakes({ ingest: { ...COPY, ext: 'mov', kind: 'motion' } });
+  expect(await runFile(f)).toBe('COPY');
+  expect(f.calls).toEqual(['ingestFile', 'reclaimCopy']);
+});
+
+test('a FileWorkflow COPY history recorded before restored-copy replays unchanged', async () => {
+  const bytes = await readFile(
+    fileURLToPath(
+      new URL('../fixtures/fileWorkflow-copy-pre-restored-copy.history.bin', import.meta.url),
+    ),
+  );
+  const history = temporal.api.history.v1.History.decode(bytes);
+  const events = history.events ?? [];
+  const scheduled = events.flatMap((e) => {
+    const name = e.activityTaskScheduledEventAttributes?.activityType?.name;
+    return name ? [name] : [];
+  });
+  // Recorded from the workflow code before the patch: ingest (COPY, kind null), then reclaim.
+  expect(scheduled).toEqual(['ingestFile', 'reclaimCopy']);
+  const patches = events.flatMap((e) => {
+    const d = e.markerRecordedEventAttributes?.details?.['patch_data']?.payloads?.[0]?.data;
+    return d ? [Buffer.from(d).toString()] : [];
+  });
+  expect(patches.join()).not.toContain('restored-copy');
+  await Worker.runReplayHistory({ workflowBundle }, history);
+});
+
 test('quarantine stops before cluster', async () => {
   const f = fakes({ ingest: INGESTED_STILL, record: 'QUARANTINED' });
   expect(await runFile(f)).toBe('QUARANTINED');

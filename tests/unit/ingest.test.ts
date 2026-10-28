@@ -114,7 +114,7 @@ test('new file lands in vault, read-only, drop zone and claimed empty', async ()
 test('byte-identical second file is COPY', async () => {
   const a = await runActivity(acts.ingestFile, [await drop('a.jpg', JPEG_A)], { runId: 'r1' });
   const b = await runActivity(acts.ingestFile, [await drop('b.jpg', JPEG_A)], { runId: 'r2' });
-  expect([b.state, b.sha256]).toEqual(['COPY', a.sha256]);
+  expect([b.state, b.sha256, b.kind]).toEqual(['COPY', a.sha256, null]);
   expect(existsSync(join(layout.vaultCopies, `${b.fileId}.jpg`))).toBe(true);
 });
 
@@ -768,9 +768,12 @@ test('an unblocked sha whose purged vault file was removed is vaulted again and 
 test('an unblocked sha whose purged vault file is still there is restored; the drop is a COPY of it', async () => {
   const sha = await purgedContent(JPEG_A, false);
   await purgedRow(JPEG_A, true);
-  const r = await runActivity(acts.ingestFile, [await drop('back.jpg', JPEG_A)], { runId: 'r1' });
-  expect([r.state, r.sha256]).toEqual(['COPY', sha]);
+  const ref = await drop('back.jpg', JPEG_A);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  // The kind tells FileWorkflow to run the content steps the restored content needs.
+  expect([r.state, r.sha256, r.ext, r.kind]).toEqual(['COPY', sha, 'jpg', 'still']);
   expect(await contentRow(sha)).toEqual(RESTORED);
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(r); // R1
   // Its removal no longer applies: the vault file stays.
   expect(await runActivity(acts.removePurgedBatch, [[sha]])).toMatchObject({ examined: 0 });
   expect(await readFile(vaultOf(sha))).toEqual(JPEG_A);
@@ -835,3 +838,24 @@ test('an unblocked sha with no content row (wiped database) is ingested as new c
 async function lockWaiters(): Promise<number> {
   return count('pg_stat_activity', `wait_event_type = 'Lock'`);
 }
+
+test('a crash between a restore and its COPY commit still hands back the kind', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A, true);
+  const ref = await drop('back.jpg', JPEG_A);
+  await expect(
+    runActivity(createActivities(crashAt('copies_rename')).ingestFile, [ref], { runId: 'r1' }),
+  ).rejects.toThrow(SimulatedCrash);
+  expect(await contentRow(sha)).toEqual(RESTORED); // committed before the crash
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect([r.state, r.kind]).toEqual(['COPY', 'still']);
+});
+
+test('once a restored content is hashed, further copies of it carry no kind', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A, true);
+  await runActivity(acts.ingestFile, [await drop('back.jpg', JPEG_A)], { runId: 'r1' });
+  await pool.query(`UPDATE contents SET state = 'HASHED' WHERE sha256 = $1`, [sha]);
+  const r = await runActivity(acts.ingestFile, [await drop('more.jpg', JPEG_A)], { runId: 'r2' });
+  expect([r.state, r.kind]).toEqual(['COPY', null]);
+});

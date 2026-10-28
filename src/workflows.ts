@@ -177,10 +177,13 @@ export async function FileWorkflow(
 ): Promise<string> {
   const r = await ingestFile(ref);
   if (r.state === 'COPY' && patched('reclaim-copy')) await reclaimCopy(r.fileId);
-  if (r.state !== 'INGESTED' || r.kind !== 'still') return r.state;
+  // A COPY with a kind is a copy of a content restored from PURGED (purge spec §9): its content
+  // steps run here. Histories before this never had a COPY with a kind, so never reach the patch.
+  const restored = r.state === 'COPY' && r.kind === 'still' && patched('restored-copy');
+  if (!restored && (r.state !== 'INGESTED' || r.kind !== 'still')) return r.state;
   if (r.sha256 === null || r.ext === null)
     throw ApplicationFailure.nonRetryable(
-      `ingest of ${ref.relPath} returned an INGESTED still without sha256/ext`,
+      `ingest of ${ref.relPath} returned a ${r.state} still without sha256/ext`,
       'UnexpectedState',
     );
   return runContentSteps(r.sha256, r.ext, opts.poisonAttempts ?? DEFAULT_POISON_ATTEMPTS);

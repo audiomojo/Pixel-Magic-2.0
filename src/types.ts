@@ -10,7 +10,11 @@ export interface IngestResult {
   sha256: string | null;
   ext: string | null;
   state: 'INGESTED' | 'COPY' | 'QUARANTINED' | 'BLOCKED';
-  /** The owned content's kind; null for COPY (owns no content), QUARANTINED and BLOCKED. */
+  /**
+   * The owned content's kind; null for QUARANTINED, BLOCKED and a COPY (owns no content) — except
+   * a COPY of a content restored from PURGED and not yet hashed, which carries its kind so the
+   * FileWorkflow runs the content steps.
+   */
   kind: 'still' | 'motion' | 'other' | null;
 }
 
