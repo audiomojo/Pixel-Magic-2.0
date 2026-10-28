@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import {
   copyIfTightSummary,
   duplicateFamilyFindings,
+  unexpectedDuplicateFindings,
   resolveCopyIfTight,
   TIGHT_BY_CONSTRUCTION,
   type FamilyMember,
@@ -83,4 +84,19 @@ test('a pixel-identical family that was not retired as expected is reported', ()
       null,
     ),
   ).toEqual(['identical family [S.JPG, synth-meta]: expected one survivor, found 0 ()']);
+});
+
+test('a DUPLICATE content outside every expected identical family is a finding (a false retire)', () => {
+  const contents = [
+    { sha256: 's', state: 'CLUSTERED', duplicateOf: null },
+    { sha256: 'm', state: 'DUPLICATE', duplicateOf: 's' }, // an expected family's retirement
+    { sha256: 'c', state: 'DUPLICATE', duplicateOf: 's' }, // a corpus content nobody expected
+    { sha256: 'd', state: 'CLUSTERED', duplicateOf: null },
+  ];
+  const at = (sha: string) => (sha === 'c' ? 'IMG_1.JPG' : sha);
+  expect(unexpectedDuplicateFindings(contents, new Set(['s', 'm']), at)).toEqual([
+    'IMG_1.JPG: DUPLICATE of s, but in no expected identical family',
+  ]);
+  // Only expected retirements: nothing to report.
+  expect(unexpectedDuplicateFindings(contents.slice(0, 2), new Set(['s', 'm']), at)).toEqual([]);
 });

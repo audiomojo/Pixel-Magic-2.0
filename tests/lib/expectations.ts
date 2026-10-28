@@ -36,14 +36,25 @@ function contentOf(w: World, sha: string): ContentRow {
   return c;
 }
 
-/** A retired duplicate stands for its keeper: same picture, so same groups (spec §6 picks). */
-function standIn(w: World, sha: string): string {
+/**
+ * A retired duplicate stands for its keeper (same picture, so same groups, spec §6 picks), but
+ * only when `expected` holds it: a member of an expected identical family. Any other retired
+ * content is a finding of its own and must never borrow its keeper's groups.
+ */
+function standIn(w: World, sha: string, expected: ReadonlySet<string>): string {
   const c = w.contents.get(sha);
-  return c?.state === 'DUPLICATE' && c.duplicateOf !== null ? c.duplicateOf : sha;
+  return expected.has(sha) && c?.state === 'DUPLICATE' && c.duplicateOf !== null
+    ? c.duplicateOf
+    : sha;
 }
 
-function sameGroup(w: World, x: string, y: string): boolean {
-  const [a, b] = [standIn(w, x), standIn(w, y)];
+function sameGroup(
+  w: World,
+  x: string,
+  y: string,
+  expected: ReadonlySet<string> = new Set(),
+): boolean {
+  const [a, b] = [standIn(w, x, expected), standIn(w, y, expected)];
   if (a === b) return true;
   const ga = contentOf(w, a).copyGroup;
   return ga !== null && ga === contentOf(w, b).copyGroup;
@@ -215,6 +226,24 @@ export function duplicateFamilyFindings(members: FamilyMember[], keeper: string 
   return out;
 }
 
+/**
+ * Every DUPLICATE content that is not a member of an expected identical family: a retirement no
+ * ground truth predicts, i.e. a possible false retire (the harmful failure). `at` names it.
+ */
+export function unexpectedDuplicateFindings(
+  contents: Iterable<{ sha256: string; state: string; duplicateOf: string | null }>,
+  expected: ReadonlySet<string>,
+  at: (sha: string) => string,
+): string[] {
+  const out: string[] = [];
+  for (const c of contents)
+    if (c.state === 'DUPLICATE' && !expected.has(c.sha256))
+      out.push(
+        `${at(c.sha256)}: DUPLICATE of ${String(c.duplicateOf)}, but in no expected identical family`,
+      );
+  return out.sort();
+}
+
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
 const sha8 = (s: string) => s.slice(0, 8);
 
@@ -289,7 +318,9 @@ export async function diffExpectations(
     seeded.filter((f) => f.origin === 'corpus').map((f) => [f.name, f.sha256]),
   );
   const group = (sha: string) => w.contents.get(sha)?.copyGroup ?? null;
-  const same = (a: string, b: string) => sameGroup(w, a, b);
+  /** Contents of the expected identical families (filled below, before any `same` call). */
+  const expectedMembers = new Set<string>();
+  const same = (a: string, b: string) => sameGroup(w, a, b, expectedMembers);
   /** The pair's stored hash distances, or null when either lacks hashes. */
   const distance = (a: string, b: string): { p: number; d: number } | null => {
     const [x, y] = [w.contents.get(a), w.contents.get(b)];
@@ -343,17 +374,22 @@ export async function diffExpectations(
           ? seedFile.sha256
           : (variants.find((v) => v.relPath === keeper)?.sha256 ?? keeper);
     out.push(...duplicateFamilyFindings(members, keeperSha));
+    for (const m of members) expectedMembers.add(m.sha256);
     retired += members.filter((m) => m.state === 'DUPLICATE').length;
   }
-  const corpusShas = new Set(seeded.filter((f) => f.origin === 'corpus').map((f) => f.sha256));
-  const corpusRetired = [...w.contents.values()].filter(
-    (c) => c.state === 'DUPLICATE' && corpusShas.has(c.sha256),
-  ).length;
+  const namesOf = new Map<string, string[]>();
+  for (const f of seeded) namesOf.set(f.sha256, [...(namesOf.get(f.sha256) ?? []), f.relPath]);
+  const unexpected = unexpectedDuplicateFindings(
+    w.contents.values(),
+    expectedMembers,
+    (sha) => namesOf.get(sha)?.join(', ') ?? `content ${sha8(sha)}`,
+  );
+  out.push(...unexpected);
   // Printed even when the test passes (vitest shows `console` output of failing tests only).
   process.stdout.write(
     `duplicate: ${String(families.size)} identical families expected ` +
       `(${String([...families.values()].flat().length)} variants), ${String(retired)} members retired; ` +
-      `${String(corpusRetired)} corpus contents retired in all; ` +
+      `${String(unexpected.length)} retired outside them; ` +
       `${String(seeded.filter((f) => f.missedIdentical).length)} pixel-identical variants with ` +
       `another suspect key (never compared, kept as today)\n`,
   );
@@ -386,7 +422,7 @@ export async function diffExpectations(
       // Within the look-alike distances by construction: always in the seed's similar set. Its
       // copy group only through another variant of the same seed that is a copy of both (an
       // EXIF-less re-encode bridging them, spec §6.3 transitive union).
-      const sc = w.contents.get(standIn(w, s));
+      const sc = w.contents.get(standIn(w, s, expectedMembers));
       if (!same(v.sha256, s) && (c.similarSet === null || c.similarSet !== sc?.similarSet))
         out.push(`${v.relPath}: expected similar to ${String(v.seedName)}, not in its similar set`);
       const bridged = seeded.some(
