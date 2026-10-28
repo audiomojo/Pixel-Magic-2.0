@@ -40,21 +40,34 @@ export async function currentShown(c: Db, setId: string): Promise<string[]> {
 }
 
 /**
- * The closure's rows: stills of every copy group of the set (and of groups merged into one,
- * transitively) in `stillStates`, plus `kind = 'motion'` contents sharing a Live Photo id with
- * one of those stills, in `motionStates`.
+ * The root copy groups of `shown` (following `merged_into` up) and every group merged into one
+ * of them (following it down): "the shown stills' copy groups". A SQL prefix for `WITH RECURSIVE`.
+ */
+const SHOWN_GROUPS = `up(id, parent) AS (
+       SELECT g.id, g.merged_into FROM groups g
+        WHERE g.id IN (SELECT copy_group_id FROM contents WHERE sha256 = ANY($1::text[]))
+        UNION
+       SELECT x.id, x.merged_into FROM groups x JOIN up ON x.id = up.parent),
+     g(id) AS (
+       SELECT id FROM up WHERE parent IS NULL
+        UNION
+       SELECT x.id FROM groups x JOIN g ON x.merged_into = g.id)`;
+
+/**
+ * The closure's rows (R6): stills of the copy groups of the shown stills (their hidden lesser
+ * copies, groups merged into them included) in `stillStates`, plus `kind = 'motion'` contents
+ * sharing a Live Photo id with one of those stills, in `motionStates`. A copy group of the set
+ * the Picks screen never showed (an undescribed candidate, a group linked after staging) is not
+ * in it.
  */
 async function closureRows(
   c: Db,
-  setId: string,
+  shown: string[],
   stillStates: string[],
   motionStates: string[],
 ): Promise<{ sha256: string; kind: string; size_bytes: bigint }[]> {
   const r = await c.query<{ sha256: string; kind: string; size_bytes: bigint }>(
-    `WITH RECURSIVE g(id) AS (
-       SELECT id FROM groups WHERE similar_set_id = $1
-        UNION
-       SELECT x.id FROM groups x JOIN g ON x.merged_into = g.id),
+    `WITH RECURSIVE ${SHOWN_GROUPS},
      stills AS (
        SELECT c.sha256, c.kind, c.size_bytes, c.live_content_id FROM contents c
         WHERE c.copy_group_id IN (SELECT id FROM g) AND c.kind <> 'motion'
@@ -66,9 +79,29 @@ async function closureRows(
         AND m.live_content_id IN (SELECT live_content_id FROM stills
                                    WHERE live_content_id IS NOT NULL)
       ORDER BY sha256`,
-    [setId, stillStates, motionStates],
+    [shown, stillStates, motionStates],
   );
   return r.rows;
+}
+
+/**
+ * True when every `shown` sha is a HASHED/CLUSTERED still whose root copy group belongs to the
+ * set now. False means the set changed since staging recorded the candidates (a set merge, a
+ * group moved, a content quarantined), so a purge or preview would not be what was shown.
+ */
+async function shownInSet(c: Db, setId: string, shown: string[]): Promise<boolean> {
+  const r = await c.query<{ n: number }>(
+    `WITH RECURSIVE up(sha256, id, parent) AS (
+       SELECT c.sha256, g.id, g.merged_into FROM contents c JOIN groups g ON g.id = c.copy_group_id
+        WHERE c.sha256 = ANY($1::text[]) AND c.kind <> 'motion'
+          AND c.state IN ('HASHED', 'CLUSTERED')
+        UNION
+       SELECT up.sha256, x.id, x.merged_into FROM groups x JOIN up ON x.id = up.parent)
+     SELECT count(DISTINCT up.sha256)::int AS n FROM up JOIN groups r ON r.id = up.id
+      WHERE up.parent IS NULL AND r.similar_set_id = $2`,
+    [shown, setId],
+  );
+  return r.rows[0]!.n === new Set(shown).size;
 }
 
 function summarize(
@@ -91,9 +124,18 @@ const LIVE_STATES = ['HASHED', 'CLUSTERED'];
 /** Any motion not already purged (motions never go past INGESTED; DUPLICATE is stills only). */
 const LIVE_MOTION_STATES = ['INGESTED', 'HASHED', 'CLUSTERED', 'QUARANTINED', 'FAILED'];
 
-/** The set's purge closure, from the current database (never from client input). */
-export async function purgeClosure(c: Db, setId: string, shown: string[]): Promise<PurgeSummary> {
-  return summarize(await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES), shown);
+/**
+ * The set's purge closure, from the current database: the copy groups of `shown` (which the
+ * caller has checked against `currentShown`). `'stale'` when a shown sha is no longer a live
+ * still in a copy group of the set.
+ */
+export async function purgeClosure(
+  c: Db,
+  setId: string,
+  shown: string[],
+): Promise<PurgeSummary | 'stale'> {
+  if (shown.length === 0 || !(await shownInSet(c, setId, shown))) return 'stale';
+  return summarize(await closureRows(c, shown, LIVE_STATES, LIVE_MOTION_STATES), shown);
 }
 
 const sameList = (a: string[], b: string[]): boolean =>
@@ -121,7 +163,7 @@ export async function purgeSet(
       [want],
     );
     if (states.rows[0]!.n === want.length)
-      return summarize(await closureRows(c, setId, ['PURGED'], ['PURGED']), want);
+      return summarize(await closureRows(c, want, ['PURGED'], ['PURGED']), want);
     // Lock order purge-set → pm.cluster → rows (dedupe: suspect key → pm.cluster → rows;
     // clusterContent: pm.cluster → rows), so none of them deadlock. Holding pm.cluster keeps a
     // concurrent cluster step from committing a cache that still holds a purged row, and the
@@ -129,14 +171,17 @@ export async function purgeSet(
     // `retireFamily`): both are read after it is taken, so what is purged is what was shown.
     await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
     if (!sameList(await currentShown(c, setId), want)) return 'stale';
-    const rows = await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES);
+    // The candidates are staging's snapshot; the groups are now. Every shown sha must still be a
+    // live still in a group of the set, or the closure would differ from what was shown.
+    if (!(await shownInSet(c, setId, want))) return 'stale';
+    const rows = await closureRows(c, want, LIVE_STATES, LIVE_MOTION_STATES);
     const shas = rows.map((r) => r.sha256);
     await c.query(
       'SELECT 1 FROM contents WHERE sha256 = ANY($1::text[]) ORDER BY sha256 FOR UPDATE',
       [shas],
     );
     // Under the row locks: the closure as it is now (a concurrent step may have moved a row).
-    const locked = await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES);
+    const locked = await closureRows(c, want, LIVE_STATES, LIVE_MOTION_STATES);
     const lockedShas = locked.map((r) => r.sha256);
     if (!sameList(lockedShas, shas)) return 'stale';
     const upd = await c.query<{ was: string }>(

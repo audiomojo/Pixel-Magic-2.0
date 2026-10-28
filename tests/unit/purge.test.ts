@@ -117,6 +117,7 @@ test('currentShown: described, not failed, not PURGED/DUPLICATE, ascending', asy
 test('closure: hidden copies, a merged group, the Live video; not other sets or DUPLICATEs', async () => {
   await seed();
   const s = await purgeClosure(pool, SET, [sha('a'), sha('b')]);
+  if (s === 'stale') throw new Error('stale');
   expect(s.shas).toEqual([sha('a'), sha('b'), sha('c'), sha('d'), MOTION].sort());
   expect(s).toMatchObject({
     shown: 2,
@@ -299,4 +300,74 @@ test('a set that changes while purge waits on pm.cluster is stale; nothing is pu
   } finally {
     holder.release();
   }
+});
+
+// R6: the closure is the copy groups of the shown candidates only; a group of the set the
+// Picks screen never showed (an undescribed candidate, or a group linked after staging) is
+// neither counted nor purged.
+test('an undescribed candidate of the set is not in the closure and survives the purge', async () => {
+  await seed();
+  await group(4, SET);
+  await content(sha('9'), { group: 4, candidateOf: SET, described: false, size: 111 });
+  await content(sha('5'), { group: 4, state: 'HASHED', size: 222 });
+  const preview = await purgeClosure(pool, SET, [sha('a'), sha('b')]);
+  expect(preview).not.toBe('stale');
+  if (preview === 'stale') return;
+  expect(preview.shas).not.toContain(sha('9'));
+  expect(preview).toMatchObject({ shown: 2, copies: 2, live: 1 });
+  const s = await purgeSet(pool, SET, [sha('a'), sha('b')]);
+  expect(s).not.toBe('stale');
+  if (s === 'stale') return;
+  expect(s.shas).toEqual(preview.shas);
+  const left = await pool.query<{ sha256: string; state: string }>(
+    'SELECT sha256, state FROM contents WHERE sha256 = ANY($1::text[]) ORDER BY sha256',
+    [[sha('9'), sha('5')]],
+  );
+  expect(left.rows.map((r) => r.state)).toEqual(['HASHED', 'CLUSTERED']);
+  expect((await pool.query('SELECT 1 FROM purged WHERE sha256 = $1', [sha('9')])).rowCount).toBe(0);
+  // The repeat (idempotent path) still reports the same closure.
+  expect(await purgeSet(pool, SET, [sha('a'), sha('b')])).toEqual(s);
+});
+
+test('a copy group linked to the set after staging is not in the closure', async () => {
+  await seed();
+  // Linked by a cluster step after the last staging build: no similar_candidates row.
+  await group(5, SET);
+  await content(sha('0'), { group: 5, size: 999 });
+  const s = await purgeSet(pool, SET, [sha('a'), sha('b')]);
+  expect(s).not.toBe('stale');
+  if (s === 'stale') return;
+  expect(s.shas).not.toContain(sha('0'));
+  expect(s).toMatchObject({ shown: 2, copies: 2, live: 1 });
+  const r = await pool.query<{ state: string }>('SELECT state FROM contents WHERE sha256 = $1', [
+    sha('0'),
+  ]);
+  expect(r.rows[0]!.state).toBe('CLUSTERED');
+});
+
+test('stale when a shown sha is no longer in a copy group of the set', async () => {
+  await seed();
+  // A cluster step moved b's group to the other set after staging.
+  await pool.query('UPDATE groups SET similar_set_id = $1 WHERE id = 2', [OTHER_SET]);
+  expect(await purgeClosure(pool, SET, [sha('a'), sha('b')])).toBe('stale');
+  expect(await purgeSet(pool, SET, [sha('a'), sha('b')])).toBe('stale');
+  expect((await pool.query("SELECT 1 FROM contents WHERE state = 'PURGED'")).rowCount).toBe(0);
+});
+
+test('stale when a shown sha is not HASHED/CLUSTERED', async () => {
+  await seed();
+  await pool.query(`UPDATE contents SET state = 'QUARANTINED' WHERE sha256 = $1`, [sha('b')]);
+  expect(await purgeSet(pool, SET, [sha('a'), sha('b')])).toBe('stale');
+  expect((await pool.query("SELECT 1 FROM contents WHERE state = 'PURGED'")).rowCount).toBe(0);
+});
+
+test('a shown still whose group was merged into another set group takes the whole root group', async () => {
+  await seed();
+  // b sits in group 6, which was merged into group 2 (a legacy non-root copy_group_id).
+  await group(6, null, 2);
+  await pool.query('UPDATE contents SET copy_group_id = 6 WHERE sha256 = $1', [sha('b')]);
+  const s = await purgeClosure(pool, SET, [sha('a'), sha('b')]);
+  expect(s).not.toBe('stale');
+  if (s === 'stale') return;
+  expect(s.shas).toEqual([sha('a'), sha('b'), sha('c'), sha('d'), MOTION].sort());
 });

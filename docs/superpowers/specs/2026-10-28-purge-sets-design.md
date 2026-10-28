@@ -22,10 +22,13 @@ purges.
 
 ## 3. Definitions
 
-- **Purge closure of a set:** every content in a copy group whose `similar_set_id` is the set
-  (the shown candidates and their hidden lesser copies; groups merged into another follow
-  `merged_into`), plus each such still's Live Photo video
-  (`live_content_id`). Computed on the server from the current database, never from client input.
+- **Purge closure of a set:** the copy groups of the shown candidates (shown stills and their
+  hidden lesser copies; groups merged into them per `merged_into`) plus Live motions of those
+  stills (`live_content_id`). A copy group of the set that was never shown (an undescribed
+  candidate, a group linked to the set after the last staging build) is not in it. Computed on the
+  server from the current database; the shown list from the token only names which groups, and a
+  purge is refused as stale when a shown sha is no longer a `HASHED`/`CLUSTERED` still in a copy
+  group of the set.
 - **Blocked sha:** a `purged` row with `unblocked_at IS NULL`.
 
 ## 4. Data model — migration `0011_purge.sql`

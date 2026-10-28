@@ -189,27 +189,44 @@ test('purged set leaves the vault and stays out, also after a wiped block list',
     const held = pairs.filter((p) => has.has(p.v.sha256) && has.has(p.seed));
     if (held.length === 0) continue;
     const preview = await purgeClosure(pool, s.set_id, s.shas);
+    if (preview === 'stale') throw new Error(`set ${s.set_id}: stale`);
+    // A candidate outside the held pairs can stay undescribed (not shown) while two or more
+    // are shown: it must survive the purge (R6, the closure is the shown copy groups only).
+    const pairShas = new Set(held.flatMap((p) => [p.v.sha256, p.seed]));
+    const spare = s.shas.length >= 3 ? s.shas.find((sha) => !pairShas.has(sha)) : undefined;
     const score =
+      (spare !== undefined ? 8 : 0) +
       (preview.live > 0 ? 4 : 0) +
       (held.some((p) => p.v.expect === 'similar') ? 2 : 0) +
       (preview.copies > 0 ? 1 : 0);
-    ranked.push({ setId: s.set_id, candidates: s.shas, score, live: preview.live > 0 });
+    ranked.push({ setId: s.set_id, candidates: s.shas, score, live: preview.live > 0, spare });
   }
   expect(ranked.length, 'no similar set holds a synthetic variant and its seed').toBeGreaterThan(0);
   const chosen = ranked.sort((a, b) => b.score - a.score)[0]!;
   // The AI worker (not part of the stack) describes candidates; the Picks screen shows only
-  // described ones. Stand in for it on this set.
+  // described ones. Stand in for it on this set, leaving the spare candidate (if any) undescribed.
+  const described = chosen.candidates.filter((sha) => sha !== chosen.spare);
   await pool.query(
     `INSERT INTO photo_features (sha256, feature_version, embedding, quality, faces)
      SELECT unnest($1::text[]), 1, '{}'::real[], '{}'::jsonb, '[]'::jsonb
      ON CONFLICT DO NOTHING`,
-    [chosen.candidates],
+    [described],
   );
   const shown = await currentShown(pool, chosen.setId);
-  expect(shown).toEqual(chosen.candidates);
+  expect(shown).toEqual(described);
+  const spareState = async (): Promise<string | undefined> =>
+    chosen.spare === undefined
+      ? undefined
+      : (
+          await pool.query<{ state: string }>('SELECT state FROM contents WHERE sha256 = $1', [
+            chosen.spare,
+          ])
+        ).rows[0]?.state;
+  const spareBefore = await spareState();
 
   // Keep the closure's bytes to drop them again later (synthetic variants exist nowhere else).
   const preview = await purgeClosure(pool, chosen.setId, shown);
+  if (preview === 'stale') throw new Error(`set ${chosen.setId}: stale`);
   const saved = join(run.dataDir, 'purge-e2e', 'bytes');
   await mkdir(saved, { recursive: true });
   const before = await vaultFiles(run.dataDir);
@@ -222,8 +239,11 @@ test('purged set leaves the vault and stays out, also after a wiped block list',
   process.stdout.write(
     `purge: set ${chosen.setId}, ${String(summary.shown)} shown, ${String(summary.copies)} ` +
       `copies, ${String(summary.live)} live, ${String(summary.bytes)} bytes ` +
-      `(of ${String(ranked.length)} eligible sets, ${String(ranked.filter((r) => r.live).length)} with a Live video)\n`,
+      `(of ${String(ranked.length)} eligible sets, ${String(ranked.filter((r) => r.live).length)} with a Live video, ` +
+      `${String(ranked.filter((r) => r.spare !== undefined).length)} with a spare candidate; ` +
+      `undescribed spare: ${chosen.spare ?? 'none'})\n`,
   );
+  if (chosen.spare !== undefined) expect(purged.has(chosen.spare), 'spare purged').toBe(false);
   expect(summary.shas).toEqual(preview.shas);
   expect(summary.shown).toBe(shown.length);
   for (const sha of shown) expect(purged.has(sha), sha).toBe(true);
@@ -246,6 +266,11 @@ test('purged set leaves the vault and stays out, also after a wiped block list',
 
   const vault = await vaultFiles(run.dataDir);
   expect(summary.shas.filter((sha) => vault.has(sha))).toEqual([]);
+  // The undescribed candidate was never shown: still in the vault, state unchanged.
+  if (chosen.spare !== undefined) {
+    expect(vault.has(chosen.spare), 'spare left the vault').toBe(true);
+    expect(await spareState()).toBe(spareBefore);
+  }
   const staged = await stagedEntries(run.dataDir);
   expect(staged.filter((e) => purged.has(e.sha256))).toEqual([]);
   const csv = await readFile(purgeLogPath(run.dataDir), 'utf8');

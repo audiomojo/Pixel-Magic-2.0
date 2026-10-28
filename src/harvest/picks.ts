@@ -449,6 +449,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     if (!sameList(await currentShown(pool, t.setId), t.shown))
       throw new HttpError(409, 'set changed');
     const s = await purgeClosure(pool, t.setId, t.shown);
+    if (s === 'stale') throw new HttpError(409, 'set changed');
     return { shown: s.shown, copies: s.copies, live: s.live, bytes: Number(s.bytes) };
   }
 

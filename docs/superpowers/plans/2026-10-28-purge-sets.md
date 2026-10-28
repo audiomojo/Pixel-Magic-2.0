@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Blocking is by exact sha256 (+ size) only — never by name or look-alike.
-- Purge closure = contents in `HASHED`/`CLUSTERED` of every copy group whose `groups.similar_set_id` is the set, plus `kind = 'motion'` contents sharing a non-null `live_content_id` with a closure still. Computed on the server, never from client-supplied shas.
+- Purge closure = the copy groups of the shown candidates (shown stills and their hidden lesser copies in `HASHED`/`CLUSTERED`; groups merged into them per `merged_into`) plus Live motions of those stills (`kind = 'motion'` contents sharing a non-null `live_content_id` with a closure still). Computed on the server; the token's shown list only selects the groups, and a shown sha that is not a `HASHED`/`CLUSTERED` still in a copy group of the set makes the purge stale.
 - A purge is refused (HTTP 409 `set changed`) when the set's current shown candidates (described, not `PURGED`, not `DUPLICATE`) differ from the token's `shown`.
 - A purge is not a pick: no `picks` row, no change to today's count, no training trigger.
 - No vault file is unlinked unless nlink is 1 and a fresh sha256 equals `contents.sha256`; mismatch → `purge_mismatch = true`, file kept.
