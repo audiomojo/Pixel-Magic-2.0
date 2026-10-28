@@ -337,6 +337,17 @@ describe('GET /api/picks/next', () => {
     expect((await e.get('/api/picks/next')).json.set).toBeNull();
   });
 
+  test('a set fully covered by a pick (no retirement) is not offered again', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await pickRow({ setId: 1, chosen: A, shown: [A, B] });
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+    // the same for a no-clear-best pick, which compares the whole shown list
+    await set(2, [C, D]);
+    await pickRow({ setId: 2, chosen: null, shown: [C, D] });
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
   /** Retires `loser` into `keeper` (the row only; the pick API reads rows). */
   async function retire(loser: string, keeper: string): Promise<void> {
     await pgh.pool.query(

@@ -227,15 +227,19 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     const covering = await pool.query<{ set_id: string; shown: string[] }>(
       `WITH rp AS (
          SELECT p.id, p.decided_at, p.no_clear_best,
-                coalesce(cc.duplicate_of, p.chosen_sha256) AS chosen,
-                ARRAY(SELECT DISTINCT coalesce(c.duplicate_of, s.sha)
+                coalesce(cc.duplicate_of::text, p.chosen_sha256) AS chosen,
+                ARRAY(SELECT DISTINCT coalesce(c.duplicate_of::text, s.sha)
                         FROM unnest(p.shown_sha256) AS s(sha)
                         LEFT JOIN contents c ON c.sha256 = s.sha) AS shown
-           FROM picks p LEFT JOIN contents cc ON cc.sha256 = p.chosen_sha256)
-       SELECT DISTINCT ON (sc.set_id) sc.set_id::text AS set_id, rp.shown
-         FROM rp JOIN similar_candidates sc
-           ON sc.sha256 = rp.chosen OR (rp.no_clear_best AND sc.sha256 = ANY (rp.shown))
-        ORDER BY sc.set_id, rp.decided_at DESC, rp.id DESC`,
+           FROM picks p LEFT JOIN contents cc ON cc.sha256 = p.chosen_sha256),
+       hit AS (
+         SELECT rp.chosen AS sha, rp.id, rp.decided_at, rp.shown FROM rp
+          UNION ALL
+         SELECT u.sha, rp.id, rp.decided_at, rp.shown
+           FROM rp CROSS JOIN LATERAL unnest(rp.shown) AS u(sha) WHERE rp.no_clear_best)
+       SELECT DISTINCT ON (sc.set_id) sc.set_id::text AS set_id, hit.shown
+         FROM hit JOIN similar_candidates sc ON sc.sha256 = hit.sha
+        ORDER BY sc.set_id, hit.decided_at DESC, hit.id DESC`,
     );
     const lastShown = new Map(covering.rows.map((r) => [r.set_id, r.shown]));
     // Eligible: two or more described candidates, and never picked, or picked when the set
