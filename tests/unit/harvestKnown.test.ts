@@ -525,6 +525,42 @@ describe('checkKnown', () => {
     expect((await ck(await add(data))).state).toBe('SEND');
   });
 
+  test('a SENT candidate whose bytes are a PURGED content is no winner (an unblock re-sends)', async () => {
+    const { add, addContent, block, purgeContent, ck } = await setup();
+    const data = bytes(200 * KIB, 15);
+    // The photo was sent, ingested and linked, then purged and unblocked.
+    const linked = await add(data, { state: 'SENT', copy: false });
+    const f = await pgh.pool.query<{ id: string }>(
+      `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, state, sha256)
+       VALUES ('harvest/Drive/p.jpg', 'p.jpg', $1, 1, 'INGESTED', $2) RETURNING id::text AS id`,
+      [data.length, sha(data)],
+    );
+    await pgh.pool.query('UPDATE harvest_items SET file_id = $2 WHERE id = $1', [
+      linked.id,
+      f.rows[0]!.id,
+    ]);
+    await addContent(data);
+    await purgeContent(data);
+    await block(data, true);
+    const first = await add(data);
+    expect((await ck(first)).state).toBe('SEND');
+    await pgh.pool.query(`UPDATE harvest_items SET state = 'FAILED' WHERE id = $1`, [first.id]);
+    // An unlinked SENT item with its sha stored: also no winner.
+    await pgh.pool.query('UPDATE harvest_items SET file_id = NULL, sha256 = $2 WHERE id = $1', [
+      linked.id,
+      sha(data),
+    ]);
+    const second = await add(data);
+    expect((await ck(second)).state).toBe('SEND');
+    await pgh.pool.query(`UPDATE harvest_items SET state = 'FAILED' WHERE id = $1`, [second.id]);
+    // Re-sent after the purge (the unblocked photo is on its way back): a winner again.
+    await pgh.pool.query(
+      `UPDATE harvest_items SET sent_at = now() + interval '1 second' WHERE id = $1`,
+      [linked.id],
+    );
+    expect(await ck(await add(data))).toMatchObject({ state: 'DUP', duplicateOf: linked.id });
+  });
+
   // ---- I2 (b): a PLANNED candidate is read only while it is still the scanned file ---------
   test('a PLANNED candidate edited in place (same size, new mtime) is not hashed: SEND', async () => {
     const { add, root, row, ck } = await setup();

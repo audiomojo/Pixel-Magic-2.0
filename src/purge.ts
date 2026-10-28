@@ -210,9 +210,13 @@ export async function purgeSet(
 }
 
 /**
- * Unblocks these shas (spec §9): `unblocked_at = now()` where currently blocked, and their
- * harvest ledger items in KNOWN/BLOCKED go back to PLANNED so the next run sends them. Returns
- * the number of `purged` rows unblocked.
+ * Unblocks these shas (spec §9): `unblocked_at = now()` where currently blocked. The harvest
+ * ledger items of every sha that is unblocked now (not of other shas passed) go back to PLANNED
+ * so the next run sends them: KNOWN/BLOCKED ones, and SENT ones sent before the (still `PURGED`)
+ * content was purged — their copy was purged, and a SENT item would otherwise stay SENT through
+ * rescans and make every other copy settle as its DUP. One re-sent since is left alone. A re-planned SENT item
+ * forgets its drop-zone copy and link (`sendItem` would otherwise take the old copy's `files`
+ * row as already published). Returns the number of `purged` rows unblocked.
  */
 export async function unblock(pool: pg.Pool, shas: string[]): Promise<number> {
   return withTx(pool, async (c) => {
@@ -221,10 +225,29 @@ export async function unblock(pool: pg.Pool, shas: string[]): Promise<number> {
         WHERE sha256 = ANY($1::text[]) AND unblocked_at IS NULL`,
       [shas],
     );
+    const open = (
+      await c.query<{ sha256: string }>(
+        `SELECT sha256 FROM purged WHERE sha256 = ANY($1::text[]) AND unblocked_at IS NOT NULL`,
+        [shas],
+      )
+    ).rows.map((x) => x.sha256);
+    if (open.length === 0) return r.rowCount ?? 0;
     await c.query(
       `UPDATE harvest_items SET state = 'PLANNED'
         WHERE sha256 = ANY($1::text[]) AND state IN ('KNOWN', 'BLOCKED')`,
-      [shas],
+      [open],
+    );
+    await c.query(
+      `UPDATE harvest_items i
+          SET state = 'PLANNED', file_id = NULL, dropzone_path = NULL, dropzone_mtime_ns = NULL,
+              sent_at = NULL, attempts = 0, last_error = NULL
+        WHERE i.state = 'SENT'
+          AND EXISTS (SELECT 1 FROM contents c
+                       WHERE c.sha256 = COALESCE(i.sha256,
+                               (SELECT f.sha256 FROM files f WHERE f.id = i.file_id))
+                         AND c.sha256 = ANY($1::text[]) AND c.state = 'PURGED'
+                         AND (i.sent_at IS NULL OR i.sent_at <= c.purged_at))`,
+      [open],
     );
     return r.rowCount ?? 0;
   });

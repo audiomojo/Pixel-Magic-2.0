@@ -27,6 +27,7 @@ import {
 } from '../../src/harvest/send.js';
 import { registerSources, type SystemProbe } from '../../src/harvest/sources.js';
 import { DataLayout } from '../../src/fsops.js';
+import { unblock } from '../../src/purge.js';
 import { runActivity } from '../helpers/activityEnv.js';
 import { tmpIsCaseInsensitive } from '../helpers/layout.js';
 import { tmpDir } from '../helpers/layout.js';
@@ -953,6 +954,49 @@ describe('known content', () => {
     expect(stored.rows[0]!.sha256).toBe(sha(bad));
     expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/b.cr2']);
     expect(await counters(e.runId)).toMatchObject({ sent: 1, blocked: 1, known: 0 });
+  });
+
+  test('harvest, ingest, purge, unblock: the next harvest sends the photo again (I2)', async () => {
+    const photo = randomBytes(2000);
+    const e = await setup({ 'DCIM/a.cr2': photo, 'DCIM/b.cr2': photo }, { lock: false });
+    expect(await e.send()).toMatchObject({ sent: 1, dups: 1 });
+    const a = await item('DCIM/a.cr2');
+    // The pipeline ingests the copy (consuming it from the drop zone) and the run links it.
+    await pgh.pool.query(
+      `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, state, sha256)
+       VALUES ($1, 'a.cr2', 2000, $2, 'INGESTED', $3)`,
+      [a.dropzone_path, a.dropzone_mtime_ns, sha(photo)],
+    );
+    await pgh.pool.query(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state) VALUES ($1, 'cr2', 'still', 2000, 'INGESTED')`,
+      [sha(photo)],
+    );
+    await fsp.rm(join(e.dz, a.dropzone_path!));
+    expect(await linkFiles(pgh.pool)).toBe(1);
+    // Purged: the content is gone from the vault and its bytes are blocked.
+    await pgh.pool.query(
+      `UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`,
+      [sha(photo)],
+    );
+    await pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 2000, '{a.cr2}', now())`,
+      [sha(photo)],
+    );
+    // A third copy turns up on the source: blocked.
+    await writeFile(join(e.root, 'DCIM/c.cr2'), photo);
+    await e.rerun();
+    expect(await e.send()).toMatchObject({ sent: 0, blocked: 1 });
+    expect((await item('DCIM/c.cr2')).state).toBe('BLOCKED');
+    expect(await listDz(e.dz)).toEqual([]);
+
+    await unblock(pgh.pool, [sha(photo)]);
+    await e.rerun();
+    expect(await e.send()).toMatchObject({ sent: 1, dups: 1, blocked: 0, known: 0 });
+    const again = await item('DCIM/a.cr2');
+    expect(again).toMatchObject({ state: 'SENT', file_id: null });
+    expect((await item('DCIM/c.cr2')).state).toBe('DUP');
+    expect(await listDz(e.dz)).toEqual([again.dropzone_path]);
+    expect(await readFile(join(e.dz, again.dropzone_path!))).toEqual(photo);
   });
 
   test('every decision (sent, known, dup) records decided_at for the dashboard rate', async () => {

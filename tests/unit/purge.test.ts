@@ -196,37 +196,113 @@ test('a purge after an unblock re-blocks: purged_at renewed, unblocked_at cleare
   expect(r.purged_at.getFullYear()).toBeGreaterThan(2020);
 });
 
-test('unblock sets unblocked_at and resets KNOWN/BLOCKED ledger items to PLANNED', async () => {
+test('unblock sets unblocked_at, re-plans KNOWN/BLOCKED items and the SENT ones of a purged content', async () => {
   await seed();
   await purgeSet(pool, SET, [sha('a'), sha('b')]);
   await pool.query(`INSERT INTO harvest_sources (id, identity, label) VALUES (1, 'u', 's')`);
-  const item = async (path: string, state: string, s: string) =>
+  const file = await pool.query<{ id: string }>(
+    `SELECT id::text AS id FROM files WHERE sha256 = $1 LIMIT 1`,
+    [sha('a')],
+  );
+  const item = async (
+    path: string,
+    state: string,
+    s: string | null,
+    fileId: string | null = null,
+    sentAt = new Date('2020-01-01'),
+  ) =>
     pool.query(
-      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state, sha256)
-       VALUES (1, $1, $1, 1, 1, 'photo', $2, $3)`,
-      [path, state, s],
+      `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state,
+                                  sha256, file_id, dropzone_path, dropzone_mtime_ns, sent_at,
+                                  attempts, last_error)
+       VALUES (1, $1, $1, 1, 1, 'photo', $2, $3, $4, $5, $6, $7, 2, 'old')`,
+      [
+        path,
+        state,
+        s,
+        fileId,
+        state === 'SENT' ? `harvest/s/${path}` : null,
+        state === 'SENT' ? 5 : null,
+        state === 'SENT' ? sentAt : null,
+      ],
     );
   await item('k.jpg', 'KNOWN', sha('a'));
   await item('bl.jpg', 'BLOCKED', sha('a'));
-  await item('sent.jpg', 'SENT', sha('a'));
+  // Linked: its bytes are the pipeline's files.sha256 (no sha stored on the item).
+  await item('sent.jpg', 'SENT', null, file.rows[0]!.id);
+  await item('sent2.jpg', 'SENT', sha('a'));
   await item('other.jpg', 'KNOWN', sha('e'));
-  expect(await unblock(pool, [sha('a')])).toBe(1);
+  await item('bsent.jpg', 'SENT', sha('b'));
+  // Sent again after the purge (an earlier unblock): its copy is on its way in, keep it.
+  await item('resent.jpg', 'SENT', sha('a'), null, new Date(Date.now() + 60_000));
+  // sha c was never purged-and-unblocked by this call; 9 is not purged at all.
+  await item('c.jpg', 'KNOWN', sha('c'));
+  await item('nine.jpg', 'KNOWN', sha('9'));
+  expect(await unblock(pool, [sha('a'), sha('9')])).toBe(1);
   const p = await pool.query<{ sha256: string; unblocked_at: Date | null }>(
     'SELECT sha256, unblocked_at FROM purged ORDER BY sha256',
   );
   expect(p.rows.find((r) => r.sha256 === sha('a'))!.unblocked_at).toBeInstanceOf(Date);
   expect(p.rows.find((r) => r.sha256 === sha('b'))!.unblocked_at).toBeNull();
-  const items = await pool.query<{ rel_path: string; state: string }>(
-    'SELECT rel_path, state FROM harvest_items ORDER BY rel_path',
+  const items = await pool.query<{
+    rel_path: string;
+    state: string;
+    file_id: string | null;
+    dropzone_path: string | null;
+    dropzone_mtime_ns: string | null;
+    sent_at: Date | null;
+    attempts: number;
+    last_error: string | null;
+  }>(
+    `SELECT rel_path, state, file_id::text AS file_id, dropzone_path,
+            dropzone_mtime_ns::text AS dropzone_mtime_ns, sent_at, attempts, last_error
+       FROM harvest_items ORDER BY rel_path`,
   );
+  const by = Object.fromEntries(items.rows.map((r) => [r.rel_path, r]));
   expect(Object.fromEntries(items.rows.map((r) => [r.rel_path, r.state]))).toEqual({
     'bl.jpg': 'PLANNED',
+    'bsent.jpg': 'SENT',
+    'c.jpg': 'KNOWN',
     'k.jpg': 'PLANNED',
+    'nine.jpg': 'KNOWN',
     'other.jpg': 'KNOWN',
-    'sent.jpg': 'SENT',
+    'resent.jpg': 'SENT',
+    'sent.jpg': 'PLANNED',
+    'sent2.jpg': 'PLANNED',
   });
+  // A re-planned SENT item forgets its copy: sendItem must not take the old file as published.
+  for (const r of ['sent.jpg', 'sent2.jpg'])
+    expect(by[r]).toMatchObject({
+      file_id: null,
+      dropzone_path: null,
+      dropzone_mtime_ns: null,
+      sent_at: null,
+      attempts: 0,
+      last_error: null,
+    });
+  expect(by['bsent.jpg']!.dropzone_path).not.toBeNull();
   // Already unblocked: nothing changes.
   expect(await unblock(pool, [sha('a')])).toBe(0);
+});
+
+test('unblock does not re-plan SENT items once the content is back in the vault', async () => {
+  await seed();
+  await purgeSet(pool, SET, [sha('a'), sha('b')]);
+  await pool.query(`INSERT INTO harvest_sources (id, identity, label) VALUES (1, 'u', 's')`);
+  await pool.query(
+    `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state,
+                                sha256, dropzone_path, dropzone_mtime_ns)
+     VALUES (1, 's.jpg', 's.jpg', 1, 1, 'photo', 'SENT', $1, 'harvest/s.jpg', 5)`,
+    [sha('a')],
+  );
+  // Restored by a re-drop between the unblock and a retried unblock request.
+  await pool.query(`UPDATE contents SET state = 'INGESTED', purged_at = NULL WHERE sha256 = $1`, [
+    sha('a'),
+  ]);
+  await pool.query('UPDATE purged SET unblocked_at = now() WHERE sha256 = $1', [sha('a')]);
+  expect(await unblock(pool, [sha('a')])).toBe(0);
+  const r = await pool.query<{ state: string }>('SELECT state FROM harvest_items');
+  expect(r.rows[0]!.state).toBe('SENT');
 });
 
 const clusterVersion = async () =>

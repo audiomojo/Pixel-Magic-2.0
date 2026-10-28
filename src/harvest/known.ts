@@ -250,7 +250,9 @@ export async function checkKnown(
     }
 
     // 3. Another ledger item with this size. DUP rows are left out: each is subsumed by its
-    // target, which has the same bytes and is itself a candidate when it qualifies.
+    // target, which has the same bytes and is itself a candidate when it qualifies. A SENT item
+    // sent before its content was purged is left out too: its copy left the vault, so matching it
+    // would keep an unblocked photo from ever being sent again (one re-sent since still wins).
     const { rows } = await pool.query<Candidate>(
       `SELECT i.id::text AS id, i.source_id::text AS source_id, i.state, i.kind,
               COALESCE(i.sha256, f.sha256) AS sha256, i.head_hash, i.rel_path, i.rel_path_raw,
@@ -259,7 +261,11 @@ export async function checkKnown(
               EXISTS (SELECT 1 FROM harvest_run_items ri
                       WHERE ri.run_id = $3::bigint AND ri.item_id = i.id) AS in_run
        FROM harvest_items i LEFT JOIN files f ON f.id = i.file_id
-       WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED')`,
+       WHERE i.size_bytes = $1 AND i.id <> $2 AND i.state IN ('SENT','PLANNED')
+         AND NOT (i.state = 'SENT' AND EXISTS (
+               SELECT 1 FROM contents pc
+                WHERE pc.sha256 = COALESCE(i.sha256, f.sha256) AND pc.state = 'PURGED'
+                  AND (i.sent_at IS NULL OR i.sent_at <= pc.purged_at)))`,
       [item.sizeBytes.toString(), item.id, item.runId],
     );
     // A PLANNED candidate wins only if this run sends it, and sends it before this item: it is
