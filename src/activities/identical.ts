@@ -42,7 +42,7 @@ const RAW_EXTS: string[] = [...RAW_MIME.keys()];
  * it sits idle in the transaction while files decode, and may wait that long for a lock held by
  * a family compare or a cluster-cache reload. A half-open holder still releases within 11 min.
  */
-const LONG_TX = '11min';
+export const LONG_TX = '11min';
 
 /** The suspect-key condition on `s` relative to `n` (spec §3: equal phash, dhash, width, height). */
 const SAME_KEY = `s.kind = 'still' AND s.phash = n.phash AND s.dhash = n.dhash
@@ -66,7 +66,7 @@ async function beating<T>(ctx: IdenticalCtx, what: string, p: Promise<T>): Promi
 }
 
 /** Runs `sql` (a lock acquisition) allowed to wait up to LONG_TX, then restores the bound. */
-async function waitForLock(
+export async function waitForLock(
   ctx: IdenticalCtx,
   c: pg.PoolClient,
   sql: string,

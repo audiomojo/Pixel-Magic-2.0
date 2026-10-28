@@ -1,6 +1,6 @@
 import { chmod, link, mkdir, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-import { Context, heartbeat } from '@temporalio/activity';
+import { Context, heartbeat, log } from '@temporalio/activity';
 import type pg from 'pg';
 import { withTx } from '../db.js';
 import {
@@ -14,6 +14,7 @@ import {
 } from '../fsops.js';
 import type { Metadata } from '../metadata.js';
 import type { FileRef, IngestResult } from '../types.js';
+import { LONG_TX, waitForLock, type IdenticalCtx } from './identical.js';
 import type { Deps } from './index.js';
 
 /** Another attempt moved the row on (a guarded update matched nothing). Retryable. */
@@ -32,6 +33,8 @@ export class ChangedWhileHashingError extends Error {
 }
 
 type Kind = IngestResult['kind'];
+/** Row states that end an ingest: a run finding its row in one returns the stored outcome (R1). */
+const FINAL = new Set<string>(['INGESTED', 'COPY', 'QUARANTINED', 'BLOCKED']);
 interface Row {
   id: string;
   sha256: string | null;
@@ -39,6 +42,15 @@ interface Row {
 }
 
 const statOrNull = (path: string) => unlessEnoent(stat(path));
+
+/** Purge spec §8: these exact bytes (sha256 + size) were purged and are not unblocked. */
+async function isBlocked(db: pg.Pool | pg.PoolClient, sha: string, size: bigint): Promise<boolean> {
+  const r = await db.query(
+    `SELECT 1 FROM purged WHERE sha256 = $1 AND size_bytes = $2 AND unblocked_at IS NULL`,
+    [sha, size],
+  );
+  return r.rowCount === 1;
+}
 
 /**
  * The detected extension, else `bin`. Never the dropped name's: identical bytes must map to one
@@ -149,13 +161,93 @@ export function makeIngestFile(deps: Deps) {
     return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', kind: meta.kind };
   }
 
+  async function commitBlocked(
+    ref: FileRef,
+    row: Row,
+    sha: string,
+    ext: string | null,
+  ): Promise<IngestResult> {
+    await guarded(pool, row.id, `state = 'BLOCKED'`, ['CLAIMED']);
+    log.info('blocked purged file', { name: ref.relPath, sha256: sha, fileId: row.id });
+    return { fileId: row.id, sha256: sha, ext, state: 'BLOCKED', kind: null };
+  }
+
+  /**
+   * Purge spec §8: bytes that were purged and not unblocked are turned away. The claimed file is
+   * deleted (durably, before the row says so); nothing is linked into the vault and no content
+   * row is created or changed. Relies on `purged` alone: after a wiped database it is rebuilt
+   * from purged.csv while `contents` is empty.
+   */
+  async function blockFile(
+    ref: FileRef,
+    row: Row,
+    claimed: string,
+    sha: string,
+    ext: string,
+  ): Promise<IngestResult> {
+    await unlessEnoent(unlink(claimed));
+    await fsyncDir(layout.claimed);
+    await deps.checkpoint?.('block_unlink');
+    return commitBlocked(ref, row, sha, ext);
+  }
+
+  /**
+   * Purge spec §9: a PURGED content's bytes, dropped again after an unblock. Under the content
+   * row's lock — the one `removePurged` takes, and it requires PURGED — the drop is linked into
+   * the vault and the content reset to INGESTED with its purge columns cleared. If the vault
+   * file was removed, the drop becomes its owner (committed in the same transaction); if it is
+   * still there (removal deferred or not yet run), the restore keeps it and the drop is a
+   * byte-identical COPY of it. A removal waiting on the lock then finds the content INGESTED and
+   * deletes nothing; one that held it first has finished, so the link makes the drop the owner.
+   * Null: the content is no longer PURGED (restored meanwhile) — the caller's normal path.
+   */
+  async function restorePurged(
+    ref: FileRef,
+    row: Row,
+    claimed: string,
+    sha: string,
+    ext: string,
+  ): Promise<IngestResult | null> {
+    const ctx: IdenticalCtx = { ...deps, beat: (d?: unknown) => heartbeat(d), log };
+    const vault = layout.vaultFile(sha, ext);
+    const r = await withTx(pool, async (c) => {
+      // A removal may hold the row while it hashes a large file; the link may hash too.
+      await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${LONG_TX}'`);
+      await waitForLock(ctx, c, 'SELECT 1 FROM contents WHERE sha256 = $1 FOR UPDATE', [sha]);
+      const cur = (
+        await c.query<{ state: string; kind: Kind }>(
+          'SELECT state, kind FROM contents WHERE sha256 = $1',
+          [sha],
+        )
+      ).rows[0];
+      if (cur?.state !== 'PURGED') return null;
+      if (await isBlocked(c, sha, BigInt(ref.size))) return 'BLOCKED' as const;
+      const outcome = await linkIntoVault(claimed, vault, sha, { onChunk: () => heartbeat() });
+      await deps.checkpoint?.('restore_link');
+      await c.query(
+        `UPDATE contents SET state = 'INGESTED', purged_at = NULL, purge_removed_at = NULL,
+                             purge_reclaimed_bytes = NULL, purge_mismatch = false
+          WHERE sha256 = $1 AND state = 'PURGED'`,
+        [sha],
+      );
+      if (outcome !== 'EXISTS_OTHER') await guarded(c, row.id, `state = 'INGESTED'`, ['CLAIMED']);
+      return { outcome, kind: cur.kind };
+    });
+    if (r === null) return null;
+    if (r === 'BLOCKED') return blockFile(ref, row, claimed, sha, ext);
+    log.info('purged content restored', { name: ref.relPath, sha256: sha, fileId: row.id });
+    if (r.outcome === 'EXISTS_OTHER') return parkAsCopy(row, claimed, sha, ext);
+    await finish(row.id, vault, sha);
+    return { fileId: row.id, sha256: sha, ext, state: 'INGESTED', kind: r.kind };
+  }
+
   /** R1: a run whose row is already final returns the stored outcome (after re-running the tail of steps 6–7). */
   async function storedOutcome(runId: string): Promise<IngestResult | null> {
     const r = await pool.query<{
       id: bigint;
       sha256: string | null;
       ext: string | null;
-      state: string;
+      state: IngestResult['state'];
       kind: Kind;
     }>(
       `SELECT f.id, f.sha256, f.ext, f.state, c.kind
@@ -164,10 +256,10 @@ export function makeIngestFile(deps: Deps) {
       [runId],
     );
     const row = r.rows[0];
-    if (!row || (row.state !== 'INGESTED' && row.state !== 'COPY' && row.state !== 'QUARANTINED'))
-      return null;
+    if (!row || !FINAL.has(row.state)) return null;
     const id = String(row.id);
-    if (row.sha256 && row.ext)
+    // BLOCKED keeps nothing: its claimed file was deleted (durably) before it was committed.
+    if (row.sha256 && row.ext && row.state !== 'BLOCKED')
       await finish(id, keptPath(id, row.state, row.sha256, row.ext), row.sha256);
     return {
       fileId: id,
@@ -206,7 +298,8 @@ export function makeIngestFile(deps: Deps) {
       [id],
     );
     const row = r.rows[0];
-    if (row?.sha256 && row.ext) {
+    // A BLOCKED row keeps no file: what is in claimed/<id> now is always a later drop.
+    if (row?.sha256 && row.ext && row.state !== 'BLOCKED') {
       const keep = keptPath(id, row.state, row.sha256, row.ext);
       if (await sameFile(claimed, keep, row.sha256, () => heartbeat())) return;
     }
@@ -236,6 +329,10 @@ export function makeIngestFile(deps: Deps) {
       // Only an unhashed, unclaimed row can vanish: CLAIMED always carries a hash.
       return quarantineUnhashed(row.id, 'vanished', ['DISCOVERED']);
     }
+    // Deleted as blocked, and the crash came before BLOCKED was committed. Never adopt the
+    // vault file here: a purged content's may still be there, pending removal.
+    if (await isBlocked(pool, row.sha256, BigInt(ref.size)))
+      return commitBlocked(ref, row, row.sha256, row.ext);
     if (row.ext) {
       const vault = layout.vaultFile(row.sha256, row.ext);
       const v = await statOrNull(vault);
@@ -320,6 +417,9 @@ export function makeIngestFile(deps: Deps) {
     const ext = extOf(meta);
     await guarded(pool, row.id, `ext = $3`, ['CLAIMED'], [ext]);
 
+    // Purged and not unblocked: turned away, whatever `contents` says (or lacks).
+    if (await isBlocked(pool, sha, size)) return blockFile(ref, row, claimed, sha, ext);
+
     // A retired (pixel-identical) content has no vault file on purpose: these exact bytes are a
     // copy of it, never linked back into the vault.
     const retired = await pool.query(
@@ -327,6 +427,16 @@ export function makeIngestFile(deps: Deps) {
       [sha],
     );
     if (retired.rowCount === 1) return parkAsCopy(row, claimed, sha, ext);
+
+    // Purged, then unblocked: these bytes bring the content back.
+    const purged = await pool.query(
+      `SELECT 1 FROM contents WHERE sha256 = $1 AND state = 'PURGED'`,
+      [sha],
+    );
+    if (purged.rowCount === 1) {
+      const restored = await restorePurged(ref, row, claimed, sha, ext);
+      if (restored) return restored;
+    }
 
     // Step 5: vault link. A different inode already there means a byte-identical copy.
     const outcome = await linkIntoVault(claimed, layout.vaultFile(sha, ext), sha, {

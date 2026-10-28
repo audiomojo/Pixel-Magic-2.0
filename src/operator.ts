@@ -114,7 +114,7 @@ export async function doctor(pool: pg.Pool, layout: DataLayout): Promise<DoctorR
   const ids = (await readdir(layout.claimed)).filter((n) => /^\d+$/.test(n));
   const orphans = await pool.query<{ n: bigint }>(
     `SELECT count(*) AS n FROM files
-     WHERE id = ANY($1::bigint[]) AND state IN ('INGESTED','COPY','QUARANTINED')`,
+     WHERE id = ANY($1::bigint[]) AND state IN ('INGESTED','COPY','QUARANTINED','BLOCKED')`,
     [ids],
   );
   const stuck = await pool.query<{ n: bigint }>(

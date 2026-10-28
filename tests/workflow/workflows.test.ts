@@ -279,6 +279,13 @@ test('a quarantined file stops after ingest', async () => {
   expect(f.calls).toEqual(['ingestFile']);
 });
 
+// Purge spec §8: a dropped file whose bytes are blocked is turned away; nothing else runs.
+test('a blocked file ends the workflow after ingest, without content steps', async () => {
+  const f = fakes({ ingest: { ...INGESTED_STILL, state: 'BLOCKED', kind: null } });
+  expect(await runFile(f)).toBe('BLOCKED');
+  expect(f.calls).toEqual(['ingestFile']);
+});
+
 test('a pixel-identical duplicate ends after dedupe: DUPLICATE, never clustered', async () => {
   const f = fakes({ ingest: INGESTED_STILL, dedupe: 'DUPLICATE' });
   expect(await runFile(f)).toBe('DUPLICATE');

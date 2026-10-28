@@ -269,9 +269,10 @@ async function seedFile(state: string, attempts = 0): Promise<string> {
 
 test('doctor counts orphaned claimed files and stuck work', async () => {
   const orphan = await seedFile('INGESTED');
+  const blocked = await seedFile('BLOCKED'); // a final row: its claimed file is an orphan too
   const live = await seedFile('CLAIMED', 1);
   await seedFile('CLAIMED', 9);
-  for (const id of [orphan, live]) await writeFile(join(layout.claimed, id), 'bytes');
+  for (const id of [orphan, blocked, live]) await writeFile(join(layout.claimed, id), 'bytes');
   const hash = await seedContent({ state: 'HASHED' });
   // The updated_at trigger would overwrite the backdating, so switch it off for the update.
   await pgh.pool.query('ALTER TABLE contents DISABLE TRIGGER contents_updated_at');
@@ -283,7 +284,7 @@ test('doctor counts orphaned claimed files and stuck work', async () => {
   const out = capture('stdout');
   expect(await main(['doctor'], deps)).toBe(0);
   expect(JSON.parse(out())).toEqual({
-    orphanedClaimed: 1,
+    orphanedClaimed: 2,
     filesStuckRetrying: 1,
     contentsStale: 1,
     copyMismatches: 0,

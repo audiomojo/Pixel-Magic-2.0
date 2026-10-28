@@ -9,8 +9,8 @@ export interface IngestResult {
   fileId: string;
   sha256: string | null;
   ext: string | null;
-  state: 'INGESTED' | 'COPY' | 'QUARANTINED';
-  /** The owned content's kind; null for COPY (owns no content) and QUARANTINED. */
+  state: 'INGESTED' | 'COPY' | 'QUARANTINED' | 'BLOCKED';
+  /** The owned content's kind; null for COPY (owns no content), QUARANTINED and BLOCKED. */
   kind: 'still' | 'motion' | 'other' | null;
 }
 

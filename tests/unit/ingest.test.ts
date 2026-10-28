@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   chmod,
   link,
@@ -627,3 +628,210 @@ test('a parked copy whose COPY commit crashed is committed, never removed before
   expect(r.state).toBe('COPY');
   expect(await runActivity(acts.reclaimCopy, [r.fileId])).toBe('REMOVED');
 });
+
+// ---- Purge spec §8–§9: blocked bytes are turned away; unblocked ones come back.
+
+const shaOf = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+const vaultOf = (sha: string) => join(layout.root, vaultRel(sha, 'jpg'));
+
+/** A `purged` row for `bytes`: blocked, or (with `unblocked`) unblocked since. */
+async function purgedRow(bytes: Buffer, unblocked = false): Promise<void> {
+  await pool.query(
+    `INSERT INTO purged (sha256, size_bytes, names, purged_at, unblocked_at)
+     VALUES ($1, $2, '{old.jpg}', now(), CASE WHEN $3 THEN now() END)`,
+    [shaOf(bytes), bytes.length, unblocked],
+  );
+}
+
+/** Ingests `bytes`, then purges its content; `removed`: its vault file is already gone too. */
+async function purgedContent(bytes: Buffer, removed: boolean): Promise<string> {
+  const r = await runActivity(acts.ingestFile, [await drop('old.jpg', bytes)], { runId: 'r-old' });
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    r.sha256,
+  ]);
+  if (removed) {
+    await rm(vaultOf(r.sha256!));
+    await pool.query(
+      `UPDATE contents SET purge_removed_at = now(), purge_reclaimed_bytes = $2 WHERE sha256 = $1`,
+      [r.sha256, bytes.length],
+    );
+  }
+  return r.sha256!;
+}
+
+async function contentRow(sha: string) {
+  return (
+    await pool.query<{
+      state: string;
+      purged_at: Date | null;
+      purge_removed_at: Date | null;
+      purge_reclaimed_bytes: bigint | null;
+      purge_mismatch: boolean;
+    }>(
+      `SELECT state, purged_at, purge_removed_at, purge_reclaimed_bytes, purge_mismatch
+         FROM contents WHERE sha256 = $1`,
+      [sha],
+    )
+  ).rows[0];
+}
+
+const RESTORED = {
+  state: 'INGESTED',
+  purged_at: null,
+  purge_removed_at: null,
+  purge_reclaimed_bytes: null,
+  purge_mismatch: false,
+};
+
+test('a blocked sha with no content row (wiped database) is deleted, BLOCKED, never vaulted', async () => {
+  await purgedRow(JPEG_A);
+  const ref = await drop('again.jpg', JPEG_A);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r).toEqual({
+    fileId: r.fileId,
+    sha256: shaOf(JPEG_A),
+    ext: 'jpg',
+    state: 'BLOCKED',
+    kind: null,
+  });
+  expect(existsSync(join(layout.dropzone, 'again.jpg'))).toBe(false);
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect(await vaultFiles()).toEqual([]);
+  expect(await count('contents')).toBe(0);
+  expect(await count('files', `state = 'BLOCKED' AND original_name = 'again.jpg'`)).toBe(1);
+  // The deletion was durable before BLOCKED was committed.
+  const sync = fsyncs.find((f) => f.dir === layout.claimed && f.claimed.length === 0);
+  expect(sync?.states).toEqual(['CLAIMED']);
+});
+
+test('a blocked file whose content is PURGED with its vault file still there is blocked; the vault is untouched (review focus 5)', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A);
+  const before = await stat(vaultOf(sha));
+  const r = await runActivity(acts.ingestFile, [await drop('again.jpg', JPEG_A)], {
+    runId: 'r1',
+  });
+  expect(r.state).toBe('BLOCKED');
+  const after = await stat(vaultOf(sha));
+  expect([after.ino, after.nlink]).toEqual([before.ino, 1]);
+  expect(await readdir(layout.vaultCopies)).toEqual([]);
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect((await contentRow(sha))?.state).toBe('PURGED');
+  expect(await count('contents')).toBe(1);
+});
+
+test('a blocked file whose purged vault file is already removed stays out of the vault', async () => {
+  const sha = await purgedContent(JPEG_A, true);
+  await purgedRow(JPEG_A);
+  const r = await runActivity(acts.ingestFile, [await drop('again.jpg', JPEG_A)], {
+    runId: 'r1',
+  });
+  expect(r.state).toBe('BLOCKED');
+  expect(await vaultFiles()).toEqual([]);
+  expect((await contentRow(sha))?.purge_removed_at).toBeInstanceOf(Date);
+});
+
+test('re-running a BLOCKED ingest returns the stored outcome', async () => {
+  await purgedRow(JPEG_A);
+  const ref = await drop('again.jpg', JPEG_A);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(r);
+  expect(await count('files')).toBe(1);
+});
+
+test('a crash after deleting a blocked file resumes to BLOCKED, never to the vault owner', async () => {
+  await purgedContent(JPEG_A, false); // the vault file is there: recovery must not adopt it
+  await purgedRow(JPEG_A);
+  const ref = await drop('again.jpg', JPEG_A);
+  await expect(
+    runActivity(createActivities(crashAt('block_unlink')).ingestFile, [ref], { runId: 'r1' }),
+  ).rejects.toThrow(SimulatedCrash);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect(r.state).toBe('BLOCKED');
+  expect(await count('files', `state = 'INGESTED'`)).toBe(1); // only the first drop
+});
+
+test('an unblocked sha whose purged vault file was removed is vaulted again and its content restored', async () => {
+  const sha = await purgedContent(JPEG_A, true);
+  await purgedRow(JPEG_A, true);
+  const ref = await drop('back.jpg', JPEG_A);
+  const r = await runActivity(acts.ingestFile, [ref], { runId: 'r1' });
+  expect([r.state, r.kind, r.sha256]).toEqual(['INGESTED', 'still', sha]);
+  expect(await readFile(vaultOf(sha))).toEqual(JPEG_A);
+  expect((await stat(vaultOf(sha))).mode & 0o777).toBe(0o444);
+  expect(await readdir(layout.claimed)).toEqual([]);
+  expect(await contentRow(sha)).toEqual(RESTORED);
+  // A replay returns the same outcome.
+  expect(await runActivity(acts.ingestFile, [ref], { runId: 'r1' })).toEqual(r);
+});
+
+test('an unblocked sha whose purged vault file is still there is restored; the drop is a COPY of it', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A, true);
+  const r = await runActivity(acts.ingestFile, [await drop('back.jpg', JPEG_A)], { runId: 'r1' });
+  expect([r.state, r.sha256]).toEqual(['COPY', sha]);
+  expect(await contentRow(sha)).toEqual(RESTORED);
+  // Its removal no longer applies: the vault file stays.
+  expect(await runActivity(acts.removePurgedBatch, [[sha]])).toMatchObject({ examined: 0 });
+  expect(await readFile(vaultOf(sha))).toEqual(JPEG_A);
+});
+
+test('a removal waiting on the content row while it is restored never deletes the vault file', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A, true);
+  let removal: Promise<unknown> | undefined;
+  const restoring = createActivities({
+    ...deps,
+    checkpoint: async (n) => {
+      if (n !== 'restore_link') return;
+      // The removal starts now and must wait for the restore's row lock.
+      removal = runActivity(acts.removePurgedBatch, [[sha]]).catch((e: unknown) => e);
+      await vi.waitFor(async () => expect(await lockWaiters()).toBe(1));
+    },
+  });
+  const r = await runActivity(restoring.ingestFile, [await drop('back.jpg', JPEG_A)], {
+    runId: 'r1',
+  });
+  expect(r.state).toBe('COPY');
+  expect(String(await removal)).toMatch(/not PURGED/);
+  expect(await readFile(vaultOf(sha))).toEqual(JPEG_A);
+  expect(await contentRow(sha)).toEqual(RESTORED);
+});
+
+test('a restore waiting on a removal in flight vaults the dropped bytes as the owner', async () => {
+  const sha = await purgedContent(JPEG_A, false);
+  await purgedRow(JPEG_A, true);
+  // Stands in for removePurged: holds the row lock, removes the file, records it.
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query('SELECT 1 FROM contents WHERE sha256 = $1 FOR UPDATE', [sha]);
+    const ingest = runActivity(acts.ingestFile, [await drop('back.jpg', JPEG_A)], {
+      runId: 'r1',
+    });
+    await vi.waitFor(async () => expect(await lockWaiters()).toBe(1));
+    await rm(vaultOf(sha));
+    await c.query(
+      `UPDATE contents SET purge_removed_at = now(), purge_reclaimed_bytes = 1 WHERE sha256 = $1`,
+      [sha],
+    );
+    await c.query('COMMIT');
+    const r = await ingest;
+    expect([r.state, r.kind]).toEqual(['INGESTED', 'still']);
+  } finally {
+    c.release();
+  }
+  expect(await readFile(vaultOf(sha))).toEqual(JPEG_A);
+  expect(await contentRow(sha)).toEqual(RESTORED);
+});
+
+test('an unblocked sha with no content row (wiped database) is ingested as new content', async () => {
+  await purgedRow(JPEG_A, true);
+  const r = await runActivity(acts.ingestFile, [await drop('back.jpg', JPEG_A)], { runId: 'r1' });
+  expect([r.state, r.kind]).toEqual(['INGESTED', 'still']);
+  expect((await contentRow(shaOf(JPEG_A)))?.state).toBe('INGESTED');
+});
+
+async function lockWaiters(): Promise<number> {
+  return count('pg_stat_activity', `wait_event_type = 'Lock'`);
+}

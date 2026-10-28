@@ -543,6 +543,48 @@ test('the sweep skips a purged row already flagged', async () => {
   expect(existsSync(vaultPath(a))).toBe(true);
 });
 
+/**
+ * An owner and one COPY of `bytes` whose .copies file outlived its reclaim (still linked by a
+ * staging generation, say); then the content is purged and its vault file removed.
+ */
+async function copyOfRemovedPurged(bytes = JPEG_A) {
+  const [c] = await copies(1, bytes);
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    c!.sha256,
+  ]);
+  expect(await runActivity(acts.removePurgedBatch, [[c!.sha256!]])).toMatchObject({ removed: 1 });
+  expect(existsSync(vaultPath(c!))).toBe(false);
+  return c!;
+}
+
+test('a COPY of a purged content whose vault file is removed: the copy is deleted too, never flagged', async () => {
+  const c = await copyOfRemovedPurged();
+  expect(await reclaim(c)).toBe('REMOVED');
+  expect(existsSync(copyPath(c))).toBe(false);
+  expect(await marks(c)).toMatchObject({ copy_mismatch: false, state: 'COPY' });
+  expect((await marks(c)).copy_removed_at).toBeInstanceOf(Date);
+});
+
+test('a COPY of a removed purged content whose .copies bytes differ is flagged, not deleted', async () => {
+  const c = await copyOfRemovedPurged();
+  await corrupt(copyPath(c), JPEG_B);
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect(existsSync(copyPath(c))).toBe(true);
+});
+
+test('a COPY of a removed purged content whose .copies file is gone is marked removed', async () => {
+  const c = await copyOfRemovedPurged();
+  await unlink(copyPath(c));
+  expect(await reclaim(c)).toBe('REMOVED');
+});
+
+test('a COPY of a removed purged content still linked elsewhere is deferred', async () => {
+  const c = await copyOfRemovedPurged();
+  await link(copyPath(c), join(layout.staging, 'held.jpg'));
+  expect(await reclaim(c)).toBe('DEFERRED');
+  expect(existsSync(copyPath(c))).toBe(true);
+});
+
 test('removePurgedBatch removes the given purged files, skipping rows not pending', async () => {
   const a = await pendingPurged('a.jpg', JPEG_A);
   const b = await pendingPurged('b.jpg', JPEG_B);

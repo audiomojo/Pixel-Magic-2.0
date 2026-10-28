@@ -119,11 +119,22 @@ export function makeCopies(deps: Deps) {
       )
     ).rows[0];
     const kept = k ? await lstatOrNull(layout.vaultFile(k.sha256, k.ext)) : null;
-    const retired = kept?.isFile() === true;
+    // A purged content whose vault file was removed (and not flagged): its bytes are meant to be
+    // gone, so the .copies file alone is checked and deleted, never flagged for the missing
+    // vault file. Pending or flagged purged contents take the normal path.
+    const purgedGone =
+      (
+        await pool.query(
+          `SELECT 1 FROM contents WHERE sha256 = $1 AND state = 'PURGED'
+              AND purge_removed_at IS NOT NULL AND NOT purge_mismatch`,
+          [sha],
+        )
+      ).rowCount === 1;
+    const vaultless = kept?.isFile() === true || purgedGone;
     const c = await lstatOrNull(copy);
-    const v = retired ? null : await lstatOrNull(vault);
+    const v = vaultless ? null : await lstatOrNull(vault);
     if (!c) {
-      if (retired) return markRemoved(id, row.size_bytes);
+      if (vaultless) return markRemoved(id, row.size_bytes);
       // COPY is committed only after the rename into .copies is durable, and nothing but this
       // step removes it: a crash came between our unlink and our mark. Mark it once the vault
       // still holds the bytes; otherwise the bytes are nowhere — an anomaly, flagged.
@@ -137,7 +148,8 @@ export function makeCopies(deps: Deps) {
     // Another name holds these bytes too (an older staging generation's hardlink, or a link the
     // user made): unlinking would free nothing, and the other name would lose its twin. Later.
     if (c.nlink > 1n) return 'DEFERRED';
-    if (!retired && (!v || !v.isFile())) return flag(id, `vault file ${layout.rel(vault)} missing`);
+    if (!vaultless && (!v || !v.isFile()))
+      return flag(id, `vault file ${layout.rel(vault)} missing`);
 
     const [hc, hv] = await Promise.all([
       freshHash(copy, c),
