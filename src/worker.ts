@@ -17,6 +17,7 @@ import { createPool } from './db.js';
 import { checkSameDevice, DataLayout } from './fsops.js';
 import { logger } from './logger.js';
 import { MetadataReader } from './metadata.js';
+import { reconcilePurgeLog } from './purgeLog.js';
 import { ensureSchedules } from './schedules.js';
 
 const QUEUES = ['main', 'io', 'cpu', 'cluster'] as const;
@@ -55,6 +56,16 @@ async function main(): Promise<void> {
     await metadata.read(fileURLToPath(import.meta.url)); // exiftool works before any claim
     const pool = createPool(settings.databaseUrl, settings.ioConcurrency + 4);
     cleanup.push(() => pool.end());
+    // A worker never ingests without its block list: a failed reconcile is fatal at start.
+    try {
+      await reconcilePurgeLog(pool, settings.dataDir, {
+        info: (m, meta) => logger.info(meta ?? {}, m),
+        warn: (m, meta) => logger.warn(meta ?? {}, m),
+      });
+    } catch (err) {
+      logger.fatal({ err }, 'purged.csv reconcile failed');
+      throw err;
+    }
     let decodePool = noDecodePool;
     if (serves('cpu')) {
       const p = createDecodePool(here('./decodeWorker.js'), settings.cpuConcurrency);
