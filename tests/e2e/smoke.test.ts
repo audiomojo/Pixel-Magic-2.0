@@ -1,5 +1,7 @@
 // Smoke tier (spec §10.3): ~150 corpus files through the real compose stack, then the golden
 // invariant, ground-truth expectations, the pinned cases and the golden staging tree.
+import { readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest';
 import { components } from '../../tools/corpus/lib.js';
 import { diffExpectations, queries } from '../lib/expectations.js';
@@ -36,6 +38,27 @@ test('smoke: invariant, expectations, golden tree', async () => {
   const tree = await treeSnapshot(...run.snap);
   if (process.env['UPDATE_GOLDEN'] === '1') await writeGolden('smoke_tree.txt', tree);
   expect(tree).toEqual(await readGolden('smoke_tree.txt'));
+});
+
+// Controller ruling R12: the one-time cleanup, run for real in the stack's worker after the
+// pipeline settled, finds nothing left to retire (the pipeline step already did it all).
+test('dedupe-identical dry run in the worker: exit 0, families 0, a report', async () => {
+  // `compose exec` rejects on a non-zero exit.
+  const stdout = await run.stack.compose(
+    'exec',
+    '-T',
+    'worker',
+    'node',
+    'dist/cli.js',
+    'dedupe-identical',
+  );
+  expect(stdout).toMatch(/^families 0, files to remove 0, bytes to free 0, errors 0$/m);
+  const reports = (await readdir(join(run.dataDir, 'reports'))).filter((n) =>
+    /^dedupe-identical-.*\.csv$/.test(n),
+  );
+  expect(reports.length, String(reports)).toBe(1);
+  expect(reports[0]).not.toMatch(/-applied\.csv$/);
+  expect(stdout).toContain(`report: /data/reports/${reports[0]!}`);
 });
 
 test('pinned cases', async () => {

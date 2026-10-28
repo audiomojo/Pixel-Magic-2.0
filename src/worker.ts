@@ -12,6 +12,7 @@ import {
 import { createDecodePool, type WorkerPool } from './activities/hashing.js';
 import { createActivities } from './activities/index.js';
 import { loadSettings } from './config.js';
+import { crashAt } from './crashAt.js';
 import { createPool } from './db.js';
 import { checkSameDevice, DataLayout } from './fsops.js';
 import { logger } from './logger.js';
@@ -71,7 +72,17 @@ async function main(): Promise<void> {
     });
     const connection = await NativeConnection.connect({ address: settings.temporalAddress });
     cleanup.push(() => connection.close());
-    const activities = createActivities({ pool, settings, layout, metadata, decodePool, temporal });
+    // Test seam only (chaos tier): unset in production, so no checkpoint is installed.
+    const checkpoint = crashAt(process.env['CRASH_AT'], settings.dataDir);
+    const activities = createActivities({
+      pool,
+      settings,
+      layout,
+      metadata,
+      decodePool,
+      temporal,
+      ...(checkpoint === undefined ? {} : { checkpoint }),
+    });
 
     // Under compose's stop_grace_period (60 s), so cleanup runs before a SIGKILL.
     const base = { connection, namespace: settings.temporalNamespace, shutdownGraceTime: '50s' };

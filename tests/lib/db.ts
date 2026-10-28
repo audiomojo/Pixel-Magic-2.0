@@ -52,6 +52,10 @@ export interface ContentRow {
   copyGroup: number | null;
   /** Root similar set of the root copy group, or null. */
   similarSet: number | null;
+  /** A retired pixel-identical duplicate's keeper (state DUPLICATE), and its removal record. */
+  duplicateOf: string | null;
+  duplicateRemovedAt: Date | null;
+  duplicateMismatch: boolean;
 }
 
 /** Every file and content row, with group ids resolved to their roots. */
@@ -106,9 +110,13 @@ export async function loadWorld(url: string): Promise<World> {
     dhash: bigint | null;
     copy_ambiguous: boolean;
     copy_group_id: bigint | null;
+    duplicate_of: string | null;
+    duplicate_removed_at: Date | null;
+    duplicate_mismatch: boolean;
   }>(
     `SELECT sha256, kind, mime, state, quarantine_reason, last_error, captured_at, subsec,
-            burst_uuid, phash, dhash, copy_ambiguous, copy_group_id FROM contents`,
+            burst_uuid, phash, dhash, copy_ambiguous, copy_group_id, duplicate_of,
+            duplicate_removed_at, duplicate_mismatch FROM contents`,
   );
   return {
     files: files.rows.map((r) => ({
@@ -144,6 +152,9 @@ export async function loadWorld(url: string): Promise<World> {
             ambiguous: r.copy_ambiguous,
             copyGroup,
             similarSet: s === null ? null : root(Number(s)),
+            duplicateOf: r.duplicate_of,
+            duplicateRemovedAt: r.duplicate_removed_at,
+            duplicateMismatch: r.duplicate_mismatch,
           },
         ];
       }),

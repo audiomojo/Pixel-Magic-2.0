@@ -54,6 +54,26 @@ test('standard: synthetic resized/re-encoded variants join their seed’s copy g
   for (const v of copies) expect(await q.sameCopyGroup(v.name, v.seedName!), v.name).toBe(true);
 });
 
+// Identical-dedupe spec §9: a metadata-only re-save (`meta`, EXIF:Software = Picasa 3.0) and a
+// pixel-identical lossless PNG are retired; only the family's keeper is staged.
+test('standard: pixel-identical variants are retired and only the keeper is staged', async () => {
+  const dups = run.seedManifest.files.filter(
+    (f) => f.origin === 'synthetic' && f.expect === 'duplicate',
+  );
+  expect(dups.some((f) => f.variant === 'meta')).toBe(true);
+  for (const seedName of new Set(dups.map((f) => f.seedName!))) {
+    const family = [seedName, ...dups.filter((f) => f.seedName === seedName).map((f) => f.name)];
+    const placed = await Promise.all(family.map(async (n) => (await q.stagedOf(n)).length));
+    // Exactly one member placed: the keeper.
+    expect(placed.filter((n) => n > 0).length, `${family.join(', ')}: ${String(placed)}`).toBe(1);
+    const keeper = dups.find((f) => f.seedName === seedName)!.keeper;
+    if (keeper !== undefined) {
+      const name = keeper === seedName ? seedName : keeper.slice(keeper.lastIndexOf('/') + 1);
+      expect(placed[family.indexOf(name)], `${name} staged`).toBeGreaterThan(0);
+    }
+  }
+});
+
 test('every Live Photo pair staged together', async () => {
   const pairs = livePairs(manifest, new Set(run.seedManifest.files.map((f) => f.name)));
   expect(pairs.length).toBeGreaterThanOrEqual(20);

@@ -14,7 +14,7 @@ import {
 } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import sharp from 'sharp';
-import { beforeAll, describe, expect, test, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import {
   PINNED,
   buildManifest,
@@ -31,6 +31,8 @@ import {
   type Manifest,
   type ManifestRecord,
 } from '../../tools/corpus/lib.js';
+import { ExifTool } from 'exiftool-vendored';
+import { pixelDigest } from '../../src/decode.js';
 import { HEIC_SCENE0 } from '../helpers/images.js';
 import { tmpDir } from '../helpers/layout.js';
 
@@ -41,6 +43,8 @@ let tmp: string;
 beforeAll(async () => {
   tmp = await tmpDir();
 });
+const exiftool = new ExifTool({ maxProcs: 1 });
+afterAll(() => exiftool.end());
 
 /** All synthetic records share one capture instant unless overridden (no subsec, so no bursts). */
 const T0 = '2021-01-01T00:00:00.000Z';
@@ -434,9 +438,10 @@ describe('seed', () => {
           .filter((f) => f.seedName === seedName)
           .map((f) => f.variant)
           .sort();
-      expect(variants('a.jpg')).toEqual(['png', 'q60-noexif', 'resize50']);
+      // `meta` (the seed's bytes, re-saved by an editor) only for JPEG seeds.
+      expect(variants('a.jpg')).toEqual(['meta', 'png', 'q60-noexif', 'resize50']);
       expect(variants('e.heic')).toEqual(['png', 'q60-noexif', 'resize50']);
-      expect(variants('b.jpg')).toEqual(['bridge', 'png', 'q60-noexif', 'resize50']);
+      expect(variants('b.jpg')).toEqual(['bridge', 'meta', 'png', 'q60-noexif', 'resize50']);
       expect(synth.every((f) => f.name.startsWith('z-'))).toBe(true);
       const truthOf = (seedName: string, variant: string) =>
         synth
@@ -446,11 +451,38 @@ describe('seed', () => {
       // Rows 7–8 (and 6) need the copy distances, which the oracle can't measure: copy-if-tight.
       expect(truthOf('a.jpg', 'resize50')).toEqual([['copy-if-tight', null]]);
       expect(truthOf('a.jpg', 'q60-noexif')).toEqual([['similar', null]]);
-      expect(truthOf('a.jpg', 'png')).toEqual([['copy-if-tight', null]]);
+      // A lossless PNG of an unrotated JPEG decodes to the seed's very pixels (measured): a
+      // duplicate, like the metadata-only re-save. A HEIC seed's PNG is made from a sips JPEG
+      // conversion, so it is not identical and keeps today's expectation.
+      expect(truthOf('a.jpg', 'png')).toEqual([['duplicate', null]]);
+      expect(truthOf('a.jpg', 'meta')).toEqual([['duplicate', null]]);
+      expect(truthOf('e.heic', 'png')).toEqual([['copy-if-tight', null]]);
       expect(truthOf('e.heic', 'q60-noexif')).toEqual([['copy-if-tight', null]]);
+      // The family's keeper by the measured keeper rule: the editor's re-save always loses on
+      // `camera-original`; between the seed and its PNG (same tags) the larger file stays: the
+      // PNG of EXIF-less a.jpg (286 vs 395 bytes), the seed for b.jpg and c.jpg (EXIF bytes).
+      const keeperOf = (seedName: string, variant: string) =>
+        synth.find((f) => f.seedName === seedName && f.variant === variant)?.keeper;
+      for (const v of ['png', 'meta']) {
+        expect(keeperOf('a.jpg', v), v).toBe('z-synth-png-a_jpg.png');
+        expect(keeperOf('b.jpg', v), v).toBe('b.jpg');
+        expect(keeperOf('c.jpg', v), v).toBe('c.jpg');
+      }
+      expect(
+        synth.filter((f) => f.expect !== 'duplicate').every((f) => f.keeper === undefined),
+      ).toBe(true);
+      const re = synth.find((f) => f.seedName === 'b.jpg' && f.variant === 'meta')!;
+      const [seedPx, rePx] = await Promise.all([
+        pixelDigest(join(src, 'b.jpg'), 'jpg'),
+        pixelDigest(join(dest, re.relPath), 'jpg'),
+      ]);
+      expect(rePx).toEqual(seedPx);
+      expect(re.sha256).not.toBe(truth.get('b.jpg')!.sha256);
+      const reTags = await exiftool.readRaw(join(dest, re.relPath), { readArgs: ['-G'] });
+      expect((reTags as Record<string, unknown>)['EXIF:Software']).toBe('Picasa 3.0');
       // b.jpg and c.jpg are a burst: EXIF-kept variants are copies, EXIF-less ones are bridges.
       expect(truthOf('b.jpg', 'resize50')).toEqual([['copy', null]]);
-      expect(truthOf('b.jpg', 'png')).toEqual([['copy', null]]);
+      expect(truthOf('b.jpg', 'png')).toEqual([['duplicate', null]]);
       expect(truthOf('b.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
       expect(truthOf('b.jpg', 'bridge')).toEqual([['copy-or-ambiguous', ['b.jpg', 'c.jpg']]]);
       expect(truthOf('c.jpg', 'q60-noexif')).toEqual([['copy-or-ambiguous', ['c.jpg', 'b.jpg']]]);
@@ -486,6 +518,7 @@ describe('seed', () => {
     const dest = join(tmp, 'dz-stem');
     const files = await synthesize(src, ['e.heic', 'e.jpg'], dest);
     expect(files.map((f) => f.name).sort()).toEqual([
+      'synth-meta-e_jpg.jpg',
       'synth-png-e_heic.png',
       'synth-png-e_jpg.png',
       'synth-q60-noexif-e_heic.jpg',
@@ -494,6 +527,60 @@ describe('seed', () => {
       'synth-resize50-e_jpg.jpg',
     ]);
   });
+
+  macTest(
+    'a rotated JPEG seed: its PNG is still pixel-identical (orientation applied on both)',
+    async () => {
+      // sharp writes the rotated pixels with Orientation reset to 1, and the pixel digest applies
+      // each file's own orientation: the same picture. Measured, not assumed from EXIF.
+      const src = join(tmp, `corpus-${++corpusSeq}`);
+      await mkdir(src, { recursive: true });
+      await sharp({
+        create: { width: 64, height: 48, channels: 3, background: { r: 5, g: 9, b: 1 } },
+      })
+        .withMetadata({ orientation: 6 })
+        .jpeg()
+        .toFile(join(src, 'r.jpg'));
+      const files = await synthesize(src, ['r.jpg'], join(tmp, 'dz-rotated'), 'k-');
+      const by = (v: string) => files.find((f) => f.variant === v)!;
+      expect([by('png').expect, by('meta').expect]).toEqual(['duplicate', 'duplicate']);
+      expect(by('png').keeper).toBeDefined();
+      expect(by('meta').keeper).toBe(by('png').keeper);
+    },
+  );
+
+  macTest(
+    'an identical PNG whose hashes differ from its JPEG seed is a missed pair, not a duplicate',
+    async () => {
+      // At 640x480 the JPEG's hashes come from a shrink-on-load decode and the PNG's from a full
+      // one: a pHash bit differs, so the pipeline never compares them (spec §3 suspect key). The
+      // PNG keeps its §6.3 expectation and is flagged; the byte-level `meta` re-save still dedupes.
+      const src = join(tmp, `corpus-${++corpusSeq}`);
+      await mkdir(src, { recursive: true });
+      const [w, h] = [640, 480];
+      const px = Buffer.alloc(w * h * 3);
+      let x = 2 * 9973;
+      for (let i = 0; i < px.length; i++) {
+        x = (x * 1103515245 + 12345) & 0x7fffffff;
+        px[i] = ((i % (w * 3)) / (w * 3)) * 200 + (x % 40);
+      }
+      await sharp(px, { raw: { width: w, height: h, channels: 3 } })
+        .jpeg({ quality: 90 })
+        .toFile(join(src, 'g.jpg'));
+      const files = await synthesize(src, ['g.jpg'], join(tmp, 'dz-missed'));
+      const by = (v: string) => files.find((f) => f.variant === v)!;
+      expect([by('png').expect, by('png').missedIdentical, by('png').keeper]).toEqual([
+        'copy-if-tight',
+        true,
+        undefined,
+      ]);
+      expect([by('meta').expect, by('meta').keeper, by('meta').missedIdentical]).toEqual([
+        'duplicate',
+        'g.jpg',
+        undefined,
+      ]);
+    },
+  );
 
   macTest('a tmp dir on APFS clones: no fallback copies', async () => {
     const src = await makeCorpus();

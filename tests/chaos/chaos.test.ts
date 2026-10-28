@@ -1,5 +1,7 @@
 // Chaos proof (spec §10.4): kills, restarts and pauses during a standard run never change the
 // outcome. Compared with a calm run modulo `copy_ambiguous` contents (spec §12 R3, as amended).
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { diffExpectations, moduloAmbiguity } from '../lib/expectations.js';
 import { checkInvariant } from '../lib/invariant.js';
@@ -11,6 +13,11 @@ import { runTier, type TierRun } from '../lib/stack.js';
  */
 const STORM_CPU_CONCURRENCY = '1';
 const CALM_CPU_CONCURRENCY = '4';
+/**
+ * Storm's workers also exit hard (src/crashAt.ts) the first time one retires a pixel-identical
+ * duplicate: after the retire commit, before the vault unlink (identical-dedupe spec §9).
+ */
+const CRASH_AT = 'identical_retired';
 
 /** `cpuConcurrency` from the worker's startup log lines. */
 async function loggedConcurrency(run: TierRun, svc: string): Promise<number[]> {
@@ -43,7 +50,7 @@ test(
       const storm = await runTier('standard', {
         shuffle: 1,
         runId: `storm-${t0.toString(36)}`,
-        workerEnv: { CPU_CONCURRENCY: STORM_CPU_CONCURRENCY },
+        workerEnv: { CPU_CONCURRENCY: STORM_CPU_CONCURRENCY, CRASH_AT },
       });
       runs.push(storm);
       const chaos = await storm.runWithChaos({
@@ -83,6 +90,10 @@ test(
       );
       expect.soft([...new Set(calmConcurrency)]).toEqual([Number(CALM_CPU_CONCURRENCY)]);
 
+      // The worker died between a retire commit and its unlink, and the run still converged.
+      const crashed = join(storm.dataDir, `.crash-at-${CRASH_AT}`);
+      expect(existsSync(crashed), `${crashed}: no worker crashed at ${CRASH_AT}`).toBe(true);
+      say(`crashed at checkpoint ${CRASH_AT}: ${crashed}`);
       expect(await checkInvariant(...storm.ctx)).toEqual([]);
       const m = await moduloAmbiguity(storm, calm);
       say(

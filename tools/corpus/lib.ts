@@ -25,7 +25,10 @@ import { promisify } from 'node:util';
 import { Worker } from 'node:worker_threads';
 import { exiftoolPath } from 'exiftool-vendored';
 import sharp, { type Sharp } from 'sharp';
+import { computeImageFacts, pixelDigest, type PixelDigest } from '../../src/decode.js';
 import { isIgnored } from '../../src/fsops.js';
+import { chooseKeeper } from '../../src/identical.js';
+import { parseKeeperTags } from '../../src/metadata.js';
 
 const execFile = promisify(execFileCb);
 
@@ -105,17 +108,32 @@ export interface SeedFile {
   mtimeNs: string;
   origin: 'corpus' | 'synthetic' | 'junk' | 'corrupt';
   seedName?: string;
-  variant?: 'resize50' | 'q60-noexif' | 'png' | 'bridge';
+  variant?: 'resize50' | 'q60-noexif' | 'png' | 'meta' | 'bridge';
   /**
    * Synthetic ground truth vs `seedName` (§6.3). `copy-if-tight`: a §6.3 row that is a copy only
    * within the copy distances, which this oracle can't measure; the e2e check takes them from
    * the pair's stored hashes. `copy-or-ambiguous` marks an EXIF-less copy of a burst frame
    * (spec §12 R3): it ends up a copy of one of `bridges` or `copy_ambiguous`, and the two
-   * `bridges` frames are never in the same copy group.
+   * `bridges` frames are never in the same copy group. `duplicate`: measured pixel-identical to
+   * its seed (identical-dedupe spec §3), so of the seed and its identical variants only
+   * `keeper` stays and every other one ends `DUPLICATE` of it.
    */
-  expect?: 'copy' | 'copy-if-tight' | 'similar' | 'copy-or-ambiguous';
+  expect?: 'copy' | 'copy-if-tight' | 'similar' | 'copy-or-ambiguous' | 'duplicate';
   /** `[seedName, its burst partner]` when `expect` is `copy-or-ambiguous`. */
   bridges?: [string, string];
+  /**
+   * With `duplicate`: the file of the seed's identical family the keeper rule keeps, by the
+   * measured tags and sizes: the seed's name or a variant's `relPath`. Absent when only ingest
+   * order would decide (rule `earlier`): then any one member may stay.
+   */
+  keeper?: string;
+  /**
+   * Measured pixel-identical to its seed, but with a different stored suspect key (pHash, dHash,
+   * width, height): a JPEG's hashes come from a shrink-on-load decode, its lossless PNG's from
+   * a full one, so a dHash bit can differ. The pipeline only compares suspects (spec §3), so
+   * the pair stays as today (`expect` from §6.3) and is counted as a missed identical pair.
+   */
+  missedIdentical?: true;
   reason?: string;
 }
 
@@ -246,13 +264,13 @@ async function inBatches<T>(
   return results.flat();
 }
 
-/** Raw `-G -n` tags per path (same order as `paths`). */
-async function readExif(paths: string[]): Promise<Tags[]> {
+/** Raw `-G -n` tags per path (same order as `paths`): `tags` (default the manifest's). */
+async function readExif(paths: string[], tags: readonly string[] = EXIF_TAGS): Promise<Tags[]> {
   const bin = await exiftoolPath();
   const lanes = Math.max(1, Math.min(4, availableParallelism() >> 1));
   return inBatches(paths, BATCH, lanes, async (batch) => {
     // exiftool exits 1 when some file can't be read (e.g. empty); its JSON is still complete.
-    const { stdout } = await execFile(bin, ['-j', '-n', '-G', ...EXIF_TAGS, ...batch], {
+    const { stdout } = await execFile(bin, ['-j', '-n', '-G', ...tags, ...batch], {
       maxBuffer: MAX_BUFFER,
     }).catch((err: unknown) => {
       const out = (err as { stdout?: string }).stdout;
@@ -849,7 +867,7 @@ async function writeCorrupt(dest: string, prefix: string): Promise<Item[]> {
 // ---------------------------------------------------------------------------------------------
 // Synthetic variants.
 
-/** At most this many still seeds get the three variants. */
+/** At most this many still seeds get the variants. */
 const SYNTH_SEEDS = 8;
 const SYNTH_STILL_EXT = new Set(['jpg', 'heic', 'png', 'tif']);
 
@@ -968,13 +986,30 @@ export async function synthesize(
       const { autoOrient } = await sharp(input).metadata();
       const out = await render(sharp(input).rotate(), autoOrient.width).toBuffer();
       await writeFile(join(dest, relPath), out, { flag: 'wx' });
-      // The seed's times, not "now": an EXIF-less variant that becomes a best copy is staged
-      // under its mtime, and two runs must get identical inputs (calm vs chaos, spec §10.4).
+      await seedTimes(seedName, relPath);
+      made.push({ relPath, seedName, variant });
+    };
+    // The seed's times, not "now": an EXIF-less variant that becomes a best copy is staged
+    // under its mtime, and two runs must get identical inputs (calm vs chaos, spec §10.4).
+    const seedTimes = async (seedName: string, relPath: string) => {
       const st = await stat(join(corpusDir, seedName), { bigint: true });
       const secs = (ns: bigint) => Number(ns) / 1e9;
       await utimes(join(dest, relPath), secs(st.atimeNs), secs(st.mtimeNs));
-      made.push({ relPath, seedName, variant });
     };
+    /** The seed's bytes with only `EXIF:Software` rewritten: an editor's metadata-only re-save. */
+    const emitMeta = async (seedName: string) => {
+      const relPath = `${prefix}synth-meta-${seedName.replaceAll('.', '_')}.jpg`;
+      const target = join(dest, relPath);
+      await copyFile(join(corpusDir, seedName), target, constants.COPYFILE_EXCL);
+      await execFile(await exiftoolPath(), [
+        '-overwrite_original',
+        `-EXIF:Software=${META_SOFTWARE}`,
+        target,
+      ]);
+      await seedTimes(seedName, relPath);
+      made.push({ relPath, seedName, variant: 'meta' });
+    };
+    const mimeOf = new Map(stills.map((n, i) => [n, enc[i]!.mime]));
     for (const { name } of seeds) {
       await emit(name, 'resize50', 'jpg', (img, w) =>
         img
@@ -984,6 +1019,7 @@ export async function synthesize(
       );
       await emit(name, 'q60-noexif', 'jpg', (img) => img.jpeg({ quality: 60 }));
       await emit(name, 'png', 'png', (img) => img.keepExif().png());
+      if (mimeOf.get(name) === 'image/jpeg') await emitMeta(name);
     }
     const frame = burst[0]?.[0];
     if (frame !== undefined) await emit(frame, 'bridge', 'jpg', (img) => img.jpeg({ quality: 85 }));
@@ -994,15 +1030,114 @@ export async function synthesize(
     dest,
     made.map((m) => m.relPath),
   );
+  const { families, missed } = await identicalFamilies(corpusDir, dest, made);
   const items: Item[] = made.map((m, i) => {
+    const family = families.get(m.relPath);
+    if (family)
+      return {
+        ...m,
+        origin: 'synthetic',
+        expect: 'duplicate',
+        ...(family.keeper === undefined ? {} : { keeper: family.keeper }),
+      };
     const v = truthFacts(out.facts[i]!, out.enc[i]!);
     const rel = expectedRelation(truth.get(m.seedName)!, v);
     const partner = partnerOf(m.seedName);
+    const flag = missed.has(m.relPath) ? { missedIdentical: true as const } : {};
     return rel !== 'similar' && v.capturedAt === null && partner !== undefined
-      ? { ...m, origin: 'synthetic', expect: 'copy-or-ambiguous', bridges: [m.seedName, partner] }
-      : { ...m, origin: 'synthetic', expect: rel };
+      ? {
+          ...m,
+          origin: 'synthetic',
+          expect: 'copy-or-ambiguous',
+          bridges: [m.seedName, partner],
+          ...flag,
+        }
+      : { ...m, origin: 'synthetic', expect: rel, ...flag };
   });
   return hashed(dest, items);
+}
+
+/** What an editor writes into `EXIF:Software` when it re-saves a `meta` variant. */
+const META_SOFTWARE = 'Picasa 3.0';
+/** The tags the keeper rule reads (src/metadata.ts `parseKeeperTags`). */
+const KEEPER_TAGS = [
+  '-EXIF:Software',
+  '-XMP:CreatorTool',
+  '-EXIF:DateTimeOriginal',
+  '-EXIF:Make',
+  '-EXIF:Model',
+  '-EXIF:GPSLatitude',
+  '-Composite:GPSLatitude',
+];
+
+/** The pipeline's own pixel digest, or null where it refuses (the pipeline then retires nothing). */
+const digestOf = (path: string): Promise<PixelDigest | null> =>
+  pixelDigest(path, extOf(path)).catch(() => null);
+
+const sameDigest = (a: PixelDigest | null, b: PixelDigest | null) =>
+  a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b);
+
+/** The pipeline's suspect key (phash, dhash, width, height), or null where it can't hash. */
+const suspectKeyOf = (path: string): Promise<string | null> =>
+  computeImageFacts(path, extOf(path)).then(
+    (f) => `${String(f.phash)}:${String(f.dhash)}:${String(f.width)}:${String(f.height)}`,
+    () => null,
+  );
+
+/**
+ * The `png` and `meta` variants measured pixel-identical to their seed (spec §3, the
+ * pipeline's decode) and sharing its suspect key, each with its family's expected keeper: the keeper rule on the measured
+ * tags and sizes, or none when only ingest order would separate two members. A `meta` variant
+ * is identical by construction: one that measures otherwise is a synthesis bug (one the
+ * pipeline can't digest either keeps its §6.3 expectation, as nothing is retired). `missed`:
+ * identical variants whose suspect key differs from the seed's (see `SeedFile.missedIdentical`).
+ */
+async function identicalFamilies(
+  corpusDir: string,
+  dest: string,
+  made: Array<{ relPath: string; seedName: string; variant: string }>,
+): Promise<{ families: Map<string, { keeper?: string }>; missed: Set<string> }> {
+  const out = new Map<string, { keeper?: string }>();
+  const missed = new Set<string>();
+  const candidates = made.filter((m) => m.variant === 'png' || m.variant === 'meta');
+  for (const seedName of [...new Set(candidates.map((m) => m.seedName))]) {
+    const seedPath = join(corpusDir, seedName);
+    const seedPx = await digestOf(seedPath);
+    const seedKey = await suspectKeyOf(seedPath);
+    const identical: typeof candidates = [];
+    for (const m of candidates.filter((c) => c.seedName === seedName)) {
+      const px = await digestOf(join(dest, m.relPath));
+      if (sameDigest(seedPx, px)) {
+        const key = await suspectKeyOf(join(dest, m.relPath));
+        if (seedKey !== null && key === seedKey) identical.push(m);
+        else if (m.variant === 'meta')
+          throw new Error(`synthesize: ${m.relPath} hashes differently from ${seedName}`);
+        else missed.add(m.relPath);
+      } else if (m.variant === 'meta' && seedPx !== null && px !== null)
+        throw new Error(`synthesize: ${m.relPath} is not pixel-identical to ${seedName}`);
+    }
+    if (identical.length === 0) continue;
+    const members = [
+      { ref: seedName, path: seedPath },
+      ...identical.map((m) => ({ ref: m.relPath, path: join(dest, m.relPath) })),
+    ];
+    const tags = await readExif(
+      members.map((x) => x.path),
+      KEEPER_TAGS,
+    );
+    const facts = await Promise.all(
+      members.map(async (x, i) => ({
+        sha256: x.ref,
+        ...parseKeeperTags(tags[i]!),
+        sizeBytes: (await stat(x.path, { bigint: true })).size,
+        ingestedAt: new Date(0),
+      })),
+    );
+    const { keeper, losers } = chooseKeeper(facts);
+    const decided = losers.every((l) => l.rule !== 'earlier');
+    for (const m of identical) out.set(m.relPath, decided ? { keeper } : {});
+  }
+  return { families: out, missed };
 }
 
 // ---------------------------------------------------------------------------------------------

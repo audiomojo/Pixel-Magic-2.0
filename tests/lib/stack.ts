@@ -317,7 +317,8 @@ export interface ChaosRun {
   marginS(): Promise<number>;
 }
 
-const TERMINAL_STILL_STATES = ['CLUSTERED', 'FAILED', 'QUARANTINED'];
+/** A retired duplicate has no decode or cluster step left either. */
+const TERMINAL_STILL_STATES = ['CLUSTERED', 'DUPLICATE', 'FAILED', 'QUARANTINED'];
 /** How long a killed service stays down before it is started again (as a supervisor would). */
 const KILL_DOWNTIME_MS = 5000;
 

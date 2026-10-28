@@ -36,7 +36,14 @@ function contentOf(w: World, sha: string): ContentRow {
   return c;
 }
 
-function sameGroup(w: World, a: string, b: string): boolean {
+/** A retired duplicate stands for its keeper: same picture, so same groups (spec §6 picks). */
+function standIn(w: World, sha: string): string {
+  const c = w.contents.get(sha);
+  return c?.state === 'DUPLICATE' && c.duplicateOf !== null ? c.duplicateOf : sha;
+}
+
+function sameGroup(w: World, x: string, y: string): boolean {
+  const [a, b] = [standIn(w, x), standIn(w, y)];
   if (a === b) return true;
   const ga = contentOf(w, a).copyGroup;
   return ga !== null && ga === contentOf(w, b).copyGroup;
@@ -133,7 +140,8 @@ type Variant = NonNullable<SeedFile['variant']>;
  * hashes say: a floor under the measured check, which a decode or hash regression would
  * otherwise pass. `png` is a lossless re-encode of the seed's own decoded pixels at the same
  * size. The rest are lossy or resized (a screenshot's `resize50` measures dHash 7, its
- * `q60-noexif` lands outside too), and synthesis makes no byte-level or metadata-only variant.
+ * `q60-noexif` lands outside too). A `png` measured pixel-identical to its seed, and every
+ * metadata-only `meta` re-save, is expected `duplicate` instead (never `copy-if-tight`).
  */
 export const TIGHT_BY_CONSTRUCTION: ReadonlySet<Variant> = new Set<Variant>(['png']);
 
@@ -167,6 +175,44 @@ export function copyIfTightSummary(
     .map(([k, n]) => `${k} ${String(n)}`)
     .join(', ');
   return `${head} (${kinds}): ${loose.join('; ')}`;
+}
+
+/** One member of a seed's pixel-identical family, for `duplicateFamilyFindings`. */
+export interface FamilyMember {
+  /** How findings name it (its drop-zone path). */
+  at: string;
+  sha256: string;
+  state: string;
+  duplicateOf: string | null;
+}
+
+/**
+ * A seed and its variants measured pixel-identical to it: exactly one member stays (CLUSTERED;
+ * `keeper` when the keeper rule decides, any one when only ingest order would) and every other
+ * one is `DUPLICATE` of it.
+ */
+export function duplicateFamilyFindings(members: FamilyMember[], keeper: string | null): string[] {
+  const out: string[] = [];
+  const name = `identical family [${members.map((m) => m.at).join(', ')}]`;
+  const kept = members.filter((m) => m.state !== 'DUPLICATE');
+  if (kept.length !== 1) {
+    out.push(
+      `${name}: expected one survivor, found ${String(kept.length)} (${kept.map((m) => m.at).join(', ')})`,
+    );
+    return out;
+  }
+  const survivor = kept[0]!;
+  if (keeper !== null && survivor.sha256 !== keeper) {
+    const want = members.find((m) => m.sha256 === keeper)?.at ?? keeper;
+    out.push(`${name}: expected ${want} to stay, ${survivor.at} did`);
+    return out;
+  }
+  if (survivor.state !== 'CLUSTERED')
+    out.push(`${survivor.at}: kept, expected CLUSTERED, got ${survivor.state}`);
+  for (const m of members)
+    if (m !== survivor && m.duplicateOf !== survivor.sha256)
+      out.push(`${m.at}: DUPLICATE of ${String(m.duplicateOf)}, expected of ${survivor.at}`);
+  return out;
 }
 
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
@@ -243,7 +289,7 @@ export async function diffExpectations(
     seeded.filter((f) => f.origin === 'corpus').map((f) => [f.name, f.sha256]),
   );
   const group = (sha: string) => w.contents.get(sha)?.copyGroup ?? null;
-  const same = (a: string, b: string) => a === b || (group(a) !== null && group(a) === group(b));
+  const same = (a: string, b: string) => sameGroup(w, a, b);
   /** The pair's stored hash distances, or null when either lacks hashes. */
   const distance = (a: string, b: string): { p: number; d: number } | null => {
     const [x, y] = [w.contents.get(a), w.contents.get(b)];
@@ -260,7 +306,58 @@ export async function diffExpectations(
     return x !== null && x.p <= t.copyPhash && x.d <= t.copyDhash;
   };
   const resolved: Parameters<typeof copyIfTightSummary>[0] = [];
-  for (const v of seeded.filter((f) => f.origin === 'synthetic')) {
+  // Pixel-identical families (identical-dedupe spec §3–§5): the seed and its `duplicate` variants.
+  const families = new Map<string, SeedFile[]>();
+  for (const v of seeded.filter((f) => f.origin === 'synthetic' && f.expect === 'duplicate'))
+    families.set(v.seedName ?? '', [...(families.get(v.seedName ?? '') ?? []), v]);
+  let retired = 0;
+  for (const [seedName, variants] of families) {
+    const seedFile = seeded.find((f) => f.origin === 'corpus' && f.name === seedName);
+    if (!seedFile) {
+      out.push(`${variants.map((v) => v.relPath).join(', ')}: seed ${seedName} was not seeded`);
+      continue;
+    }
+    const files = [seedFile, ...variants];
+    const members: FamilyMember[] = [];
+    for (const f of files) {
+      const c = contentFor(f);
+      if (c)
+        members.push({
+          at: f.relPath,
+          sha256: c.sha256,
+          state: c.state,
+          duplicateOf: c.duplicateOf,
+        });
+    }
+    if (members.length !== files.length) continue;
+    const keepers = new Set(variants.map((v) => v.keeper ?? null));
+    if (keepers.size !== 1) {
+      out.push(`identical family of ${seedName}: variants disagree on the keeper`);
+      continue;
+    }
+    const keeper = [...keepers][0]!;
+    const keeperSha =
+      keeper === null
+        ? null
+        : keeper === seedName
+          ? seedFile.sha256
+          : (variants.find((v) => v.relPath === keeper)?.sha256 ?? keeper);
+    out.push(...duplicateFamilyFindings(members, keeperSha));
+    retired += members.filter((m) => m.state === 'DUPLICATE').length;
+  }
+  const corpusShas = new Set(seeded.filter((f) => f.origin === 'corpus').map((f) => f.sha256));
+  const corpusRetired = [...w.contents.values()].filter(
+    (c) => c.state === 'DUPLICATE' && corpusShas.has(c.sha256),
+  ).length;
+  // Printed even when the test passes (vitest shows `console` output of failing tests only).
+  process.stdout.write(
+    `duplicate: ${String(families.size)} identical families expected ` +
+      `(${String([...families.values()].flat().length)} variants), ${String(retired)} members retired; ` +
+      `${String(corpusRetired)} corpus contents retired in all; ` +
+      `${String(seeded.filter((f) => f.missedIdentical).length)} pixel-identical variants with ` +
+      `another suspect key (never compared, kept as today)\n`,
+  );
+  for (const v of seeded.filter((f) => f.origin === 'synthetic' && f.expect !== 'duplicate')) {
     const c = contentFor(v);
     const s = seedSha.get(v.seedName ?? '');
     if (!c || s === undefined) {
@@ -289,7 +386,7 @@ export async function diffExpectations(
       // Within the look-alike distances by construction: always in the seed's similar set. Its
       // copy group only through another variant of the same seed that is a copy of both (an
       // EXIF-less re-encode bridging them, spec §6.3 transitive union).
-      const sc = w.contents.get(s);
+      const sc = w.contents.get(standIn(w, s));
       if (!same(v.sha256, s) && (c.similarSet === null || c.similarSet !== sc?.similarSet))
         out.push(`${v.relPath}: expected similar to ${String(v.seedName)}, not in its similar set`);
       const bridged = seeded.some(

@@ -7,7 +7,13 @@ import { copyGroups, loadWorld, type ContentRow } from './db.js';
 import { stagedEntries } from './snapshot.js';
 
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
-const FINAL_STILL_STATES = new Set(['CLUSTERED', 'QUARANTINED', 'FAILED']);
+/** A still's end states; a retired pixel-identical duplicate is never clustered. */
+export const FINAL_STILL_STATES: ReadonlySet<string> = new Set([
+  'CLUSTERED',
+  'DUPLICATE',
+  'QUARANTINED',
+  'FAILED',
+]);
 
 async function filesUnder(root: string): Promise<string[]> {
   try {
@@ -51,10 +57,45 @@ const conflict = (
 ) => a.s !== b.s || (a.sub !== null && b.sub !== null && a.sub !== b.sub);
 
 /**
+ * A seeded sha's vault count: exactly once, or zero times once its content was retired as a
+ * pixel-identical duplicate and its vault file removed (identical-dedupe spec §5).
+ */
+export function vaultCountFinding(
+  sha: string,
+  n: number,
+  content: Pick<ContentRow, 'state' | 'duplicateRemovedAt'> | undefined,
+): string | null {
+  const removed = content?.state === 'DUPLICATE' && content.duplicateRemovedAt !== null;
+  if (removed)
+    return n === 0
+      ? null
+      : `bytes ${sha}: in the vault ${String(n)} times, expected zero times (DUPLICATE, removed)`;
+  return n === 1 ? null : `bytes ${sha}: in the vault ${String(n)} times, expected exactly once`;
+}
+
+/** After idle: each retired content was removed, unflagged, and points at a kept content. */
+export function duplicateRowFindings(contents: ReadonlyMap<string, ContentRow>): string[] {
+  const out: string[] = [];
+  for (const c of contents.values()) {
+    if (c.state !== 'DUPLICATE') continue;
+    const at = `content ${c.sha256}: DUPLICATE of ${String(c.duplicateOf)}`;
+    const keeper = c.duplicateOf === null ? undefined : contents.get(c.duplicateOf);
+    if (keeper === undefined) out.push(`${at}, which has no contents row`);
+    else if (keeper.state === 'DUPLICATE') out.push(`${at}, which is itself DUPLICATE`);
+    if (c.duplicateMismatch) out.push(`${at}, flagged duplicate_mismatch`);
+    else if (c.duplicateRemovedAt === null) out.push(`${at}, vault file not removed after idle`);
+  }
+  return out.sort();
+}
+
+/**
  * - every seeded file has exactly one final row (ignored names: none, and no row is left
  *   DISCOVERED/CLAIMED); every still content is final; any FAILED content has a `last_error`
  * - `sha256(vault file) == name` for every vault file; every distinct seeded sha256 is in the
- *   vault exactly once; `work/claimed/` is empty
+ *   vault exactly once, or zero times when its content is `DUPLICATE` with `duplicate_removed_at`
+ *   set; `work/claimed/` is empty
+ * - after idle every `DUPLICATE` content's vault file is removed, none is flagged
+ *   `duplicate_mismatch`, and each points at a content that is not itself `DUPLICATE`
  * - after idle `.copies` holds no confirmed duplicate: every COPY row is marked removed (its
  *   size reclaimed), none is flagged `copy_mismatch`, and `.copies` is empty (spec §6.5)
  * - staging holds each non-motion content once: a byte-identical COPY is never staged (a paired
@@ -109,9 +150,10 @@ export async function checkInvariant(
     if (inCopies) out.push(`${p.slice(dataDir.length + 1)}: a duplicate still in .copies`);
   });
   for (const sha of new Set(sm.files.filter((f) => !isIgnored(f.name)).map((f) => f.sha256))) {
-    const n = held.get(sha) ?? 0;
-    if (n !== 1) out.push(`bytes ${sha}: in the vault ${String(n)} times, expected exactly once`);
+    const finding = vaultCountFinding(sha, held.get(sha) ?? 0, w.contents.get(sha));
+    if (finding !== null) out.push(finding);
   }
+  out.push(...duplicateRowFindings(w.contents));
   for (const f of w.files) {
     if (f.state !== 'COPY') continue;
     const at = `files ${String(f.id)} ${f.relPath}`;
