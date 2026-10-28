@@ -194,3 +194,17 @@ const MAX_SKIPPED = 50;
 export function addSkipped(list, id) {
   return [...list.filter((x) => x !== id), id].slice(-MAX_SKIPPED);
 }
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+/** The purge dialog's question from the preview `{shown, copies, live, bytes}` (zero parts left out). */
+export function purgeSentence({ shown, copies, live, bytes }) {
+  const parts = [
+    shown > 0 && plural(shown, 'photo', 'photos'),
+    copies > 0 && plural(copies, 'hidden copy', 'hidden copies'),
+    live > 0 && plural(live, 'Live Photo video', 'Live Photo videos'),
+  ].filter(Boolean);
+  const list = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : parts[0];
+  const mb = (Number(bytes) / 1_000_000).toFixed(1);
+  return `Delete these ${list} (${mb} MB) from the vault? Your originals on the source drives are not touched. These files will be blocked from coming back.`;
+}

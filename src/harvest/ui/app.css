@@ -393,3 +393,15 @@ dialog::backdrop {
   height: 3rem;
   vertical-align: middle;
 }
+.purge-dialog .purge-text {
+  margin-top: 0;
+}
+.purged-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.purged-list li {
+  padding: 0.3rem 0;
+  border-top: 1px solid var(--line);
+}

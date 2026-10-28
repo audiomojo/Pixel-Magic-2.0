@@ -10,6 +10,7 @@ import {
   isStalled,
   junkSummary,
   parseHash,
+  purgeSentence,
   addSkipped,
   rateText,
   runTotals,
@@ -297,5 +298,28 @@ describe('addSkipped', () => {
     expect(r).toHaveLength(50);
     expect(r[0]).toBe('1');
     expect(r.at(-1)).toBe('99');
+  });
+});
+
+describe('purgeSentence', () => {
+  const tail =
+    ' from the vault? Your originals on the source drives are not touched. These files will be blocked from coming back.';
+  it('leaves out zero counts', () => {
+    expect(purgeSentence({ shown: 2, copies: 0, live: 0, bytes: 14_200_000 })).toBe(
+      `Delete these 2 photos (14.2 MB)${tail}`,
+    );
+  });
+  it('joins three parts without an Oxford comma', () => {
+    expect(purgeSentence({ shown: 2, copies: 3, live: 1, bytes: 14_200_000 })).toBe(
+      `Delete these 2 photos, 3 hidden copies and 1 Live Photo video (14.2 MB)${tail}`,
+    );
+  });
+  it('uses singular forms and joins two parts with "and"', () => {
+    expect(purgeSentence({ shown: 2, copies: 1, live: 0, bytes: 1_000_000 })).toBe(
+      `Delete these 2 photos and 1 hidden copy (1.0 MB)${tail}`,
+    );
+    expect(purgeSentence({ shown: 2, copies: 0, live: 2, bytes: 50_000 })).toBe(
+      `Delete these 2 photos and 2 Live Photo videos (0.1 MB)${tail}`,
+    );
   });
 });

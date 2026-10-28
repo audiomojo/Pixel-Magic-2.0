@@ -537,3 +537,145 @@ test('picks: after 51 skips the skip list stays within the API cap', async () =>
   await eventually(async () => ((await shownNames(e))[0] ?? '') !== prev, true);
   expect(Math.max(...lens)).toBe(50);
 });
+
+// ---- purging a set ------------------------------------------------------------------------
+/** Links set `id` to a copy group holding its shown members, plus one hidden copy; returns it. */
+async function groupSet(id: number, shown: string[]): Promise<string> {
+  await q(`INSERT INTO groups (id, kind, similar_set_id) VALUES ($1, 'copy', $1)`, [id]);
+  const hidden = sha(id * 100 + 50);
+  await q(
+    `INSERT INTO contents (sha256, ext, kind, size_bytes, state, captured_at)
+     VALUES ($1, 'jpg', 'still', 2000, 'CLUSTERED', '2024-05-01T10:00:00Z')`,
+    [hidden],
+  );
+  for (const s of [...shown, hidden])
+    await q('UPDATE contents SET copy_group_id = $2 WHERE sha256 = $1', [s, id]);
+  return hidden;
+}
+const purgeSentenceRe =
+  /^Delete these 2 photos and 1 hidden copy \(0\.0 MB\) from the vault\? Your originals on the source drives are not touched\. These files will be blocked from coming back\.$/;
+
+test('purge: Purge set… shows the counts, Cancel changes nothing, no key opens it', async () => {
+  const e = await setup();
+  const shown = await seedSet(1, 2);
+  await groupSet(1, shown);
+  const posts: string[] = [];
+  e.page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/api/picks/purge')) posts.push(r.url());
+  });
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  for (const k of ['p', 'P', 'Delete', 'Backspace', 'x']) await e.page.keyboard.press(k);
+  expect(await e.page.locator('dialog[open]').count()).toBe(0);
+  await e.page.getByRole('button', { name: 'Purge set…' }).click();
+  const dlg = e.page.locator('dialog.purge-dialog');
+  await dlg
+    .locator('.purge-text')
+    .filter({ hasText: /^Delete these/ })
+    .waitFor();
+  expect(await dlg.locator('.purge-text').textContent()).toMatch(purgeSentenceRe);
+  await e.page.getByRole('button', { name: 'Cancel' }).waitFor();
+  expect(await e.page.evaluate('document.activeElement?.textContent')).toBe('Cancel');
+  await e.page.keyboard.press('Escape');
+  await dlg.waitFor({ state: 'hidden' });
+  await e.page.getByRole('button', { name: 'Purge set…' }).click();
+  await e.page.getByRole('button', { name: 'Cancel' }).click();
+  await dlg.waitFor({ state: 'hidden' });
+  expect(await shownNames(e)).toHaveLength(2);
+  expect(posts).toEqual([]);
+  expect((await q(`SELECT 1 FROM purged`)).rowCount).toBe(0);
+});
+
+test('purge: Purge deletes the set, loads the next one and lists it under Purged', async () => {
+  const e = await setup();
+  const first = await seedSet(1, 2);
+  await groupSet(1, first);
+  await seedSet(2, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  const purgedSet = (await shownNames(e))[0]!.slice(0, 1);
+  if (purgedSet === '2') await e.page.keyboard.press('s'); // work on set 1
+  await eventually(async () => (await shownNames(e))[0]?.slice(0, 1), '1');
+  await e.page.getByRole('button', { name: 'Purge set…' }).click();
+  await e.page
+    .locator('.purge-text')
+    .filter({ hasText: /^Delete these/ })
+    .waitFor();
+  await e.page.getByRole('button', { name: 'Purge', exact: true }).click();
+  await eventually(async () => (await shownNames(e))[0]?.slice(0, 1), '2');
+  expect((await q(`SELECT count(*)::int AS n FROM purged`)).rows[0]).toEqual({ n: 3 });
+  expect(await pickRows()).toEqual([]);
+  const row = e.page.locator('.purged-list li');
+  await row.waitFor();
+  const text = (await row.textContent())!;
+  expect(text).toContain('1-0.jpg');
+  expect(text).toContain('3 files');
+  expect(text).toContain('4.0 KB');
+});
+
+test('purge: a changed set answers 409, shows a notice and reloads', async () => {
+  const e = await setup();
+  const shown = await seedSet(1, 2);
+  await groupSet(1, shown);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  await e.page.getByRole('button', { name: 'Purge set…' }).click();
+  await e.page
+    .locator('.purge-text')
+    .filter({ hasText: /^Delete these/ })
+    .waitFor();
+  // The set grows behind the open dialog.
+  const extra = sha(199);
+  await q(
+    `INSERT INTO contents (sha256, ext, kind, size_bytes, state, captured_at)
+     VALUES ($1, 'jpg', 'still', 1000, 'CLUSTERED', '2024-05-01T10:00:00Z')`,
+    [extra],
+  );
+  await q(
+    `INSERT INTO files (rel_path, original_name, size_bytes, mtime_ns, ext, sha256, state)
+     VALUES ('dir/1-9.jpg', '1-9.jpg', 1000, 1, 'jpg', $1, 'INGESTED')`,
+    [extra],
+  );
+  await q('INSERT INTO similar_candidates (set_id, sha256) VALUES (1, $1)', [extra]);
+  await q(
+    `INSERT INTO photo_features (sha256, feature_version, embedding, quality, faces)
+     VALUES ($1, 1, '{}', '{}', '[]')`,
+    [extra],
+  );
+  await e.page.getByRole('button', { name: 'Purge', exact: true }).click();
+  await e.page.getByText(/set changed/).waitFor();
+  // The browser logs the expected 409 as a console error; every other one still fails the test.
+  pageErrors = pageErrors.filter((m) => !m.includes('status of 409'));
+  await eventually(() => shownNames(e).then((n) => n.length), 3);
+  expect((await q(`SELECT 1 FROM purged`)).rowCount).toBe(0);
+});
+
+test('purge: Unblock asks first and marks the row', async () => {
+  const e = await setup();
+  const shown = await seedSet(1, 2);
+  await groupSet(1, shown);
+  await seedSet(2, 2);
+  await e.open('#/picks');
+  await eventually(() => shownNames(e).then((n) => n.length), 2);
+  if ((await shownNames(e))[0]!.startsWith('2')) await e.page.keyboard.press('s');
+  await e.page.getByRole('button', { name: 'Purge set…' }).click();
+  await e.page
+    .locator('.purge-text')
+    .filter({ hasText: /^Delete these/ })
+    .waitFor();
+  await e.page.getByRole('button', { name: 'Purge', exact: true }).click();
+  await e.page.locator('.purged-list li').waitFor();
+  const unblocks: string[] = [];
+  e.page.on('request', (r) => {
+    if (r.url().endsWith('/api/picks/unblock')) unblocks.push(r.url());
+  });
+  await e.page.getByRole('button', { name: 'Unblock' }).click();
+  await e.page.locator('#confirm').getByRole('button', { name: 'Back' }).click();
+  expect(unblocks).toEqual([]);
+  await e.page.getByRole('button', { name: 'Unblock' }).click();
+  await e.page.locator('#confirm-yes').click();
+  await e.page.getByText('unblocked — returns on next harvest').waitFor();
+  expect(
+    (await q(`SELECT count(*)::int AS n FROM purged WHERE unblocked_at IS NOT NULL`)).rows[0],
+  ).toEqual({ n: 3 });
+});

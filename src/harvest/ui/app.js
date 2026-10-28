@@ -375,7 +375,16 @@ function navigate() {
   })[route.name]();
 }
 function openPicks() {
-  paintPicks({ main, h, api, post, button, message, routeIs: (name) => route.name === name });
+  paintPicks({
+    main,
+    h,
+    api,
+    post,
+    button,
+    message,
+    confirm: confirmDialog,
+    routeIs: (name) => route.name === name,
+  });
 }
 window.addEventListener('hashchange', navigate);
 

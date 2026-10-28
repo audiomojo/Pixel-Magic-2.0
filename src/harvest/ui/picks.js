@@ -2,7 +2,7 @@
 // what it picked, and watch the scoreboard. Server text goes in with textContent only.
 // Reasons travel with the pick POST (the API takes them there), so the reason chips are shown
 // BEFORE confirming: choose, tick any reasons, then Confirm (or Enter) stores the pick and reveals.
-import { addSkipped } from './format.js';
+import { addSkipped, bytes, count, day, purgeSentence } from './format.js';
 import { paintScoreboard } from './scoreboard.js';
 
 const REASONS = ['sharper', 'eyes open', 'expression', 'framing', 'exposure'];
@@ -22,11 +22,12 @@ let active = null;
 /** `ui` = {main, h, api, post, button, message, routeIs}; app.js owns routing. */
 export function openPicks(ui) {
   active?.end();
-  const { h, api, post, button, message, routeIs } = ui;
+  const { h, api, post, button, message, routeIs, confirm: askConfirm } = ui;
   const main = ui.main();
   const board = h('section', { className: 'panel', 'aria-label': 'Scoreboard' });
   const teach = h('section', { 'aria-label': 'Teach' });
-  main.replaceChildren(h('h2', {}, 'Picks'), board, teach);
+  const purgedBox = h('section', { className: 'panel', 'aria-label': 'Purged' });
+  main.replaceChildren(h('h2', {}, 'Picks'), board, teach, purgedBox);
 
   let cur = null; // {set, token, today}
   let choice = null; // index of the chosen candidate, 'none', or null
@@ -185,6 +186,7 @@ export function openPicks(ui) {
       actions.append(
         button('No clear best', () => choose('none')),
         button('Skip', skip),
+        button('Purge set…', purgeSet, '', { className: 'btn purge-btn' }),
       );
     }
   }
@@ -200,6 +202,90 @@ export function openPicks(ui) {
     skipped = addSkipped(skipped, cur.set.id);
     guarded(load);
   };
+
+  // ---- purging a set: a modal question, then the next set ------------------------------------
+  /** Asks in a native <dialog> (Escape and Cancel both leave everything as it was); true = Purge. */
+  function askPurge(text) {
+    const cancel = button('Cancel', () => dlg.close('no'));
+    const yes = button('Purge', () => dlg.close('yes'), 'primary');
+    const dlg = h(
+      'dialog',
+      { className: 'purge-dialog', 'aria-label': 'Purge set' },
+      h('p', { className: 'purge-text' }, text),
+      h('div', { className: 'row end' }, cancel, yes),
+    );
+    document.body.append(dlg);
+    return new Promise((resolve) => {
+      dlg.addEventListener(
+        'close',
+        () => {
+          dlg.remove();
+          resolve(dlg.returnValue === 'yes');
+        },
+        { once: true },
+      );
+      dlg.showModal();
+      cancel.focus();
+    });
+  }
+
+  function purgeSet() {
+    if (revealed || !cur?.set) return;
+    guarded(async () => {
+      const { token } = cur;
+      try {
+        const pv = await api(`/api/picks/purge-preview?token=${encodeURIComponent(token)}`);
+        if (ended || cur.token !== token) return;
+        if (!(await askPurge(purgeSentence(pv)))) return;
+        await post('/api/picks/purge', { token });
+      } catch (e) {
+        if (e.message !== 'set changed') throw e;
+        await load();
+        teach.prepend(message('That set changed, so nothing was purged. Here it is again.', true));
+        return;
+      }
+      await load();
+      await paintPurged();
+    });
+  }
+
+  // ---- the Purged list --------------------------------------------------------------------------
+  async function paintPurged() {
+    const { purges } = await api('/api/picks/purged');
+    if (ended) return;
+    purgedBox.replaceChildren(
+      h('h3', {}, 'Purged'),
+      purges.length === 0
+        ? h('p', { className: 'muted' }, 'Nothing purged.')
+        : h(
+            'ul',
+            { className: 'purged-list' },
+            purges.map((p) =>
+              h(
+                'li',
+                {},
+                h('span', { className: 'name' }, p.names.join(', ') || p.shas[0]),
+                ` · ${day(p.purgedAt)} · ${bytes(p.bytes)} · ${count(p.files)} file${p.files === 1 ? '' : 's'} `,
+                p.unblocked
+                  ? h('span', { className: 'muted' }, 'unblocked — returns on next harvest')
+                  : button('Unblock', () => unblockPurge(p)),
+              ),
+            ),
+          ),
+    );
+  }
+
+  const unblockPurge = (p) =>
+    guarded(async () => {
+      const yes = await askConfirm(
+        'Unblock these files?',
+        'They will be allowed back into the vault the next time their folder is harvested.',
+        'Unblock',
+      );
+      if (!yes) return;
+      await post('/api/picks/unblock', { shas: p.shas });
+      await paintPurged();
+    });
 
   function confirm() {
     if (revealed || choice === null) return false;
@@ -248,6 +334,7 @@ export function openPicks(ui) {
   // ---- keys: only on this view, never while typing --------------------------------------------
   function onKey(ev) {
     if (!routeIs('picks') || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (document.querySelector('dialog[open]')) return; // a modal question owns the keyboard
     const t = ev.target;
     if (
       t instanceof HTMLElement &&
@@ -272,5 +359,8 @@ export function openPicks(ui) {
   active = { end };
 
   paintBoard();
-  guarded(load);
+  guarded(async () => {
+    await load();
+    await paintPurged();
+  });
 }
