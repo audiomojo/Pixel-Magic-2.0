@@ -510,8 +510,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
   async function postUnblock(body: unknown): Promise<Json> {
     const { shas } = parse(unblockBody, body);
     const n = await unblock(pool, [...new Set(shas)]);
-    await startSync([]);
-    return { unblocked: n };
+    return (await startSync([])) ? { unblocked: n } : { unblocked: n, syncStarted: false };
   }
 
   // ---- scoreboard ---------------------------------------------------------------------

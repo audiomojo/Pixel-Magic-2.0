@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Client } from '@temporalio/client';
 import type { PurgeSyncWorkflow } from '../workflows.js';
 
@@ -16,7 +17,7 @@ export function temporalPipelineControl(client: Client): PipelineControl {
     async startPurgeSync(shas) {
       await client.workflow.start<typeof PurgeSyncWorkflow>('PurgeSyncWorkflow', {
         taskQueue: 'main',
-        workflowId: `pm-purge-${String(Date.now())}`,
+        workflowId: `pm-purge-${randomUUID()}`,
         args: [shas],
       });
     },

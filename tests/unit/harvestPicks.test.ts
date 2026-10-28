@@ -10,6 +10,7 @@ import type { RunControl } from '../../src/harvest/activities.js';
 import type { AiControl } from '../../src/harvest/aiControl.js';
 import { loadHarvestSettings } from '../../src/harvest/config.js';
 import { signToken, verifyToken, type PickToken } from '../../src/harvest/picks.js';
+import { temporalPipelineControl } from '../../src/harvest/pipelineControl.js';
 import { createHarvestServer, type HarvestServerDeps } from '../../src/harvest/server.js';
 import type { SystemProbe } from '../../src/harvest/sources.js';
 import { placeholderJpeg } from '../../src/harvest/thumbs.js';
@@ -934,6 +935,37 @@ describe('purge API', () => {
     expect(r.json).toEqual({ unblocked: 1 });
     expect(e.sync.calls).toEqual([[]]);
     expect((await e.get('/api/picks/purged')).json.purges[0].unblocked).toBe(true);
+  });
+
+  test('an unblock whose sync cannot start is reported, not an error', async () => {
+    const e = await setup();
+    await content(A, { size: 10 });
+    await pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 10, '{}', now())`,
+      [A],
+    );
+    e.sync.fail = true;
+    const r = await e.post('/api/picks/unblock', { shas: [A] });
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({ unblocked: 1, syncStarted: false });
+  });
+
+  test('PurgeSyncWorkflow ids are unique per start (no clash within a millisecond)', async () => {
+    const started: { type: string; id: string; args: unknown[] }[] = [];
+    const client = {
+      workflow: {
+        start: (type: string, o: { workflowId: string; args: unknown[] }) => {
+          started.push({ type, id: o.workflowId, args: o.args });
+          return Promise.resolve();
+        },
+      },
+    };
+    const pc = temporalPipelineControl(client as never);
+    await Promise.all([pc.startPurgeSync(['a']), pc.startPurgeSync([])]);
+    expect(started.map((x) => x.type)).toEqual(['PurgeSyncWorkflow', 'PurgeSyncWorkflow']);
+    for (const x of started) expect(x.id).toMatch(/^pm-purge-[0-9a-f-]{36}$/);
+    expect(started[0]!.id).not.toBe(started[1]!.id);
+    expect(started.map((x) => x.args)).toEqual([[['a']], [[]]]);
   });
 
   test('purge routes enforce the POST header', async () => {
