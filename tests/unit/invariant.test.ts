@@ -1,6 +1,12 @@
 import { expect, test } from 'vitest';
 import type { ContentRow } from '../lib/db.js';
-import { duplicateRowFindings, FINAL_STILL_STATES, vaultCountFinding } from '../lib/invariant.js';
+import {
+  blockedFileFinding,
+  duplicateRowFindings,
+  FINAL_STILL_STATES,
+  purgedRowFindings,
+  vaultCountFinding,
+} from '../lib/invariant.js';
 
 const row = (sha256: string, o: Partial<ContentRow> = {}): ContentRow => ({
   sha256,
@@ -20,6 +26,9 @@ const row = (sha256: string, o: Partial<ContentRow> = {}): ContentRow => ({
   duplicateOf: null,
   duplicateRemovedAt: null,
   duplicateMismatch: false,
+  purgedAt: null,
+  purgeRemovedAt: null,
+  purgeMismatch: false,
   ...o,
 });
 const AT = new Date('2026-10-27T00:00:00Z');
@@ -86,4 +95,47 @@ test('a retired duplicate is a final still state (it is never clustered)', () =>
     'FAILED',
     'QUARANTINED',
   ]);
+});
+
+test('an expected purge, removed, is in the vault zero times; any other purge keeps the once rule', () => {
+  const purged = row('a', { state: 'PURGED', purgedAt: AT, purgeRemovedAt: AT });
+  const expected = new Set(['a']);
+  expect(vaultCountFinding('a', 0, purged, expected)).toBeNull();
+  expect(vaultCountFinding('a', 1, purged, expected)).toBe(
+    'bytes a: in the vault 1 times, expected zero times (PURGED, removed)',
+  );
+  // Not an expected purge: its missing vault file is reported, not explained away.
+  expect(vaultCountFinding('a', 0, purged)).toBe(
+    'bytes a: in the vault 0 times, expected exactly once',
+  );
+  // Purged but removal pending: the file is still there, once.
+  const pending = row('a', { state: 'PURGED', purgedAt: AT });
+  expect(vaultCountFinding('a', 1, pending, expected)).toBeNull();
+});
+
+test('after idle exactly the expected purges are PURGED, removed and unflagged', () => {
+  const ok = row('a', { state: 'PURGED', purgedAt: AT, purgeRemovedAt: AT });
+  expect(purgedRowFindings(new Map([['a', ok]]), new Set(['a']))).toEqual([]);
+  const contents = new Map([
+    ['a', ok],
+    ['b', row('b', { state: 'PURGED', purgedAt: AT })],
+    ['c', row('c', { state: 'PURGED', purgedAt: AT, purgeRemovedAt: AT, purgeMismatch: true })],
+    ['d', row('d')],
+  ]);
+  expect(purgedRowFindings(contents, new Set(['b', 'c', 'd', 'e']))).toEqual([
+    'content a: PURGED, but in no expected purge',
+    'content b: PURGED, vault file not removed after idle',
+    'content c: PURGED, flagged purge_mismatch',
+    'content d: expected PURGED, got CLUSTERED',
+    'content e: expected PURGED, has no contents row',
+  ]);
+});
+
+test('a BLOCKED drop is final only for the bytes of an expected purge', () => {
+  const f = { id: 7n, relPath: 'x/a.jpg', state: 'BLOCKED', sha256: 'a' };
+  expect(blockedFileFinding(f, new Set(['a']))).toBeNull();
+  expect(blockedFileFinding(f, new Set())).toBe(
+    'files 7 x/a.jpg: BLOCKED, but its sha a is in no expected purge',
+  );
+  expect(blockedFileFinding({ ...f, state: 'INGESTED' }, new Set())).toBeNull();
 });

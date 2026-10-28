@@ -3,7 +3,7 @@ import { lstat, readdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { isIgnored } from '../../src/fsops.js';
 import { hashFiles, type SeedManifest } from '../../tools/corpus/lib.js';
-import { copyGroups, loadWorld, type ContentRow } from './db.js';
+import { copyGroups, loadWorld, type ContentRow, type FileRow } from './db.js';
 import { stagedEntries } from './snapshot.js';
 
 const FINAL_FILE_STATES = new Set(['INGESTED', 'COPY', 'QUARANTINED']);
@@ -57,20 +57,69 @@ const conflict = (
 ) => a.s !== b.s || (a.sub !== null && b.sub !== null && a.sub !== b.sub);
 
 /**
+ * What a run is expected to have purged (purge spec §5): a test that purges a set names its
+ * closure here, so the purge is an expected outcome and any other purge stays a finding.
+ */
+export interface Purges {
+  /** Every sha256 of the purged closures. */
+  purged?: ReadonlySet<string>;
+}
+
+/**
  * A seeded sha's vault count: exactly once, or zero times once its content was retired as a
- * pixel-identical duplicate and its vault file removed (identical-dedupe spec §5).
+ * pixel-identical duplicate (identical-dedupe spec §5) or purged as `expected` (purge spec §6)
+ * and its vault file removed.
  */
 export function vaultCountFinding(
   sha: string,
   n: number,
-  content: Pick<ContentRow, 'state' | 'duplicateRemovedAt'> | undefined,
+  content: Pick<ContentRow, 'state' | 'duplicateRemovedAt' | 'purgeRemovedAt'> | undefined,
+  expectedPurged: ReadonlySet<string> = new Set(),
 ): string | null {
-  const removed = content?.state === 'DUPLICATE' && content.duplicateRemovedAt !== null;
-  if (removed)
+  let removed: 'DUPLICATE' | 'PURGED' | null = null;
+  if (content?.state === 'DUPLICATE' && content.duplicateRemovedAt !== null) removed = 'DUPLICATE';
+  if (content?.state === 'PURGED' && expectedPurged.has(sha) && content.purgeRemovedAt !== null)
+    removed = 'PURGED';
+  if (removed !== null)
     return n === 0
       ? null
-      : `bytes ${sha}: in the vault ${String(n)} times, expected zero times (DUPLICATE, removed)`;
+      : `bytes ${sha}: in the vault ${String(n)} times, expected zero times (${removed}, removed)`;
   return n === 1 ? null : `bytes ${sha}: in the vault ${String(n)} times, expected exactly once`;
+}
+
+/**
+ * After idle: every `expected` sha is PURGED, its vault file removed and unflagged; a PURGED
+ * content outside `expected` is a purge nobody asked for.
+ */
+export function purgedRowFindings(
+  contents: ReadonlyMap<string, ContentRow>,
+  expected: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  for (const sha of expected) {
+    const c = contents.get(sha);
+    if (c === undefined) out.push(`content ${sha}: expected PURGED, has no contents row`);
+    else if (c.state !== 'PURGED') out.push(`content ${sha}: expected PURGED, got ${c.state}`);
+  }
+  for (const c of contents.values()) {
+    if (c.state !== 'PURGED') continue;
+    const at = `content ${c.sha256}: PURGED`;
+    if (!expected.has(c.sha256)) out.push(`${at}, but in no expected purge`);
+    else if (c.purgeMismatch) out.push(`${at}, flagged purge_mismatch`);
+    else if (c.purgeRemovedAt === null) out.push(`${at}, vault file not removed after idle`);
+  }
+  return out.sort();
+}
+
+/** A BLOCKED drop (purge spec §8) is final only for the bytes of an expected purge. */
+export function blockedFileFinding(
+  f: Pick<FileRow, 'id' | 'relPath' | 'state' | 'sha256'>,
+  expectedPurged: ReadonlySet<string>,
+): string | null {
+  if (f.state !== 'BLOCKED') return null;
+  return f.sha256 !== null && expectedPurged.has(f.sha256)
+    ? null
+    : `files ${String(f.id)} ${f.relPath}: BLOCKED, but its sha ${String(f.sha256)} is in no expected purge`;
 }
 
 /** After idle: each retired content was removed, unflagged, and points at a kept content. */
@@ -102,11 +151,14 @@ export function duplicateRowFindings(contents: ReadonlyMap<string, ContentRow>):
  *   MOV is staged beside every placement of its still, by design)
  * - no copy group holds two different known `(captured_at, subsec)` values, or two contents with
  *   the same `burst_uuid` (burst frames are never copies of each other)
+ * - `purged` (purge spec §5–§8): exactly those contents are PURGED, each removed from the vault
+ *   (zero times there, never staged) and unflagged; a BLOCKED files row holds one of them
  */
 export async function checkInvariant(
   dbUrl: string,
   dataDir: string,
   sm: SeedManifest,
+  { purged = new Set<string>() }: Purges = {},
 ): Promise<string[]> {
   const w = await loadWorld(dbUrl);
   const out: string[] = [];
@@ -122,11 +174,16 @@ export async function checkInvariant(
     } else if (states.length !== 1 || !FINAL_FILE_STATES.has(states[0]!))
       out.push(`${f.relPath}: expected one final files row, got [${states.join(', ')}]`);
   }
-  for (const f of w.files)
-    if (!FINAL_FILE_STATES.has(f.state)) out.push(`files ${String(f.id)} ${f.relPath}: ${f.state}`);
+  for (const f of w.files) {
+    const blocked = blockedFileFinding(f, purged);
+    if (blocked !== null) out.push(blocked);
+    else if (!FINAL_FILE_STATES.has(f.state) && f.state !== 'BLOCKED')
+      out.push(`files ${String(f.id)} ${f.relPath}: ${f.state}`);
+  }
   for (const c of w.contents.values()) {
-    if (c.kind === 'still' && !FINAL_STILL_STATES.has(c.state))
-      out.push(`content ${c.sha256}: still left ${c.state}`);
+    // An expected purge's still is final too (PURGED rows outside `purged`: purgedRowFindings).
+    const done = FINAL_STILL_STATES.has(c.state) || (c.state === 'PURGED' && purged.has(c.sha256));
+    if (c.kind === 'still' && !done) out.push(`content ${c.sha256}: still left ${c.state}`);
     if (c.state === 'FAILED' && !c.lastError)
       out.push(`content ${c.sha256}: FAILED without last_error`);
     if (c.state === 'CLUSTERED' && c.copyGroup === null)
@@ -150,10 +207,11 @@ export async function checkInvariant(
     if (inCopies) out.push(`${p.slice(dataDir.length + 1)}: a duplicate still in .copies`);
   });
   for (const sha of new Set(sm.files.filter((f) => !isIgnored(f.name)).map((f) => f.sha256))) {
-    const finding = vaultCountFinding(sha, held.get(sha) ?? 0, w.contents.get(sha));
+    const finding = vaultCountFinding(sha, held.get(sha) ?? 0, w.contents.get(sha), purged);
     if (finding !== null) out.push(finding);
   }
   out.push(...duplicateRowFindings(w.contents));
+  out.push(...purgedRowFindings(w.contents, purged));
   for (const f of w.files) {
     if (f.state !== 'COPY') continue;
     const at = `files ${String(f.id)} ${f.relPath}`;
@@ -169,9 +227,12 @@ export async function checkInvariant(
   const placed = new Map<string, string[]>();
   for (const e of await stagedEntries(dataDir))
     placed.set(e.sha256, [...(placed.get(e.sha256) ?? []), e.dest]);
-  for (const [sha, dests] of placed)
+  for (const [sha, dests] of placed) {
     if (dests.length > 1 && w.contents.get(sha)?.kind !== 'motion')
       out.push(`content ${sha} staged ${String(dests.length)} times: ${dests.join(', ')}`);
+    if (w.contents.get(sha)?.state === 'PURGED')
+      out.push(`content ${sha}: PURGED but staged at ${dests.join(', ')}`);
+  }
 
   // Copy groups never mix shots.
   for (const [id, members] of copyGroups(w)) {

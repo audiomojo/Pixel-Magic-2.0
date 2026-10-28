@@ -56,6 +56,10 @@ export interface ContentRow {
   duplicateOf: string | null;
   duplicateRemovedAt: Date | null;
   duplicateMismatch: boolean;
+  /** Purged with its similar set (purge spec §6): when, and its vault file's removal record. */
+  purgedAt: Date | null;
+  purgeRemovedAt: Date | null;
+  purgeMismatch: boolean;
 }
 
 /** Every file and content row, with group ids resolved to their roots. */
@@ -113,10 +117,14 @@ export async function loadWorld(url: string): Promise<World> {
     duplicate_of: string | null;
     duplicate_removed_at: Date | null;
     duplicate_mismatch: boolean;
+    purged_at: Date | null;
+    purge_removed_at: Date | null;
+    purge_mismatch: boolean;
   }>(
     `SELECT sha256, kind, mime, state, quarantine_reason, last_error, captured_at, subsec,
             burst_uuid, phash, dhash, copy_ambiguous, copy_group_id, duplicate_of,
-            duplicate_removed_at, duplicate_mismatch FROM contents`,
+            duplicate_removed_at, duplicate_mismatch, purged_at, purge_removed_at,
+            purge_mismatch FROM contents`,
   );
   return {
     files: files.rows.map((r) => ({
@@ -155,6 +163,9 @@ export async function loadWorld(url: string): Promise<World> {
             duplicateOf: r.duplicate_of,
             duplicateRemovedAt: r.duplicate_removed_at,
             duplicateMismatch: r.duplicate_mismatch,
+            purgedAt: r.purged_at,
+            purgeRemovedAt: r.purge_removed_at,
+            purgeMismatch: r.purge_mismatch,
           },
         ];
       }),

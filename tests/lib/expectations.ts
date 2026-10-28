@@ -4,6 +4,7 @@ import { isIgnored } from '../../src/fsops.js';
 import { hamming, toUnsigned } from '../../src/hashing.js';
 import type { Manifest, SeedFile, SeedManifest } from '../../tools/corpus/lib.js';
 import { loadWorld, poolFor, type ContentRow, type World } from './db.js';
+import type { Purges } from './invariant.js';
 import { stagedEntries, treeSnapshot } from './snapshot.js';
 
 const dataDirs = new Map<string, string>();
@@ -251,14 +252,20 @@ const sha8 = (s: string) => s.slice(0, 8);
  * Every way the run disagrees with ground truth, one readable line per finding. Copy-ness comes
  * only from sha256 equality and synthetic ground truth (`SeedFile.expect`), never from names:
  * `IMG_2834` and `"IMG_2834 1"` are different shots, and a false copy is the one harmful error.
+ * A content of an expected purge (`purged`) counts as the CLUSTERED still it was before it was
+ * purged; `checkInvariant` reports every other PURGED content.
  */
 export async function diffExpectations(
   dbUrl: string,
   sm: SeedManifest,
   manifest: Manifest,
+  { purged = new Set<string>() }: Purges = {},
 ): Promise<string[]> {
   const w = await loadWorld(dbUrl);
   const out: string[] = [];
+  /** The state ground truth compares: an expected purge was CLUSTERED when it was purged. */
+  const stateOf = (c: ContentRow) =>
+    c.state === 'PURGED' && purged.has(c.sha256) ? 'CLUSTERED' : c.state;
   const records = new Map(manifest.records.map((r) => [r.name, r]));
   const rowsByPath = new Map<string, World['files']>();
   for (const f of w.files) rowsByPath.set(f.relPath, [...(rowsByPath.get(f.relPath) ?? []), f]);
@@ -356,7 +363,7 @@ export async function diffExpectations(
         members.push({
           at: f.relPath,
           sha256: c.sha256,
-          state: c.state,
+          state: stateOf(c),
           duplicateOf: c.duplicateOf,
         });
     }
@@ -400,7 +407,7 @@ export async function diffExpectations(
       if (s === undefined) out.push(`${v.relPath}: seed ${String(v.seedName)} was not seeded`);
       continue;
     }
-    if (c.state !== 'CLUSTERED') {
+    if (stateOf(c) !== 'CLUSTERED') {
       out.push(`${v.relPath}: expected CLUSTERED, got ${c.state}`);
       continue;
     }
