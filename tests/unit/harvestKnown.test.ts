@@ -121,6 +121,16 @@ async function setup() {
       `INSERT INTO contents (sha256, ext, kind, size_bytes, state) VALUES ($1, 'jpg', 'still', $2, 'INGESTED')`,
       [hash, data.length],
     );
+  const block = (data: Buffer, unblocked = false) =>
+    pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at, unblocked_at)
+       VALUES ($1, $2, '{}', now(), ${unblocked ? 'now()' : 'NULL'})`,
+      [sha(data), data.length],
+    );
+  const purgeContent = (data: Buffer) =>
+    pgh.pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+      sha(data),
+    ]);
   const row = async (id: string) =>
     (
       await pgh.pool.query<{
@@ -141,7 +151,7 @@ async function setup() {
       dropzone: dz,
       ...opts,
     });
-  return { root, dz, runId, sourceId, add, addContent, row, ck };
+  return { root, dz, runId, sourceId, add, addContent, block, purgeContent, row, ck };
 }
 
 describe('checkKnown', () => {
@@ -164,6 +174,51 @@ describe('checkKnown', () => {
     const item = await add(data);
     expect(await ck(item)).toEqual({ state: 'KNOWN', sha256: sha(data) });
     expect(await row(item.id)).toMatchObject({ sha256: sha(data) });
+  });
+
+  test('a blocked purged sha is BLOCKED (even with a PURGED content); the hash is stored', async () => {
+    const { add, addContent, block, purgeContent, row, ck } = await setup();
+    const data = bytes(200 * KIB, 11);
+    await addContent(data);
+    await purgeContent(data);
+    await block(data);
+    const item = await add(data);
+    expect(await ck(item)).toEqual({ state: 'BLOCKED', sha256: sha(data) });
+    expect(await row(item.id)).toMatchObject({ sha256: sha(data) });
+  });
+
+  test('a blocked sha beats a live contents match and a ledger duplicate', async () => {
+    const { add, addContent, block, ck } = await setup();
+    const data = bytes(1000, 12);
+    await addContent(data);
+    await block(data);
+    await add(data, { state: 'SENT' });
+    expect((await ck(await add(data))).state).toBe('BLOCKED');
+  });
+
+  test('an unblocked sha with a PURGED content is SEND, not KNOWN', async () => {
+    const { add, addContent, block, purgeContent, ck } = await setup();
+    const data = bytes(200 * KIB, 13);
+    await addContent(data);
+    await purgeContent(data);
+    await block(data, true);
+    expect((await ck(await add(data))).state).toBe('SEND');
+  });
+
+  test('a PURGED content with no purged row is SEND (defensive)', async () => {
+    const { add, addContent, purgeContent, ck } = await setup();
+    const data = bytes(1000, 14);
+    await addContent(data);
+    await purgeContent(data);
+    expect((await ck(await add(data))).state).toBe('SEND');
+  });
+
+  test('a blocked row of another size does not make a file get hashed', async () => {
+    const { add, block, ck } = await setup();
+    await block(bytes(500, 15));
+    const hash = vi.fn();
+    expect((await ck(await add(bytes(600, 15)), { sha256File: hash })).state).toBe('SEND');
+    expect(hash).not.toHaveBeenCalled();
   });
 
   test('size matches contents but the sha differs: SEND, hash kept', async () => {

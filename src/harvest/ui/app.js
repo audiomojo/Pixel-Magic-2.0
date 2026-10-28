@@ -206,6 +206,7 @@ const COUNT_LABELS = {
   junk: 'Junk',
   sent: 'Sent',
   known: 'Already in vault',
+  blocked: 'Blocked (purged)',
   dups: 'Duplicates',
   errors: 'Failed',
 };
@@ -252,7 +253,9 @@ function paintRunPanel() {
     const rate = sampleRate(run.id, t.sent);
     panel.counts.replaceChildren(
       ...countItems([
-        ...Object.entries(COUNT_LABELS).map(([k, label]) => [label, count(t[k])]),
+        ...Object.entries(COUNT_LABELS)
+          .filter(([k]) => k !== 'blocked' || t.blocked > 0)
+          .map(([k, label]) => [label, count(t[k])]),
         ['Files / min', rateText(rate)],
         ['Bytes sent', bytes(t.bytesSent)],
       ]),
@@ -908,6 +911,7 @@ function runCard(run) {
   const keys = run.dry_run
     ? ['photos', 'known', 'dups', 'maybes', 'junk', 'dirs']
     : ['sent', 'known', 'dups', 'errors', 'maybes', 'junk'];
+  if (t.blocked > 0) keys.splice(keys.indexOf('known') + 1, 0, 'blocked');
   const items = keys.map((k) => [k === 'photos' ? 'Would send' : COUNT_LABELS[k], count(t[k])]);
   return h(
     'div',

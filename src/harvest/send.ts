@@ -45,6 +45,7 @@ export interface SendBatchResult {
   outcome: 'MORE' | 'DONE' | 'GATED' | 'SOURCE_GONE' | 'PAUSED_ERRORS' | 'DISK_FULL';
   sent: number;
   known: number;
+  blocked: number;
   dups: number;
   failed: number;
   reason?: string;
@@ -114,7 +115,16 @@ type Stop = { stop: 'GATED' | 'SOURCE_GONE' | 'DISK_FULL'; reason: string };
  * `transient`: a flaky-share error that cost no attempt.
  */
 type ItemOutcome =
-  'sent' | 'known' | 'dup' | 'vanished' | 'error' | 'capped' | 'transient' | 'skipped' | Stop;
+  | 'sent'
+  | 'known'
+  | 'blocked'
+  | 'dup'
+  | 'vanished'
+  | 'error'
+  | 'capped'
+  | 'transient'
+  | 'skipped'
+  | Stop;
 
 /**
  * One page of a run folder's PLANNED items (spec §7.3) in send order, after `after` (keyset).
@@ -231,7 +241,7 @@ async function settle(
   pool: pg.Pool,
   runId: string,
   it: Item,
-  counter: 'sent' | 'known' | 'dups',
+  counter: 'sent' | 'known' | 'blocked' | 'dups',
   set: string,
   params: unknown[],
   extra = '',
@@ -266,7 +276,7 @@ export function makeSendBatch(deps: HarvestDeps) {
     const signal = ctx.cancellationSignal;
     const gfs = new GuardedFs([join(layout.dropzone, 'harvest')], deps.fsOps);
     const dz = layout.dropzone;
-    const res = { sent: 0, known: 0, dups: 0, failed: 0 };
+    const res = { sent: 0, known: 0, blocked: 0, dups: 0, failed: 0 };
 
     const checkpoint = async (name: string): Promise<void> => {
       try {
@@ -482,6 +492,12 @@ export function makeSendBatch(deps: HarvestDeps) {
         ]);
         return ok ? 'known' : 'skipped';
       }
+      if (k.state === 'BLOCKED') {
+        const ok = await settle(pool, runId, it, 'blocked', `state = 'BLOCKED', sha256 = $4`, [
+          k.sha256,
+        ]);
+        return ok ? 'blocked' : 'skipped';
+      }
       if (k.state === 'DUP') {
         // Only while the target is still SENT or PLANNED, in the same statement; else send.
         const ok = await settle(
@@ -616,6 +632,7 @@ export function makeSendBatch(deps: HarvestDeps) {
       };
       if (out === 'sent') res.sent++;
       else if (out === 'known') res.known++;
+      else if (out === 'blocked') res.blocked++;
       else if (out === 'dup') res.dups++;
       else if (out === 'capped') res.failed++;
       consecutive =

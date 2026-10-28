@@ -211,8 +211,14 @@ async function listDz(dz: string): Promise<string[]> {
 
 const counters = async (runId: string) =>
   (
-    await pgh.pool.query<{ sent: number; known: number; dups: number; bytes_sent: number }>(
-      `SELECT sent::int, known::int, dups::int, bytes_sent::int FROM harvest_run_folders WHERE run_id = $1`,
+    await pgh.pool.query<{
+      sent: number;
+      known: number;
+      blocked: number;
+      dups: number;
+      bytes_sent: number;
+    }>(
+      `SELECT sent::int, known::int, blocked::int, dups::int, bytes_sent::int FROM harvest_run_folders WHERE run_id = $1`,
       [runId],
     )
   ).rows[0]!;
@@ -261,7 +267,13 @@ describe('copy protocol', () => {
     expect(Number((await lstat(join(e.dz, 'harvest/Drive/DCIM/a.cr2'))).mode) & 0o777).toBe(0o640);
     expect(Number((await lstat(join(e.dz, 'harvest/Drive/DCIM/b.nef'))).mode) & 0o777).toBe(0o604);
     expect((await listDz(e.dz)).filter((p) => p.endsWith('.part'))).toEqual([]);
-    expect(await counters(e.runId)).toEqual({ sent: 3, known: 0, dups: 0, bytes_sent: 8700 });
+    expect(await counters(e.runId)).toEqual({
+      sent: 3,
+      known: 0,
+      blocked: 0,
+      dups: 0,
+      bytes_sent: 8700,
+    });
   });
 
   test('sources untouched (snapshot, recorded ops, read-only opens)', async () => {
@@ -916,7 +928,31 @@ describe('known content', () => {
     expect(await item('DCIM/b.cr2')).toMatchObject({ state: 'DUP', duplicate_of: a.id });
     expect((await item('DCIM/c.cr2')).state).toBe('KNOWN');
     expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/a.cr2']);
-    expect(await counters(e.runId)).toEqual({ sent: 1, known: 1, dups: 1, bytes_sent: 2000 });
+    expect(await counters(e.runId)).toEqual({
+      sent: 1,
+      known: 1,
+      blocked: 0,
+      dups: 1,
+      bytes_sent: 2000,
+    });
+  });
+
+  test('a blocked file is settled BLOCKED with its sha, counted, and not copied', async () => {
+    const bad = randomBytes(1500);
+    const ok = randomBytes(1600);
+    const e = await setup({ 'DCIM/a.cr2': bad, 'DCIM/b.cr2': ok });
+    await pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 1500, '{}', now())`,
+      [sha(bad)],
+    );
+    expect(await e.send()).toMatchObject({ outcome: 'DONE', sent: 1, blocked: 1, known: 0 });
+    expect((await item('DCIM/a.cr2')).state).toBe('BLOCKED');
+    const stored = await pgh.pool.query<{ sha256: string }>(
+      `SELECT sha256 FROM harvest_items WHERE rel_path = 'DCIM/a.cr2'`,
+    );
+    expect(stored.rows[0]!.sha256).toBe(sha(bad));
+    expect(await listDz(e.dz)).toEqual(['harvest/Drive/DCIM/b.cr2']);
+    expect(await counters(e.runId)).toMatchObject({ sent: 1, blocked: 1, known: 0 });
   });
 
   test('every decision (sent, known, dup) records decided_at for the dashboard rate', async () => {
@@ -1327,6 +1363,7 @@ describe('finishRun, linkFiles, setRunState', () => {
       photos: 2,
       sent: 2,
       known: 0,
+      blocked: 0,
       dups: 0,
       bytes_sent: 1700,
     });

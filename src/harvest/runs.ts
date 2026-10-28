@@ -227,7 +227,8 @@ export async function finishRunRows(
          SET last_harvested_at = clock_timestamp(), last_run_id = rf.run_id,
              last_counts = jsonb_build_object(
                'dirs', rf.dirs, 'photos', rf.photos, 'maybes', rf.maybes, 'junk', rf.junk,
-               'errors', rf.errors, 'sent', rf.sent, 'known', rf.known, 'dups', rf.dups,
+               'errors', rf.errors, 'sent', rf.sent, 'known', rf.known, 'blocked', rf.blocked,
+               'dups', rf.dups,
                'bytes_sent', rf.bytes_sent)
          FROM harvest_run_folders rf
          WHERE rf.run_id = $1 AND rf.folder_id = f.id AND rf.root_ok`,

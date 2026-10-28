@@ -171,6 +171,7 @@ describe('runTotals', () => {
       errors: 1,
       sent: 6,
       known: 2,
+      blocked: 0,
       dups: 1,
       bytesSent: 150,
     });

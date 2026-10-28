@@ -25,6 +25,7 @@ const batch = (outcome: SendBatchResult['outcome'], reason?: string): SendBatchR
   outcome,
   sent: 0,
   known: 0,
+  blocked: 0,
   dups: 0,
   failed: 0,
   cursor: null,

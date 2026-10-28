@@ -11,6 +11,7 @@ const HEAD_BYTES = 64 * 1024;
 
 export type KnownOutcome =
   | { state: 'KNOWN'; sha256: string }
+  | { state: 'BLOCKED'; sha256: string }
   | { state: 'DUP'; sha256: string; duplicateOf: string }
   | { state: 'SEND'; sha256: string | null; headHash: string | null };
 
@@ -219,20 +220,36 @@ export async function checkKnown(
   };
 
   try {
-    // 1. A vault content with this size and sha.
-    const sized = await pool.query('SELECT 1 FROM contents WHERE size_bytes = $1 LIMIT 1', [
-      item.sizeBytes.toString(),
-    ]);
+    // 1. A blocked purged file (size and sha) wins over everything, a PURGED content included.
+    const blockedSized = await pool.query(
+      'SELECT 1 FROM purged WHERE size_bytes = $1 AND unblocked_at IS NULL LIMIT 1',
+      [item.sizeBytes.toString()],
+    );
+    if (blockedSized.rowCount) {
+      const s = await ensureSha();
+      const hit = await pool.query(
+        'SELECT 1 FROM purged WHERE sha256 = $1 AND size_bytes = $2 AND unblocked_at IS NULL',
+        [s, item.sizeBytes.toString()],
+      );
+      if (hit.rowCount) return { state: 'BLOCKED', sha256: s };
+    }
+
+    // 2. A vault content with this size and sha. A PURGED content is gone from the vault: an
+    // unblocked photo must be sent again.
+    const sized = await pool.query(
+      `SELECT 1 FROM contents WHERE size_bytes = $1 AND state <> 'PURGED' LIMIT 1`,
+      [item.sizeBytes.toString()],
+    );
     if (sized.rowCount) {
       const s = await ensureSha();
-      const hit = await pool.query('SELECT 1 FROM contents WHERE sha256 = $1 AND size_bytes = $2', [
-        s,
-        item.sizeBytes.toString(),
-      ]);
+      const hit = await pool.query(
+        `SELECT 1 FROM contents WHERE sha256 = $1 AND size_bytes = $2 AND state <> 'PURGED'`,
+        [s, item.sizeBytes.toString()],
+      );
       if (hit.rowCount) return { state: 'KNOWN', sha256: s };
     }
 
-    // 2. Another ledger item with this size. DUP rows are left out: each is subsumed by its
+    // 3. Another ledger item with this size. DUP rows are left out: each is subsumed by its
     // target, which has the same bytes and is itself a candidate when it qualifies.
     const { rows } = await pool.query<Candidate>(
       `SELECT i.id::text AS id, i.source_id::text AS source_id, i.state, i.kind,
@@ -276,7 +293,7 @@ export async function checkKnown(
       (e as Error).message,
     ]);
   }
-  // 3. Otherwise copy it.
+  // 4. Otherwise copy it.
   return { state: 'SEND', sha256: cur.sha, headHash: cur.head };
 }
 

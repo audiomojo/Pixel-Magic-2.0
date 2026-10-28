@@ -273,7 +273,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
       `SELECT rf.run_id::text AS run_id, rf.folder_id::text AS "folderId",
               f.source_id::text AS "sourceId", s.label, f.rel_path AS "relPath", rf.state,
               rf.dirs::text, rf.photos::text, rf.maybes::text, rf.junk, rf.errors::text,
-              rf.sent::text, rf.known::text, rf.dups::text, rf.bytes_sent::text AS "bytesSent"
+              rf.sent::text, rf.known::text, rf.blocked::text, rf.dups::text, rf.bytes_sent::text AS "bytesSent"
        FROM harvest_run_folders rf JOIN harvest_folders f ON f.id = rf.folder_id
        JOIN harvest_sources s ON s.id = f.source_id
        WHERE rf.run_id = ANY($1::bigint[]) ORDER BY rf.run_id, rf.position`,

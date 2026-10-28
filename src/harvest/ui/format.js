@@ -109,6 +109,7 @@ export function runTotals(folders) {
     errors: 0,
     sent: 0,
     known: 0,
+    blocked: 0,
     dups: 0,
     bytesSent: 0,
   };
