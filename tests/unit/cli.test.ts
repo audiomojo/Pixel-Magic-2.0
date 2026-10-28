@@ -1,4 +1,14 @@
-import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -447,7 +457,7 @@ test('dedupe-identical --apply retires, removes, names the report -applied; re-r
   const { keep, lose } = await seedDupes();
   const out = capture('stdout');
   expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
-  expect(out()).toMatch(/families 1, files removed 1, bytes freed \d+, errors 0/);
+  expect(out()).toMatch(/^families 1, files removed 1, bytes freed \d+, deferred 0, errors 0$/m);
   // A full tie falls to ingest time then sha: exactly one of the two stays.
   const left = [keep, lose].filter((h) => existsSync(layout.vaultFile(h, 'jpg')));
   expect(left).toHaveLength(1);
@@ -459,5 +469,43 @@ test('dedupe-identical --apply retires, removes, names the report -applied; re-r
   expect(lines[1]).toMatch(/,REMOVED$/);
   const again = capture('stdout');
   expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
-  expect(again()).toMatch(/families 0, files removed 0, bytes freed 0, errors 0/);
+  expect(again()).toMatch(/families 0, files removed 0, bytes freed 0, deferred 0, errors 0/);
+  expect(again()).not.toMatch(/^errors: /m);
+});
+
+test('dedupe-identical writes its errors beside the report, prints the path, still exits 0', async () => {
+  const { keep, lose } = await seedDupes();
+  await rm(layout.vaultFile(lose, 'jpg')); // the pair cannot be compared: an error verdict
+  const out = capture('stdout');
+  expect(await main(['dedupe-identical'], { ...deps, identical: deps })).toBe(0);
+  expect(out()).toMatch(/^families 0, files to remove 0, bytes to free 0, errors 1$/m);
+  const files = await reports();
+  expect(files).toHaveLength(2);
+  const errs = files.find((f) => f.endsWith('-errors.csv'))!;
+  const rep = files.find((f) => f !== errs)!;
+  expect(errs).toBe(rep.replace(/\.csv$/, '-errors.csv'));
+  expect(out()).toContain(`errors: ${errs}`);
+  const lines = (await readFile(errs, 'utf8')).trim().split('\n');
+  expect(lines[0]).toBe('sha_a,sha_b,members,error');
+  expect(lines).toHaveLength(2);
+  const [a, b] = keep < lose ? [keep, lose] : [lose, keep];
+  expect(lines[1]).toMatch(new RegExp(`^${a},${b},,.+`));
+});
+
+test('dedupe-identical --apply: a still-linked loser is DEFERRED (own count and outcome); a re-run removes it', async () => {
+  const { keep, lose } = await seedDupes();
+  // Stand-ins for a staging generation's hardlinks to both vault files.
+  const links = [keep, lose].map((h) => join(layout.root, `staged-${h}.jpg`));
+  await link(layout.vaultFile(keep, 'jpg'), links[0]!);
+  await link(layout.vaultFile(lose, 'jpg'), links[1]!);
+  const out = capture('stdout');
+  expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
+  expect(out()).toMatch(/^families 1, files removed 0, bytes freed 0, deferred 1, errors 0$/m);
+  expect(await readFile((await reports())[0]!, 'utf8')).toMatch(/,0,DEFERRED\n$/);
+  expect([keep, lose].every((h) => existsSync(layout.vaultFile(h, 'jpg')))).toBe(true);
+  for (const l of links) await unlink(l);
+  const again = capture('stdout');
+  expect(await main(['dedupe-identical', '--apply'], { ...deps, identical: deps })).toBe(0);
+  expect(again()).toMatch(/families 0, files removed 1, bytes freed \d+, deferred 0, errors 0/);
+  expect([keep, lose].filter((h) => existsSync(layout.vaultFile(h, 'jpg')))).toHaveLength(1);
 });

@@ -8,6 +8,8 @@ import type pg from 'pg';
 import { createDecodePool } from './activities/hashing.js';
 import {
   dedupeIdenticalAll,
+  errorLines,
+  errorsHeader,
   reportHeader,
   reportLines,
   type CleanupSummary,
@@ -121,16 +123,26 @@ async function dedupeIdentical(deps: Deps, apply: boolean): Promise<number> {
   await mkdir(dir, { recursive: true });
   const file = join(dir, `dedupe-identical-${stamp(new Date())}${apply ? '-applied' : ''}.csv`);
   await writeFile(file, reportHeader(apply));
+  // Errors (failed pairs, families, removals) go beside it, created at the first one only.
+  const errorsFile = file.replace(/\.csv$/, '-errors.csv');
+  let errorsStarted = false;
   const r: CleanupSummary = await dedupeIdenticalAll(ctx, {
     apply,
     onRows: (rows) => appendFile(file, reportLines(rows, apply)),
+    onError: async (row) => {
+      if (!errorsStarted) await writeFile(errorsFile, errorsHeader());
+      errorsStarted = true;
+      await appendFile(errorsFile, errorLines([row]));
+    },
   });
   out(
     `families ${String(r.families)}, ` +
       `${apply ? 'files removed' : 'files to remove'} ${String(r.files)}, ` +
-      `${apply ? 'bytes freed' : 'bytes to free'} ${String(r.bytes)}, errors ${String(r.errors)}`,
+      `${apply ? 'bytes freed' : 'bytes to free'} ${String(r.bytes)}, ` +
+      `${apply ? `deferred ${String(r.deferred)}, ` : ''}errors ${String(r.errors)}`,
   );
   out(`report: ${file}`);
+  if (errorsStarted) out(`errors: ${errorsFile}`);
   return 0;
 }
 
