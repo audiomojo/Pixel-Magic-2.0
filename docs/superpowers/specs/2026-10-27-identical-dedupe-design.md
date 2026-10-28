@@ -71,10 +71,14 @@ In one transaction:
 - Retired members already pointing at another retired content are re-pointed to the final keeper
   (`duplicate_of` is always a non-duplicate).
 
-After commit: re-hash the vault file; only if it matches `contents.sha256` unlink it and set
-`duplicate_removed_at`, `duplicate_reclaimed_bytes`. A mismatch sets `duplicate_mismatch = true` and
-deletes nothing. A missing file sets `duplicate_removed_at` with 0 bytes (already gone). Staging
-hardlinks keep the inode alive until the next build reaps the old generation, which frees the space.
+After commit: re-hash the vault file and the keeper's vault file; only if they match
+`contents.sha256` and `duplicate_of` unlink the loser and set `duplicate_removed_at`,
+`duplicate_reclaimed_bytes`. A mismatch (or a missing keeper) sets `duplicate_mismatch = true` and
+deletes nothing. A missing file sets `duplicate_removed_at` with 0 bytes (already gone). While the
+vault file has another link (a staging generation still holds it) the removal is DEFERRED: nothing
+unlinked or recorded, since staging's reaper would otherwise rescue the last link as a user's file
+(ruling R15). The copy sweep (`pm-copies`) and `dedupe-identical --apply` retry pending rows; once
+staging builds have dropped the generations that linked it, the unlink frees the space.
 Each removal logs both names, the keeper and the rule.
 
 ## 6. Everything else that sees contents

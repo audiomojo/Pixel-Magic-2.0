@@ -178,17 +178,42 @@ Photoshop, Lightroom, GIMP, Photos, ...) beats an edited one; (2) more of DateTi
 Make, Model, GPS; (3) the larger file; (4) the earlier ingested. The deciding rule is
 recorded per removed file.
 
-    make dedupe-identical          # dry run: deletes nothing, writes the report
-    make dedupe-identical APPLY=1  # retire and delete, after you have read the report
-    make stage FORCE=1             # then refresh staging
+The live sequence:
+
+    make dedupe-identical          # 1. dry run: deletes nothing, writes the report
+                                   # 2. read the report (and the -errors.csv, if printed)
+    make dedupe-identical APPLY=1  # 3. retire, and delete what nothing else links
+    make stage FORCE=1             # 4. rebuild staging without the retired files ...
+    make stage FORCE=1             #    ... twice: a build keeps the previous generation
+    make sweep-copies              # 5. finish the deferred deletions (or wait for the 15-minute
+                                   #    copy sweep, or run `make dedupe-identical APPLY=1` again)
+
+Run step 4 before using the Picks tab after an apply: until staging is rebuilt it still shows
+the retired files.
 
 The dry run writes `DATA_DIR/reports/dedupe-identical-<YYYYMMDD-HHMMSS>.csv` (columns
 `keeper_sha256,keeper_vault_path,keeper_names,removed_sha256,removed_vault_path,removed_names,rule,bytes`;
 several names are joined by `;`) and prints `families N, files to remove N, bytes to free X,
 errors N`. Its only database writes are the cached pair comparisons. `APPLY=1` writes the
-same report as `...-applied.csv`. It is safe to re-run or interrupt: a file is deleted only
-after a fresh checksum of it matches, and a re-run first finishes any deletion left half
-done. A pair that cannot be decoded is an error, retires nothing and is retried next run.
+same report as `...-applied.csv` with a 9th column, `outcome`, per file:
+
+- `REMOVED`: deleted; its bytes count as freed.
+- `ALREADY_REMOVED`: an earlier run (or the pipeline) deleted it.
+- `MISSING`: the vault file was already gone (an error: 0 bytes).
+- `MISMATCH`: not deleted: its checksum, or its keeper's, no longer matched, or the keeper is
+  gone (an error; flagged `duplicate_mismatch`, shown by `make doctor`).
+- `DEFERRED`: retired but not yet deleted, because a staging generation still links the file
+  (deleting the vault name would free nothing). Neither removed nor an error: steps 4–5
+  finish it and free the space.
+
+The applied totals line is `families N, files removed N, bytes freed X, deferred N, errors N`.
+When there are errors, they are also written to `<report>-errors.csv` beside the report
+(columns `sha_a,sha_b,members,error`: a pair that failed to compare, or a family that failed,
+with its members joined by `;`, or a removal that was MISMATCH/MISSING) and its path is printed;
+the exit code stays 0. It is safe to re-run or interrupt: a file is deleted only after fresh
+checksums of it and of its keeper match, and a re-run first finishes any deletion left half
+done or deferred. A pair that cannot be decoded, or a family that fails (exiftool, a lock
+timeout), is an error, retires nothing and is retried next run; the others carry on.
 
 ## Upgrading
 
