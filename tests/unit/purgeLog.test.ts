@@ -74,11 +74,56 @@ test('a garbage line is reported by number, the rest kept', () => {
   expect(bad).toEqual([2, 4]);
 });
 
-test('the reader keeps a raw newline inside a quoted field and counts lines', () => {
-  const raw = `${HEADER}\npurge,${A},1,2026-10-28T10:00:00.000Z,"[\n""a""]"\r\nbroken\n`;
+test('a raw newline ends a record even inside quotes (formatEvent never writes one)', () => {
+  const good = formatEvent(ev('purge', B, '2026-10-28T10:00:00.000Z', ['n\nm']));
+  expect(good).not.toMatch(/[\r\n]/);
+  const raw = `${HEADER}\npurge,${A},1,2026-10-28T10:00:00.000Z,"[\n""a""]"\r\nbroken\n${good}\n`;
   const { events, bad } = parseLog(raw);
-  expect(events[0]!.names).toEqual(['a']);
-  expect(bad).toEqual([4]);
+  expect(bad).toEqual([2, 3, 4]);
+  expect(events).toHaveLength(1);
+  expect(events[0]!.names).toEqual(['n\nm']);
+});
+
+test('a torn last line does not swallow the event appended after it', async () => {
+  // A crash mid-append left an open quote and no newline.
+  const torn = `purge,${A},1,2026-10-28T10:00:00.000Z,"[""to`;
+  await writeFile(purgeLogPath(dir), `${HEADER}\n${torn}`);
+  await pool.query(
+    `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 6, '{z}', '2026-10-28T11:00:00Z')`,
+    [B],
+  );
+  expect(await reconcilePurgeLog(pool, dir, log)).toEqual({ imported: 0, appended: 1, bad: 1 });
+  const text = await readFile(purgeLogPath(dir), 'utf8');
+  const parsed = parseLog(text);
+  expect(parsed.bad).toEqual([2]);
+  expect(parsed.events.map((e) => e.sha256)).toEqual([B]);
+  // The appended event is read back: the next reconcile writes nothing.
+  expect(await reconcilePurgeLog(pool, dir, log)).toEqual({ imported: 0, appended: 0, bad: 1 });
+  expect(await readFile(purgeLogPath(dir), 'utf8')).toBe(text);
+});
+
+test('a failed unlock releases the connection with the error (destroyed, not pooled)', async () => {
+  const released: unknown[] = [];
+  const fake = {
+    connect: async () => {
+      const c = await pool.connect();
+      return {
+        query: (sql: string, ...rest: unknown[]) =>
+          sql.includes('pg_advisory_unlock')
+            ? Promise.reject(new Error('connection lost'))
+            : (c.query as (...a: unknown[]) => Promise<unknown>)(sql, ...rest),
+        release: (err?: unknown) => {
+          released.push(err);
+          c.release(true);
+        },
+      };
+    },
+  } as unknown as pg.Pool;
+  expect(await reconcilePurgeLog(fake, dir, log)).toEqual({ imported: 0, appended: 0, bad: 0 });
+  expect(released).toHaveLength(1);
+  expect(released[0]).toBeInstanceOf(Error);
+  // The session ended with the destroyed connection: the lock is free again.
+  expect(await reconcilePurgeLog(pool, dir, log)).toEqual({ imported: 0, appended: 0, bad: 0 });
 });
 
 test('imports a file into an empty database: purge then unblock, unblock then purge', async () => {

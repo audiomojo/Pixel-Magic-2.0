@@ -35,7 +35,11 @@ export function formatEvent(e: PurgeEvent): string {
     .join(',');
 }
 
-/** RFC 4180 reader: records with the 1-based line each starts on. */
+/**
+ * RFC 4180 reader: records with the 1-based line each starts on. A raw line break always ends a
+ * record, even inside quotes: `formatEvent` never writes one (names are JSON-escaped), so one
+ * inside quotes can only be a torn last line, which must not swallow the event appended after it.
+ */
 function readRecords(text: string): { line: number; fields: string[] }[] {
   const out: { line: number; fields: string[] }[] = [];
   let fields: string[] = [];
@@ -59,7 +63,7 @@ function readRecords(text: string): { line: number; fields: string[] }[] {
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
     if (c === '\n') line++;
-    if (quoted) {
+    if (quoted && c !== '\n' && c !== '\r') {
       if (c !== '"') cur += c;
       else if (text[i + 1] === '"') {
         cur += '"';
@@ -76,6 +80,7 @@ function readRecords(text: string): { line: number; fields: string[] }[] {
         i++;
         line++;
       }
+      quoted = false;
       endRecord();
       start = line;
     } else {
@@ -163,6 +168,8 @@ export async function reconcilePurgeLog(
   log: PurgeLogger,
 ): Promise<{ imported: number; appended: number; bad: number }> {
   const client = await pool.connect();
+  /** Set when the unlock failed: the connection may still hold the lock, so it is destroyed. */
+  let broken: Error | undefined;
   try {
     await client.query("SELECT pg_advisory_lock(hashtext('pm.purge-log'))");
     try {
@@ -242,9 +249,13 @@ export async function reconcilePurgeLog(
         log.info('purged.csv reconciled', { imported, appended: lines.length, bad: bad.length });
       return { imported, appended: lines.length, bad: bad.length };
     } finally {
-      await client.query("SELECT pg_advisory_unlock(hashtext('pm.purge-log'))").catch(() => {});
+      try {
+        await client.query("SELECT pg_advisory_unlock(hashtext('pm.purge-log'))");
+      } catch (err) {
+        broken = err instanceof Error ? err : new Error(String(err));
+      }
     }
   } finally {
-    client.release();
+    client.release(broken);
   }
 }

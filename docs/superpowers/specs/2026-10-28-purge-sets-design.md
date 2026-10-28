@@ -88,7 +88,11 @@ On worker start, before the scanner or any ingest runs, a reconcile step merges 
   and append).
 
 So a wiped database rebuilds its block list from the file before any file is taken in. A missing
-file is an empty list (first run); an unreadable line is logged and skipped, never fatal.
+file is an empty list (first run); an unreadable line is logged and skipped, never fatal. A raw
+line break always ends a line, even inside quotes (JSON-escaped names never contain one), so a
+line torn by a crash cannot swallow the event appended after it. Besides worker start and
+`PurgeSyncWorkflow`, the copy sweep also runs the reconcile, so a purge whose sync never started
+reaches the file within one sweep period.
 
 ## 8. Blocking returning files
 
