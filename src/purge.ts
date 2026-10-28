@@ -112,7 +112,9 @@ export async function purgeSet(
   const want = [...new Set(shown)].sort();
   if (want.length === 0) return 'stale';
   return withTx(pool, async (c) => {
-    // A double-click's two requests: the second waits, then finds the set purged.
+    // A double-click's two requests: the second waits, then finds the set purged. The idempotent
+    // answer is read before pm.cluster: it only reads PURGED rows, which nothing but a purge
+    // (serialized here) creates, so a repeat need not wait behind a cluster-cache reload.
     await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.purge-set:' || $1))`, [setId]);
     const states = await c.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM contents WHERE sha256 = ANY($1::text[]) AND state = 'PURGED'`,
@@ -120,13 +122,13 @@ export async function purgeSet(
     );
     if (states.rows[0]!.n === want.length)
       return summarize(await closureRows(c, setId, ['PURGED'], ['PURGED']), want);
-    if (!sameList(await currentShown(c, setId), want)) return 'stale';
-
     // Lock order purge-set → pm.cluster → rows (dedupe: suspect key → pm.cluster → rows;
     // clusterContent: pm.cluster → rows), so none of them deadlock. Holding pm.cluster keeps a
     // concurrent cluster step from committing a cache that still holds a purged row, and the
-    // groups from merging under the closure (R6, as `retireFamily`).
+    // groups and candidates from changing under the stale check and the closure (R6, as
+    // `retireFamily`): both are read after it is taken, so what is purged is what was shown.
     await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
+    if (!sameList(await currentShown(c, setId), want)) return 'stale';
     const rows = await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES);
     const shas = rows.map((r) => r.sha256);
     await c.query(

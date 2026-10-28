@@ -268,3 +268,35 @@ test('purgeSet waits for pm.cluster before touching the closure rows', async () 
     holder.release();
   }
 });
+
+test('a set that changes while purge waits on pm.cluster is stale; nothing is purged', async () => {
+  await seed();
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
+    const p = purgeSet(pool, SET, [sha('a'), sha('b')]);
+    await new Promise((r) => setTimeout(r, 300));
+    // A cluster step commits under pm.cluster: a new described candidate joins the set.
+    await holder.query(
+      `INSERT INTO contents (sha256, ext, kind, size_bytes, state, copy_group_id)
+       VALUES ($1, 'jpg', 'still', 10, 'CLUSTERED', 2)`,
+      [sha('5')],
+    );
+    await holder.query('INSERT INTO similar_candidates (set_id, sha256) VALUES ($1, $2)', [
+      SET,
+      sha('5'),
+    ]);
+    await holder.query(
+      `INSERT INTO photo_features (sha256, feature_version, embedding, quality, faces)
+       VALUES ($1, 1, '{}', '{}', '[]')`,
+      [sha('5')],
+    );
+    await holder.query('COMMIT');
+    expect(await p).toBe('stale');
+    expect((await pool.query("SELECT 1 FROM contents WHERE state = 'PURGED'")).rowCount).toBe(0);
+    expect((await pool.query('SELECT 1 FROM purged')).rowCount).toBe(0);
+  } finally {
+    holder.release();
+  }
+});
