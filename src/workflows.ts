@@ -220,9 +220,13 @@ export const MAX_SWEEP_BATCHES = 50;
 /**
  * Scheduled (`pm-copies`) or on demand (`cli sweep-copies`): removes confirmed duplicates that
  * FileWorkflow did not (crash leftovers, deferred copies, files ingested before removal existed),
- * and the vault files of retired identical duplicates whose removal was deferred. Bounded: `MAX_SWEEP_BATCHES` batches of `SWEEP_BATCH`; the next run resumes at the cursor.
+ * and the vault files of retired identical duplicates and purged contents whose removal was
+ * deferred; first it appends what `purged.csv` lacks. Bounded: `MAX_SWEEP_BATCHES` batches of `SWEEP_BATCH`; the next run resumes at the cursor.
  */
 export async function CopySweepWorkflow(): Promise<SweepResult> {
+  // Append any purge `purged.csv` lacks first (its PurgeSyncWorkflow may never have started),
+  // before the sweep removes purged files. `patched`: histories from before replay without it.
+  if (patched('sweep-sync-purge-log')) await syncPurgeLog();
   const total: SweepResult = {
     examined: 0,
     removed: 0,
@@ -246,12 +250,15 @@ export async function CopySweepWorkflow(): Promise<SweepResult> {
  * `purged.csv`, rebuild staging so it drops its links to the purged files, then remove their
  * vault files. The build is forced: a non-forced one skips while FileWorkflows are running
  * (within STAGE_MAX_STALENESS_S), which would leave every removal DEFERRED. Files still DEFERRED
- * (an older generation still links them) are finished by the copy sweep.
+ * (an older generation still links them) are finished by the copy sweep. `[]` (an unblock) only
+ * appends the log.
  */
 export async function PurgeSyncWorkflow(
   shas: string[],
 ): Promise<{ appended: number; removed: number; deferred: number }> {
   const { appended } = await syncPurgeLog();
+  // After an unblock there is nothing to drop from staging or remove from the vault.
+  if (shas.length === 0) return { appended, removed: 0, deferred: 0 };
   await executeChild(StagingWorkflow, {
     workflowId: `pm-stage-purge-${workflowInfo().workflowId}`,
     args: [true],

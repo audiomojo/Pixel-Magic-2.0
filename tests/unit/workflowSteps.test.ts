@@ -282,8 +282,9 @@ const swept = (wrapped: boolean) => ({
   wrapped,
 });
 
-test('CopySweepWorkflow sweeps batches until the pass wraps, and sums them', async () => {
+test('CopySweepWorkflow syncs the purge log, sweeps batches until the pass wraps, and sums them', async () => {
   let n = 0;
+  h.impl['syncPurgeLog'] = () => ({ appended: 0 });
   h.impl['sweepCopies'] = () => swept(++n === 3);
   expect(await wf.CopySweepWorkflow()).toEqual({
     examined: 6,
@@ -292,15 +293,30 @@ test('CopySweepWorkflow sweeps batches until the pass wraps, and sums them', asy
     deferred: 3,
     wrapped: true,
   });
-  expect(h.calls.map((c) => [c.name, c.args])).toEqual(
-    Array(3).fill(['sweepCopies', [wf.SWEEP_BATCH]]),
-  );
+  expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+    ['syncPurgeLog', []],
+    ...Array.from({ length: 3 }, () => ['sweepCopies', [wf.SWEEP_BATCH]]),
+  ]);
 });
 
 test('CopySweepWorkflow is bounded per run', async () => {
+  h.impl['syncPurgeLog'] = () => ({ appended: 0 });
   h.impl['sweepCopies'] = () => swept(false);
   expect(await wf.CopySweepWorkflow()).toMatchObject({ wrapped: false });
-  expect(names()).toHaveLength(wf.MAX_SWEEP_BATCHES);
+  expect(names().filter((x) => x === 'sweepCopies')).toHaveLength(wf.MAX_SWEEP_BATCHES);
+});
+
+test('a CopySweepWorkflow history from before sweep-sync-purge-log replays without the sync', async () => {
+  h.patches['sweep-sync-purge-log'] = false;
+  h.impl['sweepCopies'] = () => swept(true);
+  await wf.CopySweepWorkflow();
+  expect(names()).toEqual(['sweepCopies']);
+});
+
+test('PurgeSyncWorkflow after an unblock (no shas) only syncs the log', async () => {
+  h.impl['syncPurgeLog'] = () => ({ appended: 2 });
+  expect(await wf.PurgeSyncWorkflow([])).toEqual({ appended: 2, removed: 0, deferred: 0 });
+  expect(names()).toEqual(['syncPurgeLog']);
 });
 
 test.each([

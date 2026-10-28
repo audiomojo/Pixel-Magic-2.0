@@ -264,8 +264,32 @@ test('CopySweepWorkflow is bounded: it stops after its batch cap or once the pas
   let n = 0;
   current = fakes({ sweep: () => ({ ...batch, wrapped: ++n === 2 }) });
   expect(await run()).toEqual({ ...batch, examined: 6, removed: 6, wrapped: true });
-  expect(current.calls).toEqual(['sweepCopies', 'sweepCopies']);
-  expect(capped).toBeLessThanOrEqual(100);
+  expect(current.calls).toEqual(['syncPurgeLog', 'sweepCopies', 'sweepCopies']);
+  expect(capped).toBeLessThanOrEqual(101);
+});
+
+// R7/M6: the sweep also appends the purge log, so a PurgeSyncWorkflow that never started does
+// not leave purged.csv behind for long. Histories from before the patch replay unchanged.
+test('a CopySweepWorkflow history recorded before sweep-sync-purge-log replays unchanged', async () => {
+  const bytes = await readFile(
+    fileURLToPath(
+      new URL('../fixtures/copySweepWorkflow-pre-sync-purge-log.history.bin', import.meta.url),
+    ),
+  );
+  const history = temporal.api.history.v1.History.decode(bytes);
+  const events = history.events ?? [];
+  const scheduled = events.flatMap((e) => {
+    const name = e.activityTaskScheduledEventAttributes?.activityType?.name;
+    return name ? [name] : [];
+  });
+  // Recorded from the workflow code before the patch: two sweep batches, no log sync.
+  expect(scheduled).toEqual(['sweepCopies', 'sweepCopies']);
+  const patches = events.flatMap((e) => {
+    const d = e.markerRecordedEventAttributes?.details?.['patch_data']?.payloads?.[0]?.data;
+    return d ? [Buffer.from(d).toString()] : [];
+  });
+  expect(patches.join()).not.toContain('sweep-sync-purge-log');
+  await Worker.runReplayHistory({ workflowBundle }, history);
 });
 
 test('motion stops after ingest', async () =>
@@ -517,6 +541,19 @@ test('PurgeSyncWorkflow: sync the log, rebuild staging (forced), then remove the
   expect(current.args['removePurgedBatch']).toEqual([[shas]]);
   const child = env.client.workflow.getHandle(`pm-stage-purge-${workflowId}`);
   expect((await child.describe()).type).toBe('StagingWorkflow');
+});
+
+test('PurgeSyncWorkflow after an unblock (no shas): the log only, no build, no removal', async () => {
+  current = fakes({});
+  const workflowId = `test-${randomUUID()}`;
+  expect(
+    await env.client.workflow.execute<typeof PurgeSyncWorkflow>('PurgeSyncWorkflow', {
+      ...start,
+      workflowId,
+      args: [[]],
+    }),
+  ).toEqual({ appended: 3, removed: 0, deferred: 0 });
+  expect(current.calls).toEqual(['syncPurgeLog']);
 });
 
 test('PurgeSyncWorkflow: the removal step retries through an outage', async () => {
