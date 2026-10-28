@@ -75,7 +75,7 @@ they skip `DUPLICATE`.
 ## 7. The durable record — `DATA_DIR/purged.csv`
 
 Append-only, one line per event: `action,sha256,size_bytes,purged_or_unblocked_at,names`
-(`action` is `purge` or `unblock`; names joined with `|`, CSV-quoted). Lines are appended and
+(`action` is `purge` or `unblock`; `names` a JSON array of strings; fields CSV-quoted as needed). Lines are appended and
 fsynced after the database commit.
 
 On worker start, before the scanner or any ingest runs, a reconcile step merges the two both ways:
