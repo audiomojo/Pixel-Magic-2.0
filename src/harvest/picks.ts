@@ -11,9 +11,17 @@ import { rawPreview } from '../decode.js';
 import { RAW_MIME } from '../formats.js';
 import { vaultRel } from '../fsops.js';
 import { logger } from '../logger.js';
-import { SHOWN_CANDIDATE } from '../purge.js';
+import {
+  currentShown,
+  purgeClosure,
+  purgeSet,
+  SHOWN_CANDIDATE,
+  unblock,
+  type PurgeSummary,
+} from '../purge.js';
 import type { AiControl } from './aiControl.js';
 import type { HarvestSettings } from './config.js';
+import type { PipelineControl } from './pipelineControl.js';
 import { HttpError, parse, send, type Json } from './http.js';
 import { GuardedFs } from './paths.js';
 import { evictThumbs, placeholderJpeg, readSource, renderJpeg, writeCacheFile } from './thumbs.js';
@@ -126,6 +134,18 @@ const bySetId = (a: string, b: string): number => {
   return x < y ? -1 : x > y ? 1 : 0;
 };
 
+const purgeBody = z.object({ token: z.string().max(200_000) });
+const unblockBody = z.object({ shas: z.array(shaSchema).min(1).max(1000) });
+const PURGED_LIST_MAX = 500;
+
+const summaryJson = (s: PurgeSummary): Json => ({
+  shown: s.shown,
+  copies: s.copies,
+  live: s.live,
+  bytes: Number(s.bytes),
+  shas: s.shas,
+});
+
 const pickBody = z
   .object({
     token: z.string().max(200_000),
@@ -150,6 +170,8 @@ export interface PicksDeps {
   pool: pg.Pool;
   settings: HarvestSettings;
   ai: AiControl;
+  /** The main pipeline worker's control (purge sync). */
+  pipeline: PipelineControl;
   /** HMAC key of the next-set tokens: random per process, so a restart invalidates them. */
   secret: Buffer;
   /** Random draws and shuffles (tests make them deterministic). */
@@ -165,7 +187,7 @@ export type PicksRoutes = (
 ) => Promise<boolean>;
 
 export function createPicksRoutes(d: PicksDeps): PicksRoutes {
-  const { pool, settings, ai, secret } = d;
+  const { pool, settings, ai, pipeline, secret } = d;
   const rng = d.rng ?? Math.random;
   const cacheRoot = join(settings.dataDir, 'harvest-cache');
   const previewDir = join(cacheRoot, 'previews');
@@ -414,6 +436,83 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     return { paused };
   }
 
+  // ---- purging a set (purge spec §5, §9, §10) ---------------------------------------------
+  /** The token's payload; a purge is not a pick, so the token is not used up. */
+  function purgeToken(raw: string): PickToken {
+    const v = verifySigned(secret, raw, Date.now());
+    if (!v) throw new HttpError(400, 'invalid or expired token');
+    return v.token;
+  }
+
+  async function purgePreview(raw: string | null): Promise<Json> {
+    const t = purgeToken(raw ?? '');
+    if (!sameList(await currentShown(pool, t.setId), t.shown))
+      throw new HttpError(409, 'set changed');
+    const s = await purgeClosure(pool, t.setId, t.shown);
+    return { shown: s.shown, copies: s.copies, live: s.live, bytes: Number(s.bytes) };
+  }
+
+  /** Starts the purge sync; false (logged) when Temporal refused: the sweep reconciles anyway. */
+  async function startSync(shas: string[]): Promise<boolean> {
+    try {
+      await pipeline.startPurgeSync(shas);
+      return true;
+    } catch (err) {
+      logger.warn({ err }, 'picks: starting PurgeSyncWorkflow failed');
+      return false;
+    }
+  }
+
+  async function postPurge(body: unknown): Promise<Json> {
+    const t = purgeToken(parse(purgeBody, body).token);
+    const r = await purgeSet(pool, t.setId, t.shown);
+    if (r === 'stale') throw new HttpError(409, 'set changed');
+    const purged = summaryJson(r);
+    return (await startSync(r.shas)) ? { purged } : { purged, syncStarted: false };
+  }
+
+  async function purgedList(): Promise<Json> {
+    const { rows } = await pool.query<{
+      set_id: string | null;
+      purged_at: Date;
+      names: string[];
+      files: number;
+      bytes: number;
+      unblocked: boolean;
+      shas: string[];
+    }>(
+      `WITH k AS (SELECT *, coalesce(set_id::text, sha256) AS key FROM purged)
+       SELECT g.set_id, g.purged_at, g.files, g.bytes, g.unblocked, g.shas,
+              ARRAY(SELECT n FROM (SELECT DISTINCT n FROM k k2 CROSS JOIN LATERAL unnest(k2.names) AS n
+                     WHERE k2.key = g.key) u ORDER BY n COLLATE "C") AS names
+         FROM (SELECT key, max(set_id)::text AS set_id, max(purged_at) AS purged_at,
+                      count(*)::int AS files, sum(size_bytes)::float8 AS bytes,
+                      bool_and(unblocked_at IS NOT NULL) AS unblocked,
+                      array_agg(sha256 ORDER BY sha256) AS shas
+                 FROM k GROUP BY key
+                ORDER BY max(purged_at) DESC, key LIMIT ${String(PURGED_LIST_MAX)}) g
+        ORDER BY g.purged_at DESC, g.shas[1]`,
+    );
+    return {
+      purges: rows.map((r) => ({
+        setId: r.set_id,
+        purgedAt: r.purged_at.toISOString(),
+        names: r.names,
+        files: r.files,
+        bytes: r.bytes,
+        unblocked: r.unblocked,
+        shas: r.shas,
+      })),
+    };
+  }
+
+  async function postUnblock(body: unknown): Promise<Json> {
+    const { shas } = parse(unblockBody, body);
+    const n = await unblock(pool, [...new Set(shas)]);
+    await startSync([]);
+    return { unblocked: n };
+  }
+
   // ---- scoreboard ---------------------------------------------------------------------
   const GRADED = 'random_draw AND model_pick_sha256 IS NOT NULL AND chosen_sha256 IS NOT NULL';
 
@@ -548,12 +647,16 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     if (method === 'GET') {
       if (path === '/api/picks/next') return ok(await next(parseSkip(query.get('skip'))));
       if (path === '/api/picks/scoreboard') return ok(await scoreboard());
+      if (path === '/api/picks/purge-preview') return ok(await purgePreview(query.get('token')));
+      if (path === '/api/picks/purged') return ok(await purgedList());
       if ((m = path.match(/^\/api\/preview\/([^/]+)$/))) {
         await preview(m[1]!, query, res);
         return true;
       }
     } else if (method === 'POST') {
       if (path === '/api/picks') return ok(await postPick(body));
+      if (path === '/api/picks/purge') return ok(await postPurge(body));
+      if (path === '/api/picks/unblock') return ok(await postUnblock(body));
       if (path === '/api/picks/session-end') return ok(await sessionEnd());
       if ((m = path.match(/^\/api\/picks\/describe\/(pause|resume)$/)))
         return ok(await setPaused(m[1] === 'pause'));

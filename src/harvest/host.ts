@@ -20,6 +20,7 @@ import { DataLayout } from '../fsops.js';
 import { logDestination, logger } from '../logger.js';
 import { createHarvestActivities } from './activities.js';
 import { temporalAiControl } from './aiControl.js';
+import { temporalPipelineControl } from './pipelineControl.js';
 import { loadHarvestSettings } from './config.js';
 import { HARVEST_TASK_QUEUE, temporalRunControl } from './control.js';
 import { rotateIfLarge } from './logRotate.js';
@@ -158,6 +159,7 @@ async function main(): Promise<void> {
       sys: realSystem,
       control,
       ai: temporalAiControl(client),
+      pipeline: temporalPipelineControl(client),
       // Per process: a restart invalidates the Picks page's tokens ("reload the page").
       picksSecret: randomBytes(32),
       staticDir: here('../../src/harvest/ui'),

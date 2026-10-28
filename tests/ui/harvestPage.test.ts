@@ -100,6 +100,7 @@ async function setup(o: { spec?: TreeSpec; temporal?: boolean } = {}): Promise<E
     settings,
     sys,
     control,
+    pipeline: { startPurgeSync: () => Promise.resolve() },
     ai: {
       startTrain: () => {
         ai.push('train');

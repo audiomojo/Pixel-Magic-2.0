@@ -141,6 +141,7 @@ async function setup(
     settings,
     sys,
     control,
+    pipeline: { startPurgeSync: () => Promise.resolve() },
     ai: {
       startTrain: () => Promise.resolve('started' as const),
       setDescribePaused: () => Promise.resolve(),

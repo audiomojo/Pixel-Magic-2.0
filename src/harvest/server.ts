@@ -13,6 +13,7 @@ import { logger } from '../logger.js';
 import { errCode, errText, isMissing } from '../fsops.js';
 import type { RunControl } from './activities.js';
 import type { AiControl } from './aiControl.js';
+import type { PipelineControl } from './pipelineControl.js';
 import { childContext, keepDir, ROOT_CONTEXT, type DirContext } from './classify.js';
 import type { HarvestSettings } from './config.js';
 import { HttpError, parse, send, type Json } from './http.js';
@@ -44,6 +45,8 @@ export interface HarvestServerDeps {
   control: RunControl;
   /** The AI worker's training and describe control (the Picks tab). */
   ai: AiControl;
+  /** The main pipeline worker's control (purge sync). */
+  pipeline: PipelineControl;
   /** HMAC key of the Picks tokens (default: 32 random bytes, so per process). */
   picksSecret?: Buffer;
   /** Random draws and shuffles of the Picks tab (tests make them deterministic). */
@@ -173,6 +176,7 @@ export function createHarvestServer(d: HarvestServerDeps): http.Server {
     pool,
     settings,
     ai: d.ai,
+    pipeline: d.pipeline,
     secret: d.picksSecret ?? randomBytes(32),
     ...(d.picksRng ? { rng: d.picksRng } : {}),
   });

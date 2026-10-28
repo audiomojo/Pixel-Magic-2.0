@@ -62,6 +62,7 @@ interface Env {
   port: number;
   dataDir: string;
   ai: FakeAi;
+  sync: { calls: string[][]; fail: boolean };
   req(method: string, path: string, o?: ReqOpts): Promise<Res>;
   get(path: string): Promise<Res>;
   post(path: string, body?: unknown): Promise<Res>;
@@ -113,6 +114,7 @@ async function setup(
     cancel: () => Promise.resolve('requested' as const),
   };
   const ai = fakeAi();
+  const sync = { calls: [] as string[][], fail: false };
   const staticDir = await tmpDir();
   await writeFile(join(staticDir, 'index.html'), '<h1>hi</h1>');
   const server = createHarvestServer({
@@ -121,6 +123,12 @@ async function setup(
     sys,
     control,
     ai,
+    pipeline: {
+      startPurgeSync(shas) {
+        sync.calls.push(shas);
+        return sync.fail ? Promise.reject(new Error('temporal down')) : Promise.resolve();
+      },
+    },
     staticDir,
     temporalHealthy: () => Promise.resolve(true),
     detectOpts: { volumes: `${dataDir}/no-volumes/` },
@@ -164,6 +172,7 @@ async function setup(
     port,
     dataDir,
     ai,
+    sync,
     req,
     get: (p) => req('GET', p),
     post: (p, json) => req('POST', p, { json: json ?? {} }),
@@ -784,5 +793,156 @@ describe('protection', () => {
     }
     expect(await pickCount()).toBe(0);
     expect(e.ai.calls).toEqual([]);
+  });
+});
+
+// ---- purge ---------------------------------------------------------------------------------
+describe('purge API', () => {
+  /** A set whose copy group is linked to similar set `id`; `extra` are hidden copies. */
+  async function purgeSet(id: number, shown: string[], extra: string[] = []): Promise<void> {
+    await set(id, shown);
+    await pgh.pool.query(`INSERT INTO groups (id, kind, similar_set_id) VALUES ($1, 'copy', $2)`, [
+      id,
+      id,
+    ]);
+    for (const s of [...shown, ...extra]) {
+      if (extra.includes(s)) await content(s, { name: `${s.slice(0, 4)}.jpg` });
+      await pgh.pool.query('UPDATE contents SET copy_group_id = $2 WHERE sha256 = $1', [s, id]);
+    }
+  }
+  const state = async (s: string): Promise<string> =>
+    (await pgh.pool.query('SELECT state FROM contents WHERE sha256 = $1', [s])).rows[0]
+      .state as string;
+  const tokenFor = async (e: Env): Promise<string> =>
+    (await e.get('/api/picks/next')).json.token as string;
+
+  test('preview counts the closure; stale and bad tokens are refused', async () => {
+    const e = await setup();
+    await content(A, { name: 'a.jpg', size: 100 });
+    await content(C, { name: 'c.jpg', size: 50 });
+    await purgeSet(1, [A, B], [C]);
+    const token = await tokenFor(e);
+    const r = await e.get(`/api/picks/purge-preview?token=${encodeURIComponent(token)}`);
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({ shown: 2, copies: 1, live: 0, bytes: 1150 });
+    expect((await e.get('/api/picks/purge-preview?token=junk')).status).toBe(400);
+    await describeOk(C); // not shown yet: make the set grow
+    await pgh.pool.query('INSERT INTO similar_candidates (set_id, sha256) VALUES (1, $1)', [C]);
+    const stale = await e.get(`/api/picks/purge-preview?token=${encodeURIComponent(token)}`);
+    expect(stale.status).toBe(409);
+    expect(stale.json).toEqual({ error: 'set changed' });
+  });
+
+  test('purge marks the closure PURGED, starts the sync, and is not a pick', async () => {
+    const e = await setup();
+    await purgeSet(1, [A, B], [C]);
+    const next = await e.get('/api/picks/next');
+    const before = next.json.today;
+    const r = await e.post('/api/picks/purge', { token: next.json.token });
+    expect(r.status).toBe(200);
+    expect(r.json.purged).toEqual({
+      shown: 2,
+      copies: 1,
+      live: 0,
+      bytes: 3000,
+      shas: [A, B, C].sort(),
+    });
+    expect(e.sync.calls).toEqual([[A, B, C].sort()]);
+    for (const s of [A, B, C]) expect(await state(s)).toBe('PURGED');
+    expect(await pickCount()).toBe(0);
+    expect(e.ai.calls).toEqual([]);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+    expect(before).toEqual({ done: 0, goal: 10 });
+  });
+
+  test('the same token twice purges once and returns the same summary', async () => {
+    const e = await setup();
+    await purgeSet(1, [A, B]);
+    const token = await tokenFor(e);
+    const r1 = await e.post('/api/picks/purge', { token });
+    const r2 = await e.post('/api/picks/purge', { token });
+    expect(r2.status).toBe(200);
+    expect(r2.json).toEqual(r1.json);
+    expect((await pgh.pool.query('SELECT count(*)::int AS n FROM purged')).rows[0].n).toBe(2);
+  });
+
+  test('a stale set is a 409 and nothing changes', async () => {
+    const e = await setup();
+    await purgeSet(1, [A, B]);
+    const token = await tokenFor(e);
+    await pgh.pool.query(
+      `UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`,
+      [A],
+    );
+    const r = await e.post('/api/picks/purge', { token });
+    expect(r.status).toBe(409);
+    expect(r.json).toEqual({ error: 'set changed' });
+    expect(await state(B)).toBe('CLUSTERED');
+    expect(e.sync.calls).toEqual([]);
+    expect((await e.post('/api/picks/purge', { token: 'junk' })).status).toBe(400);
+  });
+
+  test('a sync that cannot start is reported, not an error', async () => {
+    const e = await setup();
+    await purgeSet(1, [A, B]);
+    e.sync.fail = true;
+    const r = await e.post('/api/picks/purge', { token: await tokenFor(e) });
+    expect(r.status).toBe(200);
+    expect(r.json.syncStarted).toBe(false);
+    expect(await state(A)).toBe('PURGED');
+  });
+
+  test('the purged list groups by set, newest first; a null set is one entry per sha', async () => {
+    const e = await setup();
+    await content(A, { name: 'a.jpg', size: 10 });
+    await content(B, { name: 'b.jpg', size: 20 });
+    await content(C, { name: 'c.jpg', size: 30 });
+    await content(D, { name: 'd.jpg', size: 40 });
+    await pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at, unblocked_at, set_id) VALUES
+       ($1, 10, '{a.jpg,x.jpg}', '2026-01-01', NULL, 1),
+       ($2, 20, '{b.jpg,x.jpg}', '2026-01-01', NULL, 1),
+       ($3, 30, '{c.jpg}', '2026-02-01', now(), NULL),
+       ($4, 40, '{d.jpg}', '2026-03-01', NULL, NULL)`,
+      [A, B, C, D],
+    );
+    const r = await e.get('/api/picks/purged');
+    expect(r.status).toBe(200);
+    const p = r.json.purges;
+    expect(p).toHaveLength(3);
+    expect(p[0]).toMatchObject({ setId: null, names: ['d.jpg'], files: 1, bytes: 40, shas: [D] });
+    expect(p[0].unblocked).toBe(false);
+    expect(p[1]).toMatchObject({ setId: null, files: 1, unblocked: true, shas: [C] });
+    expect(p[2]).toMatchObject({ setId: '1', files: 2, bytes: 30, unblocked: false });
+    expect(p[2].names).toEqual(['a.jpg', 'b.jpg', 'x.jpg']);
+    expect(p[2].shas).toEqual([A, B]);
+    expect(typeof p[2].purgedAt).toBe('string');
+  });
+
+  test('unblock validates, unblocks, and asks for a sync', async () => {
+    const e = await setup();
+    await content(A, { size: 10 });
+    await pgh.pool.query(
+      `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 10, '{}', now())`,
+      [A],
+    );
+    for (const bad of [{}, { shas: [] }, { shas: ['nope'] }, { shas: Array(1001).fill(A) }])
+      expect((await e.post('/api/picks/unblock', bad)).status).toBe(400);
+    expect(e.sync.calls).toEqual([]);
+    const r = await e.post('/api/picks/unblock', { shas: [A] });
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({ unblocked: 1 });
+    expect(e.sync.calls).toEqual([[]]);
+    expect((await e.get('/api/picks/purged')).json.purges[0].unblocked).toBe(true);
+  });
+
+  test('purge routes enforce the POST header', async () => {
+    const e = await setup();
+    const r = await e.req('POST', '/api/picks/purge', {
+      json: {},
+      raw: true,
+      headers: { host: `127.0.0.1:${e.port}` },
+    });
+    expect(r.status).toBeGreaterThanOrEqual(400);
   });
 });
