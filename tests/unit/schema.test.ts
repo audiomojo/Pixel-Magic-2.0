@@ -247,3 +247,62 @@ test('pixel_compares rejects sha_a >= sha_b, an unknown verdict, and a repeated 
     await pool.query('DELETE FROM pixel_compares');
   }
 });
+
+const purgeIns = `INSERT INTO contents(sha256, ext, kind, size_bytes, state, purged_at)
+  VALUES ($1,'jpg','still',1,$2,$3)`;
+test('a PURGED content requires purged_at, and only a PURGED may have it', async () => {
+  await expect(pool.query(purgeIns, [sha('a'), 'PURGED', null])).rejects.toMatchObject({
+    code: '23514',
+  });
+  await expect(pool.query(purgeIns, [sha('b'), 'HASHED', new Date()])).rejects.toMatchObject({
+    code: '23514',
+  });
+  await pool.query(purgeIns, [sha('c'), 'PURGED', new Date()]);
+  await pool.query(purgeIns, [sha('d'), 'HASHED', null]);
+});
+test('purge_mismatch defaults false', async () => {
+  await pool.query(purgeIns, [sha('d'), 'HASHED', null]);
+  expect((await one<{ m: boolean }>('SELECT purge_mismatch m FROM contents')).m).toBe(false);
+});
+test('files and harvest_items accept BLOCKED', async () => {
+  await pool.query(ins, ['BLOCKED']);
+  const src = await one<{ id: string }>(
+    `INSERT INTO harvest_sources (identity, label, kind) VALUES ('i','L','local') RETURNING id`,
+  );
+  await pool.query(
+    `INSERT INTO harvest_items (source_id, rel_path, path_key, size_bytes, mtime_ns, kind, state)
+     VALUES ($1,'f','f',1,1,'photo','BLOCKED')`,
+    [src.id],
+  );
+});
+test('harvest_run_folders.blocked and copy_sweep_state.purged_after default', async () => {
+  const src = await one<{ id: string }>(
+    `INSERT INTO harvest_sources (identity, label, kind) VALUES ('i','L','local') RETURNING id`,
+  );
+  const run = await one<{ id: string }>(
+    `INSERT INTO harvest_runs(state) VALUES ('queued') RETURNING id`,
+  );
+  const folder = await one<{ id: string }>(
+    `INSERT INTO harvest_folders(source_id, rel_path) VALUES ($1,'') RETURNING id`,
+    [src.id],
+  );
+  const f = await one<{ blocked: string }>(
+    `INSERT INTO harvest_run_folders(run_id, folder_id, position) VALUES ($1,$2,0) RETURNING blocked`,
+    [run.id, folder.id],
+  );
+  expect(Number(f.blocked)).toBe(0);
+  expect(
+    (await one<{ p: string }>('SELECT purged_after p FROM copy_sweep_state WHERE id=1')).p,
+  ).toBe('');
+});
+test('purged table: insert, then upsert by sha256', async () => {
+  const up = `INSERT INTO purged(sha256, size_bytes, names, purged_at) VALUES ($1,5,$2,now())
+    ON CONFLICT (sha256) DO UPDATE SET unblocked_at = NULL, names = EXCLUDED.names RETURNING names, unblocked_at, set_id`;
+  await pool.query(up, [sha('a'), ['x.jpg']]);
+  const r = await one<{ names: string[]; unblocked_at: Date | null; set_id: string | null }>(up, [
+    sha('a'),
+    ['y.jpg'],
+  ]);
+  expect(r).toEqual({ names: ['y.jpg'], unblocked_at: null, set_id: null });
+  expect((await one<{ n: bigint }>('SELECT count(*) n FROM purged')).n).toBe(1n);
+});
