@@ -157,7 +157,7 @@ export function makeStaging(deps: Deps) {
               c.live_content_id, c.duration_s, c.state, c.quarantine_reason, c.copy_group_id,
               g.similar_set_id, c.copy_ambiguous
          FROM contents c LEFT JOIN groups g ON g.id = c.copy_group_id
-        WHERE c.state <> 'DUPLICATE'`,
+        WHERE c.state NOT IN ('DUPLICATE', 'PURGED')`,
     );
     // COPY files only name contents (and pair Live Photos); their bytes are never staged.
     const fs = await c.query<{
@@ -171,7 +171,7 @@ export function makeStaging(deps: Deps) {
       `SELECT id, rel_path, original_name, mtime_ns, sha256, state FROM files
         WHERE state IN ('INGESTED', 'COPY') AND sha256 IS NOT NULL AND ext IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM contents d
-                           WHERE d.sha256 = files.sha256 AND d.state = 'DUPLICATE')`,
+                           WHERE d.sha256 = files.sha256 AND d.state IN ('DUPLICATE', 'PURGED'))`,
     );
     const num = (v: bigint | null) => (v === null ? null : Number(v));
     return {
@@ -213,7 +213,8 @@ export function makeStaging(deps: Deps) {
       // A pick of a retired duplicate counts for its keeper (retiring repoints chains, so one hop).
       `SELECT coalesce(c.duplicate_of, p.chosen_sha256) AS chosen_sha256
          FROM picks p LEFT JOIN contents c ON c.sha256 = p.chosen_sha256
-        WHERE p.chosen_sha256 IS NOT NULL ORDER BY p.decided_at, p.id`,
+        WHERE p.chosen_sha256 IS NOT NULL AND c.state IS DISTINCT FROM 'PURGED'
+        ORDER BY p.decided_at, p.id`,
     );
     const sc = await c.query<{ sha256: string; score: number }>(
       `SELECT sha256, score FROM photo_scores

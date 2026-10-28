@@ -11,6 +11,7 @@ import { rawPreview } from '../decode.js';
 import { RAW_MIME } from '../formats.js';
 import { vaultRel } from '../fsops.js';
 import { logger } from '../logger.js';
+import { SHOWN_CANDIDATE } from '../purge.js';
 import type { AiControl } from './aiControl.js';
 import type { HarvestSettings } from './config.js';
 import { HttpError, parse, send, type Json } from './http.js';
@@ -208,8 +209,7 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
       `SELECT sc.set_id::text AS set_id, sc.sha256, ps.score
          FROM similar_candidates sc
          LEFT JOIN photo_scores ps ON ps.sha256 = sc.sha256 AND ps.model_version = $1
-        WHERE EXISTS (SELECT 1 FROM photo_features pf
-                       WHERE pf.sha256 = sc.sha256 AND pf.failed IS NULL)`,
+        WHERE ${SHOWN_CANDIDATE}`,
       [version],
     );
     const sets = new Map<string, string[]>();
@@ -224,19 +224,25 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
     // showed) is a current candidate.
     // Retired duplicates count as their keeper (chosen and shown alike), so a set whose only
     // change is a retired member is not offered again.
+    // A purged photo is dropped from what a pick showed (a set that only lost a purged member is
+    // not offered again); a pick whose chosen photo is purged covers the set by the rest of what
+    // it showed.
     const covering = await pool.query<{ set_id: string; shown: string[] }>(
       `WITH rp AS (
          SELECT p.id, p.decided_at, p.no_clear_best,
-                coalesce(cc.duplicate_of::text, p.chosen_sha256) AS chosen,
+                CASE WHEN cc.state = 'PURGED' THEN NULL
+                     ELSE coalesce(cc.duplicate_of::text, p.chosen_sha256) END AS chosen,
+                (cc.state = 'PURGED') AS chosen_purged,
                 ARRAY(SELECT DISTINCT coalesce(c.duplicate_of::text, s.sha)
                         FROM unnest(p.shown_sha256) AS s(sha)
-                        LEFT JOIN contents c ON c.sha256 = s.sha) AS shown
+                        LEFT JOIN contents c ON c.sha256 = s.sha
+                       WHERE c.state IS DISTINCT FROM 'PURGED') AS shown
            FROM picks p LEFT JOIN contents cc ON cc.sha256 = p.chosen_sha256),
        hit AS (
          SELECT rp.chosen AS sha, rp.id, rp.decided_at, rp.shown FROM rp
           UNION ALL
          SELECT u.sha, rp.id, rp.decided_at, rp.shown
-           FROM rp CROSS JOIN LATERAL unnest(rp.shown) AS u(sha) WHERE rp.no_clear_best)
+           FROM rp CROSS JOIN LATERAL unnest(rp.shown) AS u(sha) WHERE rp.no_clear_best OR rp.chosen_purged)
        SELECT DISTINCT ON (sc.set_id) sc.set_id::text AS set_id, hit.shown
          FROM hit JOIN similar_candidates sc ON sc.sha256 = hit.sha
         ORDER BY sc.set_id, hit.decided_at DESC, hit.id DESC`,

@@ -393,6 +393,46 @@ describe('GET /api/picks/next', () => {
     expect((await e.get('/api/picks/next')).json.set.id).toBe('1');
   });
 
+  const purge = async (s: string): Promise<void> => {
+    await pgh.pool.query(
+      `UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`,
+      [s],
+    );
+  };
+
+  test('a purged candidate is not shown, before any staging rebuild', async () => {
+    const e = await setup();
+    await set(1, [A, B, C]);
+    await purge(C);
+    const r = await e.get('/api/picks/next');
+    expect(r.json.set.candidates.map((c: { sha256: string }) => c.sha256).sort()).toEqual(
+      [A, B].sort(),
+    );
+  });
+
+  test('a set left with fewer than two candidates by a purge is not offered', async () => {
+    const e = await setup();
+    await set(1, [A, B]);
+    await purge(B);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
+  test('a set that only lost a purged shown member is not offered again', async () => {
+    const e = await setup();
+    await set(1, [A, B, C]);
+    await pickRow({ setId: 1, chosen: A, shown: [A, B, C] });
+    await purge(C);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
+  test('a pick whose chosen photo was purged still covers the set by the rest it showed', async () => {
+    const e = await setup();
+    await set(1, [A, B, C]);
+    await pickRow({ setId: 1, chosen: C, shown: [A, B, C] });
+    await purge(C);
+    expect((await e.get('/api/picks/next')).json.set).toBeNull();
+  });
+
   test('no clear best for the same candidates is never offered; changed candidates come back', async () => {
     const e = await setup();
     await set(1, [A, B]);

@@ -749,3 +749,51 @@ test('a staged retired loser: removal DEFERRED while a generation links it, .res
   expect(await rescued()).toEqual([]);
   expect(await verifyVault(layout)).toMatchObject({ mismatches: [] });
 });
+
+/** Marks `sha` PURGED as the purge transaction does (row only). */
+async function markPurged(sha: string): Promise<void> {
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    sha,
+  ]);
+}
+
+test('a purged content and its files are not staged; its set drops it from the candidates', async () => {
+  const { a, a2, b } = await seedSimilarSet();
+  await build(true);
+  await markPurged(a2);
+  expect(await build(false)).toMatchObject({ skipped: false });
+  const names = (await tree(join(layout.staging, 'current'))).map(([p]) => basename(p));
+  expect(names.some((n) => n.endsWith('A.JPG'))).toBe(false);
+  expect(names.some((n) => n.endsWith('A.HEIC'))).toBe(true);
+  expect((await candidates()).map((c) => c.sha256).sort()).toEqual([a, b].sort());
+});
+
+test('a set left with one candidate after a purge stages as unique and leaves similar_candidates', async () => {
+  const { a, a2, b } = await seedSimilarSet();
+  await build(true);
+  await markPurged(b);
+  await build(false);
+  await markPurged(a2);
+  await build(false);
+  expect(await candidates()).toEqual([]);
+  expect(a).toBeTruthy();
+  const paths = (await tree(join(layout.staging, 'current'))).map(([p]) => p);
+  expect(paths.some((p) => p.startsWith('similar/'))).toBe(false);
+  expect(paths.some((p) => p.startsWith('unique/') && p.endsWith('A.HEIC'))).toBe(true);
+});
+
+test('a pick of a purged content marks nothing', async () => {
+  const { b } = await seedSimilarSet();
+  const bb = randomBytes(64);
+  const b2 = await content(bb, { ext: 'jpg', kind: 'still', state: 'CLUSTERED', w: 10, group: 2 });
+  await file('p/B2.JPG', b2, 'jpg');
+  await put(vaultRel(b2, 'jpg'), bb);
+  await pool.query(
+    `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best)
+     VALUES (9, $1, $2, false)`,
+    [b2, [b2, b]],
+  );
+  await markPurged(b2);
+  await build(true);
+  expect((await setNames()).some((n) => n.startsWith('0-best_'))).toBe(false);
+});
