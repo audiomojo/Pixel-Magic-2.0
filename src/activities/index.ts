@@ -8,6 +8,7 @@ import { makeCopies } from './copies.js';
 import { makeHashing, type WorkerPool } from './hashing.js';
 import { makeIdentical } from './identical.js';
 import { makeIngestFile } from './ingest.js';
+import { makePurge } from './purge.js';
 import { makeScan } from './scan.js';
 import { makeStaging } from './staging.js';
 
@@ -31,6 +32,7 @@ export function createActivities(deps: Deps) {
     ...makeIdentical(deps),
     clusterContent: makeClusterContent(deps),
     ...makeCopies(deps),
+    ...makePurge(deps),
     maybeBuildStaging: makeStaging(deps),
     scanAndStart: makeScan(deps),
   };

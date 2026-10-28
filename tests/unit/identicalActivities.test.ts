@@ -11,6 +11,7 @@ import {
   dedupeIdenticalAll,
   dedupeIdenticalWith,
   findFamily,
+  removePurged,
   removeRetired,
   planFamily,
   reportCsv,
@@ -813,4 +814,103 @@ test('one family that fails to plan is an error, recorded with its members; the 
   expect((await row(f1.cam)).state).toBe('HASHED');
   expect((await row(f2.pic)).state).toBe('DUPLICATE');
   expect(await exists(await vaultPath(f2.pic))).toBe(false);
+});
+
+// ---------------------------------------------------------------- purged contents (purge spec §6)
+
+/** A vaulted content marked PURGED (vault file still there). */
+async function purgedContent(src: string, name: string): Promise<string> {
+  const sha = await hashed(src, { name });
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    sha,
+  ]);
+  return sha;
+}
+interface PurgeRow {
+  purge_removed_at: Date | null;
+  purge_reclaimed_bytes: bigint | null;
+  purge_mismatch: boolean;
+  last_error: string | null;
+}
+const purgeRow = async (sha: string): Promise<PurgeRow> =>
+  (
+    await pool.query<PurgeRow>(
+      `SELECT purge_removed_at, purge_reclaimed_bytes, purge_mismatch, last_error
+         FROM contents WHERE sha256 = $1`,
+      [sha],
+    )
+  ).rows[0]!;
+
+test('removePurged: DEFERRED while a second link exists, REMOVED once it is gone', async () => {
+  const p = await purgedContent(await variant({}), 'gone.jpg');
+  const path = await vaultPath(p);
+  const size = (await stat(path)).size;
+  const staged = join(await tmpDir(), 'staged.jpg');
+  await link(path, staged);
+  const c = ctx();
+  expect(await removePurged(c, p)).toBe('DEFERRED');
+  expect(c.logs.join('\n')).toMatch(/purged photo removal deferred: still linked/);
+  expect(await exists(path)).toBe(true);
+  expect(await purgeRow(p)).toMatchObject({ purge_removed_at: null, purge_mismatch: false });
+  await unlink(staged);
+  expect(await removePurged(c, p)).toBe('REMOVED');
+  expect(c.logs.join('\n')).toMatch(/purged photo removed/);
+  expect(c.logs.join('\n')).toMatch(/gone\.jpg/);
+  expect(await exists(path)).toBe(false);
+  const r = await purgeRow(p);
+  expect(r.purge_removed_at).toBeInstanceOf(Date);
+  expect(r.purge_reclaimed_bytes).toBe(BigInt(size));
+  expect(await removePurged(c, p)).toBe('ALREADY_REMOVED');
+  // The duplicate columns are untouched.
+  expect(await row(p)).toMatchObject({ duplicate_removed_at: null, duplicate_mismatch: false });
+});
+
+test('removePurged: altered bytes are flagged purge_mismatch and kept', async () => {
+  const p = await purgedContent(await variant({}), 'x.jpg');
+  const path = await vaultPath(p);
+  await appendFile(path, Buffer.from('tampered'));
+  const c = ctx();
+  expect(await removePurged(c, p)).toBe('MISMATCH');
+  expect(c.logs.join('\n')).toMatch(/purged photo not removed: mismatch flagged/);
+  expect(await exists(path)).toBe(true);
+  expect(await purgeRow(p)).toMatchObject({
+    purge_mismatch: true,
+    purge_removed_at: null,
+    last_error: expect.stringMatching(/^purge_mismatch: vault sha256/) as unknown,
+  });
+  expect(await removePurged(c, p)).toBe('MISMATCH');
+});
+
+test('removePurged: an absent vault file is MISSING, recorded with 0 bytes', async () => {
+  const p = await purgedContent(await variant({}), 'x.jpg');
+  await unlink(await vaultPath(p));
+  expect(await removePurged(ctx(), p)).toBe('MISSING');
+  expect(await purgeRow(p)).toMatchObject({ purge_reclaimed_bytes: 0n });
+  expect((await purgeRow(p)).purge_removed_at).toBeInstanceOf(Date);
+});
+
+test('removePurged refuses a content that is not PURGED', async () => {
+  const s = await hashed(await variant({}));
+  await expect(removePurged(ctx(), s)).rejects.toThrow(/not PURGED/);
+  expect(await exists(await vaultPath(s))).toBe(true);
+});
+
+test('a retired duplicate whose keeper is PURGED is flagged, never removed (review focus 2)', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  await retireOnly(cam);
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    cam,
+  ]);
+  expect(await removeRetired(ctx(), n)).toBe('MISMATCH');
+  expect(await exists(await vaultPath(n))).toBe(true);
+  expect(await row(n)).toMatchObject({
+    state: 'DUPLICATE',
+    duplicate_of: cam,
+    duplicate_mismatch: true,
+    duplicate_removed_at: null,
+  });
+  expect(
+    (await pool.query('SELECT last_error FROM contents WHERE sha256 = $1', [n])).rows[0],
+  ).toMatchObject({ last_error: expect.stringMatching(/keeper .* is PURGED/) as unknown });
 });

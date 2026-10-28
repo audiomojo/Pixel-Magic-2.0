@@ -100,6 +100,10 @@ export interface DoctorReport {
   duplicatesRetired: number;
   /** Retired duplicates whose vault file was not removed because a re-hash disagreed. */
   duplicatesMismatched: number;
+  /** Contents purged with their similar set (purge spec §6). */
+  purged: number;
+  /** Purged contents whose vault file was not removed because a re-hash disagreed. */
+  purgeMismatched: number;
 }
 
 export const STUCK_ATTEMPTS = 5;
@@ -126,9 +130,16 @@ export async function doctor(pool: pg.Pool, layout: DataLayout): Promise<DoctorR
   const mismatches = await pool.query<{ n: bigint }>(
     `SELECT count(*) AS n FROM files WHERE copy_mismatch`,
   );
-  const dups = await pool.query<{ retired: bigint; mismatched: bigint }>(
+  const dups = await pool.query<{
+    retired: bigint;
+    mismatched: bigint;
+    purged: bigint;
+    purge_mismatched: bigint;
+  }>(
     `SELECT count(*) FILTER (WHERE state = 'DUPLICATE') AS retired,
-            count(*) FILTER (WHERE duplicate_mismatch) AS mismatched
+            count(*) FILTER (WHERE duplicate_mismatch) AS mismatched,
+            count(*) FILTER (WHERE state = 'PURGED') AS purged,
+            count(*) FILTER (WHERE purge_mismatch) AS purge_mismatched
        FROM contents`,
   );
   return {
@@ -138,6 +149,8 @@ export async function doctor(pool: pg.Pool, layout: DataLayout): Promise<DoctorR
     copyMismatches: Number(mismatches.rows[0]!.n),
     duplicatesRetired: Number(dups.rows[0]!.retired),
     duplicatesMismatched: Number(dups.rows[0]!.mismatched),
+    purged: Number(dups.rows[0]!.purged),
+    purgeMismatched: Number(dups.rows[0]!.purge_mismatched),
   };
 }
 

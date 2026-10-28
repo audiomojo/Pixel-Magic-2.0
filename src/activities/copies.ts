@@ -5,7 +5,7 @@ import { lstat, unlink } from 'node:fs/promises';
 import { heartbeat, log } from '@temporalio/activity';
 import { fsyncDir, sha256File, unlessEnoent } from '../fsops.js';
 import type { ReclaimOutcome, SweepResult } from '../types.js';
-import { removeRetired, type IdenticalCtx } from './identical.js';
+import { removePurged, removeRetired, type IdenticalCtx, type RemoveOutcome } from './identical.js';
 import type { Deps } from './index.js';
 import { ChangedWhileHashingError } from './ingest.js';
 
@@ -29,6 +29,35 @@ type Stats = NonNullable<Awaited<ReturnType<typeof lstatOrNull>>>;
  * can take long enough for that; the hashes, not the inode, prove the bytes.
  */
 const same = (a: Stats, b: Stats): boolean => a.size === b.size && a.mtimeNs === b.mtimeNs;
+
+/** Adds one removal outcome to a sweep's counts (`examined` included). */
+export function tally(out: SweepResult, o: RemoveOutcome): void {
+  out.examined++;
+  if (o === 'REMOVED' || o === 'MISSING') out.removed++;
+  else if (o === 'MISMATCH') out.mismatched++;
+  else if (o === 'DEFERRED') out.deferred++;
+}
+
+/**
+ * The sweep's passes over contents with a vault file still to remove: `sweepRetired` (identical
+ * duplicates) and `sweepPurged` (purged contents), each with its cursor in `copy_sweep_state`.
+ */
+const PENDING_PASSES = [
+  {
+    state: 'DUPLICATE',
+    removedAt: 'duplicate_removed_at',
+    mismatch: 'duplicate_mismatch',
+    cursor: 'retired_after',
+    remove: removeRetired,
+  },
+  {
+    state: 'PURGED',
+    removedAt: 'purge_removed_at',
+    mismatch: 'purge_mismatch',
+    cursor: 'purged_after',
+    remove: removePurged,
+  },
+] as const;
 
 export function makeCopies(deps: Deps) {
   const { pool, layout } = deps;
@@ -133,32 +162,35 @@ export function makeCopies(deps: Deps) {
     return row ? reclaimRow(row) : 'NOT_COPY';
   }
 
+  const ctx: IdenticalCtx = { ...deps, beat, log };
+
   /**
-   * Up to `limit` retired identical duplicates whose vault file is not yet dealt with (removal
-   * DEFERRED while a staging generation linked it, or a crash's leftover), after the persisted
-   * sha256 cursor: `removeRetired` each. True when the pass reached the end (cursor reset).
+   * One pass over contents whose vault file is not yet dealt with (removal DEFERRED while a
+   * staging generation linked it, or a crash's leftover): up to `limit` of them after the
+   * persisted sha256 cursor, each removed with `remove`. True when the pass reached the end
+   * (cursor reset).
    */
-  async function sweepRetired(limit: number, out: SweepResult, after: string): Promise<boolean> {
-    const ctx: IdenticalCtx = { ...deps, beat, log };
+  async function sweepPending(
+    p: (typeof PENDING_PASSES)[number],
+    limit: number,
+    out: SweepResult,
+    after: string,
+  ): Promise<boolean> {
     const rows = (
       await pool.query<{ sha256: string }>(
         `SELECT sha256 FROM contents
-          WHERE state = 'DUPLICATE' AND duplicate_removed_at IS NULL AND NOT duplicate_mismatch
+          WHERE state = '${p.state}' AND ${p.removedAt} IS NULL AND NOT ${p.mismatch}
             AND sha256 > $1
           ORDER BY sha256 LIMIT $2`,
         [after, limit],
       )
     ).rows;
     for (const { sha256 } of rows) {
-      const o = await removeRetired(ctx, sha256);
-      out.examined++;
-      if (o === 'REMOVED' || o === 'MISSING') out.removed++;
-      else if (o === 'MISMATCH') out.mismatched++;
-      else if (o === 'DEFERRED') out.deferred++;
+      tally(out, await p.remove(ctx, sha256));
       heartbeat(out);
     }
     const wrapped = rows.length < limit;
-    await pool.query('UPDATE copy_sweep_state SET retired_after = $1 WHERE id = 1', [
+    await pool.query(`UPDATE copy_sweep_state SET ${p.cursor} = $1 WHERE id = 1`, [
       wrapped ? '' : rows[rows.length - 1]!.sha256,
     ]);
     return wrapped;
@@ -168,13 +200,14 @@ export function makeCopies(deps: Deps) {
    * Queue `io`, heartbeating (`CopySweepWorkflow`). Up to `limit` COPY rows neither removed nor
    * flagged, after the persisted cursor in id order: crash leftovers, deferred copies and the
    * one-off pass over data ingested before removal existed. Then up to `limit` pending retired
-   * identical duplicates (`sweepRetired`, its own cursor). `wrapped`: both passes reached the end
-   * and their cursors went back to the start.
+   * identical duplicates (`sweepRetired`) and up to `limit` pending purged contents
+   * (`sweepPurged`), each on its own cursor. `wrapped`: every pass reached the end and its
+   * cursor went back to the start.
    */
   async function sweepCopies(limit: number): Promise<SweepResult> {
     const state = (
-      await pool.query<{ after_id: bigint; retired_after: string }>(
-        'SELECT after_id, retired_after FROM copy_sweep_state WHERE id = 1',
+      await pool.query<{ after_id: bigint; retired_after: string; purged_after: string }>(
+        'SELECT after_id, retired_after, purged_after FROM copy_sweep_state WHERE id = 1',
       )
     ).rows[0]!;
     const after = state.after_id;
@@ -204,8 +237,10 @@ export function makeCopies(deps: Deps) {
     const copiesWrapped = rows.length < limit;
     const next = copiesWrapped ? 0n : rows[rows.length - 1]!.id;
     await pool.query('UPDATE copy_sweep_state SET after_id = $1 WHERE id = 1', [next]);
-    const retiredWrapped = await sweepRetired(limit, out, state.retired_after);
-    out.wrapped = copiesWrapped && retiredWrapped;
+    let pendingWrapped = true;
+    for (const p of PENDING_PASSES)
+      if (!(await sweepPending(p, limit, out, state[p.cursor]))) pendingWrapped = false;
+    out.wrapped = copiesWrapped && pendingWrapped;
     if (out.examined > 0) log.info('duplicate sweep', { ...out });
     return out;
   }

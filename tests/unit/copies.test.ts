@@ -1,6 +1,17 @@
 // Removal of confirmed byte-identical duplicates (spec §6.5): `reclaimCopy` and `sweepCopies`.
 import { existsSync } from 'node:fs';
-import { chmod, link, mkdir, readdir, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  unlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type pg from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
@@ -475,4 +486,87 @@ test('the retired pass is bounded and resumes at its own cursor', async () => {
   expect(second).toMatchObject({ deferred: 1, wrapped: true });
   const third = await sweep(2);
   expect(third).toMatchObject({ deferred: 2, wrapped: false }); // back at the start
+});
+
+/** Purged, removal pending (vault file present). */
+async function pendingPurged(name: string, bytes: Buffer) {
+  const r = await ingest(name, bytes);
+  await pool.query(`UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = $1`, [
+    r.sha256,
+  ]);
+  return r;
+}
+const purgedRow = async (r: IngestResult) =>
+  (
+    await pool.query<{ purge_removed_at: Date | null; purge_mismatch: boolean }>(
+      'SELECT purge_removed_at, purge_mismatch FROM contents WHERE sha256 = $1',
+      [r.sha256],
+    )
+  ).rows[0]!;
+
+test('the sweep finishes deferred purged removals once staging drops its link (review focus 4)', async () => {
+  const a = await pendingPurged('a.jpg', JPEG_A);
+  const b = await pendingPurged('b.jpg', JPEG_B);
+  const staged = join(layout.staging, 'staged-link.jpg');
+  await link(vaultPath(a), staged);
+  // As after a worker restart: nothing but the sweep comes back to these rows.
+  expect(await sweep(10)).toMatchObject({ removed: 1, deferred: 1, wrapped: true });
+  expect(existsSync(vaultPath(a))).toBe(true);
+  expect((await purgedRow(a)).purge_removed_at).toBeNull();
+  expect(existsSync(vaultPath(b))).toBe(false);
+  expect((await purgedRow(b)).purge_removed_at).toBeInstanceOf(Date);
+  await unlink(staged);
+  expect(await sweep(10)).toMatchObject({ removed: 1, deferred: 0 });
+  expect(existsSync(vaultPath(a))).toBe(false);
+  expect((await purgedRow(a)).purge_removed_at).toBeInstanceOf(Date);
+  expect(await sweep(10)).toMatchObject({ examined: 0, wrapped: true });
+});
+
+test('the purged pass is bounded and resumes at its own cursor', async () => {
+  const rs = [];
+  for (let i = 0; i < 3; i++)
+    rs.push(await pendingPurged(`p${String(i)}.jpg`, Buffer.concat([JPEG_A, Buffer.from([i])])));
+  for (const r of rs) await link(vaultPath(r), join(layout.root, `l-${r.sha256!}`));
+  expect(await sweep(2)).toMatchObject({ deferred: 2, wrapped: false });
+  const cursor = async () =>
+    (await pool.query<{ p: string }>('SELECT purged_after AS p FROM copy_sweep_state')).rows[0]!.p;
+  expect(await cursor()).not.toBe('');
+  expect(await sweep(2)).toMatchObject({ deferred: 1, wrapped: true });
+  expect(await cursor()).toBe('');
+  expect(await sweep(2)).toMatchObject({ deferred: 2, wrapped: false }); // back at the start
+});
+
+test('the sweep skips a purged row already flagged', async () => {
+  const a = await pendingPurged('a.jpg', JPEG_A);
+  await pool.query('UPDATE contents SET purge_mismatch = true WHERE sha256 = $1', [a.sha256]);
+  expect(await sweep(10)).toMatchObject({ examined: 0 });
+  expect(existsSync(vaultPath(a))).toBe(true);
+});
+
+test('removePurgedBatch removes the given purged files, skipping rows not pending', async () => {
+  const a = await pendingPurged('a.jpg', JPEG_A);
+  const b = await pendingPurged('b.jpg', JPEG_B);
+  const live = await ingest('c.jpg', Buffer.concat([JPEG_A, Buffer.from('c')]));
+  await link(vaultPath(b), join(layout.staging, 'b-link.jpg'));
+  const beats: unknown[] = [];
+  const r = await runActivity(
+    acts.removePurgedBatch,
+    [[a.sha256!, b.sha256!, live.sha256!, 'f'.repeat(64)]],
+    { onHeartbeat: (d) => beats.push(d) },
+  );
+  expect(r).toEqual({ examined: 2, removed: 1, mismatched: 0, deferred: 1, wrapped: true });
+  expect(beats.length).toBeGreaterThan(0);
+  expect(existsSync(vaultPath(a))).toBe(false);
+  expect(existsSync(vaultPath(b))).toBe(true);
+  expect(existsSync(vaultPath(live))).toBe(true);
+});
+
+test('syncPurgeLog appends the purged rows the log lacks', async () => {
+  await pool.query(
+    `INSERT INTO purged (sha256, size_bytes, names, purged_at) VALUES ($1, 5, '{x.jpg}', now())`,
+    ['a'.repeat(64)],
+  );
+  expect(await runActivity(acts.syncPurgeLog, [])).toEqual({ appended: 1 });
+  expect(await readFile(join(layout.root, 'purged.csv'), 'utf8')).toContain('a'.repeat(64));
+  expect(await runActivity(acts.syncPurgeLog, [])).toEqual({ appended: 0 });
 });

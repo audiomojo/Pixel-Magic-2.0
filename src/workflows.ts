@@ -3,6 +3,7 @@
 import {
   ActivityFailure,
   ApplicationFailure,
+  executeChild,
   isCancellation,
   log,
   patched,
@@ -10,6 +11,7 @@ import {
   sleep,
   type ActivityOptions,
   type RetryPolicy,
+  workflowInfo,
 } from '@temporalio/workflow';
 import type { Activities } from './activities/index.js';
 import type { BuildResult, DecodeKilledType, FileRef, ScanResult, SweepResult } from './types.js';
@@ -85,6 +87,15 @@ export const ACTIVITY_OPTIONS = {
     heartbeatTimeout: '30s',
     retry: TRANSIENT_RETRY,
   },
+  /** Reads and appends `purged.csv` (small) under an advisory lock. */
+  syncPurgeLog: { taskQueue: 'io', startToCloseTimeout: '10m', retry: TRANSIENT_RETRY },
+  /** Re-hashes each purged vault file before unlinking it (large videos): heartbeats. */
+  removePurgedBatch: {
+    taskQueue: 'io',
+    startToCloseTimeout: '1h',
+    heartbeatTimeout: '30s',
+    retry: TRANSIENT_RETRY,
+  },
 } satisfies Record<keyof Activities, ActivityOptions>;
 
 const { ingestFile } = proxyActivities<Activities>(ACTIVITY_OPTIONS.ingestFile);
@@ -97,6 +108,8 @@ const { maybeBuildStaging } = proxyActivities<Activities>(ACTIVITY_OPTIONS.maybe
 const { scanAndStart } = proxyActivities<Activities>(ACTIVITY_OPTIONS.scanAndStart);
 const { reclaimCopy } = proxyActivities<Activities>(ACTIVITY_OPTIONS.reclaimCopy);
 const { sweepCopies } = proxyActivities<Activities>(ACTIVITY_OPTIONS.sweepCopies);
+const { syncPurgeLog } = proxyActivities<Activities>(ACTIVITY_OPTIONS.syncPurgeLog);
+const { removePurgedBatch } = proxyActivities<Activities>(ACTIVITY_OPTIONS.removePurgedBatch);
 
 const DECODE_KILLED: DecodeKilledType = 'DecodeKilled';
 /** Decode attempts in all (kills included) before a content is FAILED `decode_killed`. */
@@ -223,6 +236,25 @@ export async function CopySweepWorkflow(): Promise<SweepResult> {
     total.wrapped = r.wrapped;
   }
   return total;
+}
+
+/**
+ * Started by the Picks API after a purge commits (purge spec §5 step 3): append the purge to
+ * `purged.csv`, rebuild staging so it drops its links to the purged files, then remove their
+ * vault files. The build is forced: a non-forced one skips while FileWorkflows are running
+ * (within STAGE_MAX_STALENESS_S), which would leave every removal DEFERRED. Files still DEFERRED
+ * (an older generation still links them) are finished by the copy sweep.
+ */
+export async function PurgeSyncWorkflow(
+  shas: string[],
+): Promise<{ appended: number; removed: number; deferred: number }> {
+  const { appended } = await syncPurgeLog();
+  await executeChild(StagingWorkflow, {
+    workflowId: `pm-stage-purge-${workflowInfo().workflowId}`,
+    args: [true],
+  });
+  const r = await removePurgedBatch(shas);
+  return { appended, removed: r.removed, deferred: r.deferred };
 }
 
 export * from './harvest/workflow.js';

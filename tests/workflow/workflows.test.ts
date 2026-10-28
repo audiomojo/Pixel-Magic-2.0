@@ -28,6 +28,7 @@ import type {
   ContentWorkflow,
   CopySweepWorkflow,
   FileWorkflow,
+  PurgeSyncWorkflow,
   ScanWorkflow,
   StagingWorkflow,
 } from '../../src/workflows.js';
@@ -43,6 +44,7 @@ interface Overrides {
   scan?: Fakeable<ScanResult>;
   reclaim?: Fakeable<ReclaimOutcome>;
   sweep?: Fakeable<SweepResult>;
+  removePurged?: Fakeable<SweepResult>;
 }
 type Impl = Pick<
   Activities,
@@ -57,6 +59,8 @@ type Impl = Pick<
   | 'scanAndStart'
   | 'reclaimCopy'
   | 'sweepCopies'
+  | 'syncPurgeLog'
+  | 'removePurgedBatch'
 >;
 interface Fakes {
   impl: Impl;
@@ -129,6 +133,16 @@ function fakes(o: Overrides): Fakes {
       sweepCopies: rec('sweepCopies', () =>
         value(o.sweep, { examined: 0, removed: 0, mismatched: 0, deferred: 0, wrapped: true }),
       ),
+      syncPurgeLog: rec('syncPurgeLog', () => Promise.resolve({ appended: 3 })),
+      removePurgedBatch: rec('removePurgedBatch', () =>
+        value(o.removePurged, {
+          examined: 2,
+          removed: 1,
+          mismatched: 0,
+          deferred: 1,
+          wrapped: true,
+        }),
+      ),
     },
   };
 }
@@ -151,6 +165,8 @@ const NAMES = [
   'scanAndStart',
   'reclaimCopy',
   'sweepCopies',
+  'syncPurgeLog',
+  'removePurgedBatch',
 ] as const;
 /** Every activity forwards to the current test's fakes, so one set of workers serves the file. */
 const activities = Object.fromEntries(
@@ -432,6 +448,42 @@ test('StagingWorkflow passes force through', async () => {
   expect(await run([true])).toEqual({ gen: 9, entries: 0, skipped: false });
   expect(await run([])).toEqual({ gen: null, entries: 0, skipped: true });
   expect(current.args['maybeBuildStaging']).toEqual([[true], [false]]);
+});
+
+test('PurgeSyncWorkflow: sync the log, rebuild staging (forced), then remove the files', async () => {
+  current = fakes({});
+  const shas = ['a'.repeat(64), 'b'.repeat(64)];
+  const workflowId = `test-${randomUUID()}`;
+  expect(
+    await env.client.workflow.execute<typeof PurgeSyncWorkflow>('PurgeSyncWorkflow', {
+      ...start,
+      workflowId,
+      args: [shas],
+    }),
+  ).toEqual({ appended: 3, removed: 1, deferred: 1 });
+  expect(current.calls).toEqual(['syncPurgeLog', 'maybeBuildStaging', 'removePurgedBatch']);
+  expect(current.args['maybeBuildStaging']).toEqual([[true]]);
+  expect(current.args['removePurgedBatch']).toEqual([[shas]]);
+  const child = env.client.workflow.getHandle(`pm-stage-purge-${workflowId}`);
+  expect((await child.describe()).type).toBe('StagingWorkflow');
+});
+
+test('PurgeSyncWorkflow: the removal step retries through an outage', async () => {
+  current = fakes({
+    removePurged: failNTimes(3, {
+      examined: 1,
+      removed: 1,
+      mismatched: 0,
+      deferred: 0,
+      wrapped: true,
+    }),
+  });
+  expect(
+    await env.client.workflow.execute<typeof PurgeSyncWorkflow>('PurgeSyncWorkflow', {
+      ...id(),
+      args: [['a'.repeat(64)]],
+    }),
+  ).toEqual({ appended: 3, removed: 1, deferred: 0 });
 });
 
 test('fileWorkflowId is stable and sensitive', () => {

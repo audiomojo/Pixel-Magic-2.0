@@ -273,16 +273,6 @@ export async function retireFamily(
   return { keeper, retired: losers };
 }
 
-interface RetiredRow {
-  state: string;
-  ext: string;
-  size_bytes: bigint;
-  duplicate_of: string | null;
-  duplicate_rule: string | null;
-  duplicate_removed_at: Date | null;
-  duplicate_mismatch: boolean;
-}
-
 /** Original names of a content's files, for the removal log. */
 async function namesOf(c: pg.PoolClient, sha256: string): Promise<string[]> {
   const r = await c.query<{ n: string }>(
@@ -292,61 +282,90 @@ async function namesOf(c: pg.PoolClient, sha256: string): Promise<string[]> {
   return r.rows.map((x) => x.n);
 }
 
+interface LockedRow {
+  state: string;
+  ext: string;
+  removed_at: Date | null;
+  mismatch: boolean;
+  duplicate_of: string | null;
+  duplicate_rule: string | null;
+}
+
+/** What a removal kind changes and says; the steps themselves are shared (`removeVaultFile`). */
+interface Removal {
+  /** The exported function's name, for its errors. */
+  fn: string;
+  /** The content state this removal is for. */
+  state: 'DUPLICATE' | 'PURGED';
+  /** `contents` columns: when removed, bytes reclaimed, mismatch flag. */
+  removedAt: string;
+  reclaimed: string;
+  mismatch: string;
+  /** Log message subject: `<label> removed`, `<label> removal deferred: still linked`, … */
+  label: string;
+  /**
+   * Under the row lock: log fields, and the kind's own checks. `beforeLink` runs once the vault
+   * file is known to be a regular file, `beforeHash` once it is known to be the only link;
+   * either returns a reason to flag the row, or null.
+   */
+  prepare(
+    ctx: IdenticalCtx,
+    c: pg.PoolClient,
+    sha256: string,
+    row: LockedRow & { removed: string },
+  ): Promise<{
+    where: Record<string, unknown>;
+    beforeLink?: () => Promise<string | null>;
+    beforeHash?: () => Promise<string | null>;
+  }>;
+}
+
 /**
- * Deletes a retired content's vault file once a fresh sha256 of it equals `contents.sha256` and
- * a fresh sha256 of the keeper's vault file equals `duplicate_of`, then records it. DEFERRED
- * (nothing done, nothing recorded) while another name links the file (R15). Safe to repeat and to run on a row
- * left retired-but-not-removed by a crash; concurrent calls for one content serialize on its
- * row. A file already gone is MISSING (0 bytes reclaimed); any mismatch is flagged and kept.
+ * Deletes a content's vault file once a fresh sha256 of it equals `contents.sha256` (and the
+ * kind's own checks pass), then records it. DEFERRED (nothing done, nothing recorded) while
+ * another name links the file (R15). Safe to repeat and to run on a row left pending by a
+ * crash; concurrent calls for one content serialize on its row. A file already gone is MISSING
+ * (0 bytes reclaimed); any mismatch is flagged and the file kept.
  */
-export async function removeRetired(ctx: IdenticalCtx, sha256: string): Promise<RemoveOutcome> {
+async function removeVaultFile(
+  ctx: IdenticalCtx,
+  sha256: string,
+  k: Removal,
+): Promise<RemoveOutcome> {
   return withTx(ctx.pool, async (c) => {
     await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${LONG_TX}'`);
     const r = (
-      await c.query<RetiredRow>(
-        `SELECT state, ext, size_bytes, duplicate_of, duplicate_rule, duplicate_removed_at,
-                duplicate_mismatch
+      await c.query<LockedRow>(
+        `SELECT state, ext, ${k.removedAt} AS removed_at, ${k.mismatch} AS mismatch,
+                duplicate_of, duplicate_rule
            FROM contents WHERE sha256 = $1 FOR UPDATE`,
         [sha256],
       )
     ).rows[0];
-    if (r?.state !== 'DUPLICATE' || r.duplicate_of === null)
-      throw new Error(
-        `removeRetired ${sha256}: content is ${r?.state ?? 'missing'}, not DUPLICATE`,
-      );
-    if (r.duplicate_removed_at !== null) return 'ALREADY_REMOVED';
-    if (r.duplicate_mismatch) return 'MISMATCH';
-    const keeper = (
-      await c.query<{ ext: string; state: string }>(
-        'SELECT ext, state FROM contents WHERE sha256 = $1',
-        [r.duplicate_of],
-      )
-    ).rows[0];
+    if (r?.state !== k.state)
+      throw new Error(`${k.fn} ${sha256}: content is ${r?.state ?? 'missing'}, not ${k.state}`);
+    if (r.removed_at !== null) return 'ALREADY_REMOVED';
+    if (r.mismatch) return 'MISMATCH';
     const path = ctx.layout.vaultFile(sha256, r.ext);
-    const keptPath = keeper ? ctx.layout.vaultFile(r.duplicate_of, keeper.ext) : null;
-    const where = {
+    const { where, beforeLink, beforeHash } = await k.prepare(ctx, c, sha256, {
+      ...r,
       removed: ctx.layout.rel(path),
-      removedNames: await namesOf(c, sha256),
-      kept: keptPath && ctx.layout.rel(keptPath),
-      keptNames: await namesOf(c, r.duplicate_of),
-      rule: r.duplicate_rule,
-    };
+    });
     const flag = async (error: string): Promise<RemoveOutcome> => {
-      await c.query(
-        `UPDATE contents SET duplicate_mismatch = true, last_error = $2 WHERE sha256 = $1`,
-        [sha256, `duplicate_mismatch: ${error}`],
-      );
-      ctx.log.warn('identical duplicate not removed: mismatch flagged', { ...where, error });
+      await c.query(`UPDATE contents SET ${k.mismatch} = true, last_error = $2 WHERE sha256 = $1`, [
+        sha256,
+        `${k.mismatch}: ${error}`,
+      ]);
+      ctx.log.warn(`${k.label} not removed: mismatch flagged`, { ...where, error });
       return 'MISMATCH';
     };
     const deferred = (): RemoveOutcome => {
-      ctx.log.info('identical duplicate removal deferred: still linked', where);
+      ctx.log.info(`${k.label} removal deferred: still linked`, where);
       return 'DEFERRED';
     };
     const mark = async (bytes: bigint): Promise<void> => {
       await c.query(
-        `UPDATE contents SET duplicate_removed_at = clock_timestamp(),
-                             duplicate_reclaimed_bytes = $2
+        `UPDATE contents SET ${k.removedAt} = clock_timestamp(), ${k.reclaimed} = $2
           WHERE sha256 = $1`,
         [sha256, bytes],
       );
@@ -355,33 +374,111 @@ export async function removeRetired(ctx: IdenticalCtx, sha256: string): Promise<
     const before = await unlessEnoent(lstat(path, { bigint: true }));
     if (!before) {
       await mark(0n);
-      ctx.log.info('identical duplicate already gone', where);
+      ctx.log.info(`${k.label} already gone`, where);
       return 'MISSING';
     }
-    if (!before.isFile()) return flag(`${where.removed} is not a regular file`);
-    if (!keeper || !keptPath || keeper.state === 'DUPLICATE')
-      return flag(`keeper ${r.duplicate_of} is ${keeper?.state ?? 'missing'}`);
-    const kept = await unlessEnoent(lstat(keptPath));
-    if (!kept?.isFile()) return flag(`keeper vault file ${String(where.kept)} missing`);
+    if (!before.isFile()) return flag(`${ctx.layout.rel(path)} is not a regular file`);
+    const linkErr = await beforeLink?.();
+    if (linkErr) return flag(linkErr);
     // A staging generation (or a link the user made) still names these bytes: unlinking the vault
     // name would free nothing and leave the other name to be reaped as a user's file. Later: the
-    // copy sweep and `dedupe-identical --apply` retry once the generation is gone.
+    // copy sweep (and, for duplicates, `dedupe-identical --apply`) retry once it is gone.
     if (before.nlink > 1n) return deferred();
-    const keptSha = await sha256File(keptPath, () => ctx.beat());
-    if (keptSha !== r.duplicate_of)
-      return flag(`keeper vault sha256 ${keptSha}, expected ${r.duplicate_of}`);
+    const hashErr = await beforeHash?.();
+    if (hashErr) return flag(hashErr);
     const actual = await sha256File(path, () => ctx.beat());
     if (actual !== sha256) return flag(`vault sha256 ${actual}, expected ${sha256}`);
     const after = await unlessEnoent(lstat(path, { bigint: true }));
     if (!after || after.size !== before.size || after.mtimeNs !== before.mtimeNs)
-      return flag(`${where.removed} changed while hashing`);
+      return flag(`${ctx.layout.rel(path)} changed while hashing`);
     if (after.nlink > 1n) return deferred();
     await unlessEnoent(unlink(path));
     await fsyncDir(dirname(path)); // the unlink is durable before the row says so
     await mark(before.size);
-    ctx.log.info('identical duplicate removed', { ...where, bytes: String(before.size) });
+    ctx.log.info(`${k.label} removed`, { ...where, bytes: String(before.size) });
     return 'REMOVED';
   });
+}
+
+/**
+ * A retired duplicate: removed only while its keeper's vault file is there and a fresh sha256
+ * of it equals `duplicate_of`. A keeper that is itself retired or purged counts as gone (flag).
+ */
+const RETIRED: Removal = {
+  fn: 'removeRetired',
+  state: 'DUPLICATE',
+  removedAt: 'duplicate_removed_at',
+  reclaimed: 'duplicate_reclaimed_bytes',
+  mismatch: 'duplicate_mismatch',
+  label: 'identical duplicate',
+  async prepare(ctx, c, sha256, row) {
+    const keeperSha = row.duplicate_of;
+    if (keeperSha === null)
+      throw new Error(`removeRetired ${sha256}: content is DUPLICATE without duplicate_of`);
+    const keeper = (
+      await c.query<{ ext: string; state: string }>(
+        'SELECT ext, state FROM contents WHERE sha256 = $1',
+        [keeperSha],
+      )
+    ).rows[0];
+    const keptPath = keeper ? ctx.layout.vaultFile(keeperSha, keeper.ext) : null;
+    const where = {
+      removed: row.removed,
+      removedNames: await namesOf(c, sha256),
+      kept: keptPath && ctx.layout.rel(keptPath),
+      keptNames: await namesOf(c, keeperSha),
+      rule: row.duplicate_rule,
+    };
+    return {
+      where,
+      async beforeLink() {
+        if (!keeper || !keptPath || keeper.state === 'DUPLICATE' || keeper.state === 'PURGED')
+          return `keeper ${keeperSha} is ${keeper?.state ?? 'missing'}`;
+        const kept = await unlessEnoent(lstat(keptPath));
+        if (!kept?.isFile()) return `keeper vault file ${String(where.kept)} missing`;
+        return null;
+      },
+      async beforeHash() {
+        const keptSha = await sha256File(keptPath!, () => ctx.beat());
+        return keptSha === keeperSha
+          ? null
+          : `keeper vault sha256 ${keptSha}, expected ${keeperSha}`;
+      },
+    };
+  },
+};
+
+/** A purged content (purge spec §6): no keeper; everything else as for a duplicate. */
+const PURGED: Removal = {
+  fn: 'removePurged',
+  state: 'PURGED',
+  removedAt: 'purge_removed_at',
+  reclaimed: 'purge_reclaimed_bytes',
+  mismatch: 'purge_mismatch',
+  label: 'purged photo',
+  async prepare(_ctx, c, sha256, row) {
+    return { where: { removed: row.removed, removedNames: await namesOf(c, sha256) } };
+  },
+};
+
+/**
+ * Deletes a retired content's vault file once a fresh sha256 of it equals `contents.sha256` and
+ * a fresh sha256 of the keeper's vault file equals `duplicate_of`, then records it. DEFERRED
+ * (nothing done, nothing recorded) while another name links the file (R15). Safe to repeat and to run on a row
+ * left retired-but-not-removed by a crash; concurrent calls for one content serialize on its
+ * row. A file already gone is MISSING (0 bytes reclaimed); any mismatch is flagged and kept.
+ */
+export async function removeRetired(ctx: IdenticalCtx, sha256: string): Promise<RemoveOutcome> {
+  return removeVaultFile(ctx, sha256, RETIRED);
+}
+
+/**
+ * Deletes a purged content's vault file (purge spec §6), with `removeRetired`'s steps minus the
+ * keeper check: DEFERRED while linked elsewhere, re-hash before unlink, mismatch flagged
+ * (`purge_mismatch`) and kept, a file already gone MISSING. Throws for a content not PURGED.
+ */
+export async function removePurged(ctx: IdenticalCtx, sha256: string): Promise<RemoveOutcome> {
+  return removeVaultFile(ctx, sha256, PURGED);
 }
 
 interface Pre {

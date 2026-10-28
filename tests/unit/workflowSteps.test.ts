@@ -142,9 +142,11 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
     'maybeBuildStaging',
     'reclaimCopy',
     'recordHash',
+    'removePurgedBatch',
     'reopenFailed',
     'scanAndStart',
     'sweepCopies',
+    'syncPurgeLog',
   ]);
   for (const [k, v] of all) {
     expect(v.startToCloseTimeout, k).toBeDefined();
@@ -152,6 +154,8 @@ test('every activity has a start-to-close timeout; only decode caps its attempts
   }
   expect(o.markFailed).toMatchObject({ taskQueue: 'io', startToCloseTimeout: '1m' });
   expect(o.reopenFailed).toMatchObject({ taskQueue: 'io', startToCloseTimeout: '1m' });
+  expect(o.syncPurgeLog).toMatchObject({ taskQueue: 'io' });
+  expect(o.removePurgedBatch).toMatchObject({ taskQueue: 'io', heartbeatTimeout: '30s' });
   expect(o.maybeBuildStaging).toMatchObject({
     taskQueue: 'io',
     startToCloseTimeout: '2h',

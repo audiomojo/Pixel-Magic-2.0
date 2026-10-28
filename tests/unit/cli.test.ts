@@ -289,6 +289,8 @@ test('doctor counts orphaned claimed files and stuck work', async () => {
     copyMismatches: 0,
     duplicatesRetired: 0,
     duplicatesMismatched: 0,
+    purged: 0,
+    purgeMismatched: 0,
   });
 });
 
@@ -302,6 +304,8 @@ test('doctor reports zeros on a clean system', async () => {
     copyMismatches: 0,
     duplicatesRetired: 0,
     duplicatesMismatched: 0,
+    purged: 0,
+    purgeMismatched: 0,
   });
 });
 
@@ -386,6 +390,20 @@ test('doctor counts retired duplicates and identical-duplicate mismatches', asyn
   const out = capture('stdout');
   expect(await main(['doctor'], deps)).toBe(0);
   expect(JSON.parse(out())).toMatchObject({ duplicatesRetired: 2, duplicatesMismatched: 1 });
+});
+
+test('doctor counts purged contents and purge mismatches', async () => {
+  const a = await seedContent({ state: 'CLUSTERED' });
+  const b = await seedContent({ state: 'CLUSTERED' });
+  await seedContent({ state: 'CLUSTERED' });
+  await pgh.pool.query(
+    `UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 IN ($1, $2)`,
+    [a, b],
+  );
+  await pgh.pool.query('UPDATE contents SET purge_mismatch = true WHERE sha256 = $1', [b]);
+  const out = capture('stdout');
+  expect(await main(['doctor'], deps)).toBe(0);
+  expect(JSON.parse(out())).toMatchObject({ purged: 2, purgeMismatched: 1 });
 });
 
 // ---- dedupe-identical ----
