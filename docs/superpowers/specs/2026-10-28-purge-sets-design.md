@@ -106,7 +106,10 @@ UI: the Purged list (§10) row's **Unblock** button, behind a confirmation.
 
 - set `purged.unblocked_at = now()`; append `unblock` lines to `purged.csv`;
 - reset `harvest_items` in state `BLOCKED` or `KNOWN` with that sha to `PLANNED`, so the next run
-  of its source sends it again.
+  of its source sends it again; likewise `SENT` items whose copy was purged (sent before the
+  still-`PURGED` content's `purged_at`), clearing their drop-zone copy and `file_id`. Only shas
+  that are unblocked are reset. The known-check never counts such a `SENT` item as the winner
+  of a duplicate.
 
 On ingest of a sha whose content is `PURGED` and unblocked: link the file into the vault, reset
 the content to `INGESTED` (clearing the purge columns) and run the normal content workflow.
