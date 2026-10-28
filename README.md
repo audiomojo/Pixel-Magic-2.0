@@ -215,6 +215,45 @@ checksums of it and of its keeper match, and a re-run first finishes any deletio
 done or deferred. A pair that cannot be decoded, or a family that fails (exiftool, a lock
 timeout), is an error, retires nothing and is retried next run; the others carry on.
 
+## Purging a similar set
+
+On the Picks tab, **Purge set…** deletes a look-alike set you never want to keep: the photos
+shown, their hidden lesser copies (same copy group) and their Live Photo videos. The dialog
+names the counts and size first. A purge is not a pick (it does not train the AI), and your
+originals on the source drives are never touched. Only what was on screen goes: a photo of the
+set the AI has not described yet, or one that joined the set since the last staging build, is
+left alone (if the set changed meanwhile, the purge is refused and the screen reloads).
+
+Purged files are **blocked by their exact bytes** (sha256 and size, never by name or look):
+dropped into the drop zone again they are deleted there and recorded `BLOCKED`, and the
+harvester counts them as blocked instead of sending them.
+
+**Keep `DATA_DIR/purged.csv`.** The block list lives in the database (`purged`) and in this
+append-only file (`action,sha256,size_bytes,at,names`, one line per purge or unblock). A
+worker rebuilds the table from the file at start, before it takes any file in, so a wiped or
+restored database keeps its block list only if the file survives: back it up with the
+database. The worker also appends any purge the file lacks, at start and on every copy sweep.
+
+Removal finishes in steps: the purge marks the rows at once (they leave the Picks tab), then
+the worker appends the file, forces a staging build and deletes each vault file that nothing
+else links, after a fresh checksum. Files the previous staging generation still links are
+deferred: they go after **two** staging builds plus the copy sweep (every 15 minutes, or
+`make stage FORCE=1` twice, then `make sweep-copies`). `make doctor` shows `purged` (contents
+purged) and `purgeMismatched` (vault files kept because their checksum no longer matched:
+check them by hand).
+
+**Unblocking:** the Purged section of the Picks tab lists each purge; **Unblock** (confirmed)
+lifts the block, appends an `unblock` line, and marks the photos' harvest items to be sent
+again: they return on the next harvest of their folder (or when you drop the file in the drop
+zone yourself) and go through the pipeline as new. Purging them again blocks them again.
+
+**Rollout:** migration 0011 and the worker go first (`make up`, following the drain in
+[Upgrading](#upgrading)), the harvester after (`make harvest-install`). An older worker does
+not know `PurgeSyncWorkflow`, does not read `purged.csv` at start and does not block returning
+files, so a purge made from a new harvester against it would reach neither the vault nor the
+file until the worker is upgraded.
+Design: `docs/superpowers/specs/2026-10-28-purge-sets-design.md`.
+
 ## Upgrading
 
 Up to `MAX_IN_FLIGHT` (5,000) FileWorkflows are always in flight, and a workflow-code change
