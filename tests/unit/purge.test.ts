@@ -227,3 +227,44 @@ test('unblock sets unblocked_at and resets KNOWN/BLOCKED ledger items to PLANNED
   // Already unblocked: nothing changes.
   expect(await unblock(pool, [sha('a')])).toBe(0);
 });
+
+const clusterVersion = async () =>
+  (await pool.query<{ v: bigint }>('SELECT version AS v FROM cluster_state WHERE id = 1')).rows[0]!
+    .v;
+
+test('purging CLUSTERED rows bumps cluster_state.version once; the idempotent repeat does not', async () => {
+  await seed();
+  const v0 = await clusterVersion();
+  expect(await purgeSet(pool, SET, [sha('a'), sha('b')])).not.toBe('stale');
+  expect(await clusterVersion()).toBe(v0 + 1n);
+  await purgeSet(pool, SET, [sha('a'), sha('b')]);
+  expect(await clusterVersion()).toBe(v0 + 1n);
+});
+
+test('a stale purge leaves cluster_state.version alone', async () => {
+  await seed();
+  const v0 = await clusterVersion();
+  expect(await purgeSet(pool, SET, [sha('a')])).toBe('stale');
+  expect(await clusterVersion()).toBe(v0);
+});
+
+test('purgeSet waits for pm.cluster before touching the closure rows', async () => {
+  await seed();
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
+    let done = false;
+    const p = purgeSet(pool, SET, [sha('a'), sha('b')]).then((r) => {
+      done = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(done).toBe(false);
+    expect((await pool.query("SELECT 1 FROM contents WHERE state = 'PURGED'")).rowCount).toBe(0);
+    await holder.query('COMMIT');
+    expect(await p).not.toBe('stale');
+  } finally {
+    holder.release();
+  }
+});

@@ -122,6 +122,11 @@ export async function purgeSet(
       return summarize(await closureRows(c, setId, ['PURGED'], ['PURGED']), want);
     if (!sameList(await currentShown(c, setId), want)) return 'stale';
 
+    // Lock order purge-set → pm.cluster → rows (dedupe: suspect key → pm.cluster → rows;
+    // clusterContent: pm.cluster → rows), so none of them deadlock. Holding pm.cluster keeps a
+    // concurrent cluster step from committing a cache that still holds a purged row, and the
+    // groups from merging under the closure (R6, as `retireFamily`).
+    await c.query(`SELECT pg_advisory_xact_lock(hashtext('pm.cluster'))`);
     const rows = await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES);
     const shas = rows.map((r) => r.sha256);
     await c.query(
@@ -132,10 +137,15 @@ export async function purgeSet(
     const locked = await closureRows(c, setId, LIVE_STATES, LIVE_MOTION_STATES);
     const lockedShas = locked.map((r) => r.sha256);
     if (!sameList(lockedShas, shas)) return 'stale';
-    await c.query(
-      `UPDATE contents SET state = 'PURGED', purged_at = now() WHERE sha256 = ANY($1::text[])`,
+    const upd = await c.query<{ was: string }>(
+      `UPDATE contents n SET state = 'PURGED', purged_at = now()
+         FROM contents o WHERE o.sha256 = n.sha256 AND n.sha256 = ANY($1::text[])
+       RETURNING o.state AS was`,
       [shas],
     );
+    // A purged CLUSTERED row must leave every worker's in-memory cluster index.
+    if (upd.rows.some((r) => r.was === 'CLUSTERED'))
+      await c.query('UPDATE cluster_state SET version = version + 1 WHERE id = 1');
     await c.query(
       `INSERT INTO purged (sha256, size_bytes, names, purged_at, unblocked_at, set_id)
        SELECT c.sha256, c.size_bytes,
