@@ -1,6 +1,6 @@
 // dedupeIdentical against a real Postgres, a temp vault and the real decode pool (pixelDigest
 // crosses workerpool's JSON IPC in every test here).
-import { appendFile, copyFile, mkdir, stat, unlink } from 'node:fs/promises';
+import { appendFile, copyFile, link, mkdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, extname, join } from 'node:path';
 import { ExifTool } from 'exiftool-vendored';
 import type pg from 'pg';
@@ -708,4 +708,109 @@ test('a loser that fails its checksum is MISMATCH: not counted as removed, count
     }),
   ]);
   expect(await exists(nPath)).toBe(true);
+});
+
+/** Retires the family of `cam` (row only: vault files untouched). */
+async function retireOnly(cam: string): Promise<void> {
+  const c = ctx();
+  await withTx(pool, async (tx) => retireFamily(c, tx, await findFamily(c, tx, cam)));
+}
+
+test('a loser still linked elsewhere (a staging generation) is DEFERRED: kept, unmarked, removed once unlinked', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  await retireOnly(cam);
+  const nPath = await vaultPath(n);
+  const staged = join(await tmpDir(), 'staged.jpg');
+  await link(nPath, staged);
+  const c = ctx();
+  expect(await removeRetired(c, n)).toBe('DEFERRED');
+  expect(c.logs.join('\n')).toMatch(/deferred/);
+  expect(await exists(nPath)).toBe(true);
+  expect(await row(n)).toMatchObject({
+    state: 'DUPLICATE',
+    duplicate_removed_at: null,
+    duplicate_mismatch: false,
+  });
+  // The pipeline step treats it as a normal outcome (pending, retried later).
+  expect(['KEPT', 'UNIQUE']).toContain(await dedupe(cam));
+  expect(await exists(nPath)).toBe(true);
+  await unlink(staged);
+  expect(await removeRetired(ctx(), n)).toBe('REMOVED');
+  expect(await exists(nPath)).toBe(false);
+  expect((await row(n)).duplicate_removed_at).toBeInstanceOf(Date);
+});
+
+test('apply: a DEFERRED removal is its own count (not removed, not an error); a later apply finishes it', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  const staged = join(await tmpDir(), 'staged.jpg');
+  const r = await dedupeIdenticalAll(
+    ctx({
+      checkpoint: async (name) => {
+        if (name === 'identical_retired') await link(await vaultPath(n), staged);
+      },
+    }),
+    { apply: true },
+  );
+  expect(r).toMatchObject({ families: 1, files: 0, bytes: 0, deferred: 1, errors: 0 });
+  expect(r.rows).toEqual([
+    expect.objectContaining({ keeper_sha256: cam, removed_sha256: n, outcome: 'DEFERRED' }),
+  ]);
+  expect(reportCsv(r.rows, true)).toMatch(/,DEFERRED\n$/);
+  expect(await exists(await vaultPath(n))).toBe(true);
+  const still = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(still).toMatchObject({ families: 0, files: 0, deferred: 1, errors: 0 });
+  await unlink(staged);
+  const done = await dedupeIdenticalAll(ctx(), { apply: true });
+  expect(done).toMatchObject({ families: 0, files: 1, deferred: 0, errors: 0 });
+  expect(done.rows).toEqual([expect.objectContaining({ removed_sha256: n, outcome: 'REMOVED' })]);
+  expect(await exists(await vaultPath(n))).toBe(false);
+});
+
+test('a keeper whose bytes no longer match its sha256 keeps the loser: flagged, nothing deleted', async () => {
+  const cam = await hashed(await variant({}), { name: 'cam.jpg' });
+  const n = await hashed(await variant({ Software: 'Picasa 3.0' }), { name: 'pic.jpg' });
+  await retireOnly(cam);
+  const camPath = await vaultPath(cam);
+  await writeFile(camPath, Buffer.from('not the keeper any more'));
+  expect(await removeRetired(ctx(), n)).toBe('MISMATCH');
+  expect(await exists(await vaultPath(n))).toBe(true);
+  expect(await row(n)).toMatchObject({ duplicate_mismatch: true, duplicate_removed_at: null });
+  expect(
+    (await pool.query('SELECT last_error FROM contents WHERE sha256 = $1', [n])).rows[0],
+  ).toMatchObject({ last_error: expect.stringMatching(/keeper vault sha256/) as unknown });
+});
+
+test('one family that fails to plan is an error, recorded with its members; the others still run', async () => {
+  const f1 = await seedFamilies();
+  const f2 = await secondFamily();
+  const bad = await vaultPath(f1.cam);
+  const c = ctx({
+    metadata: {
+      ...deps.metadata,
+      keeperTags: (path: string) =>
+        path === bad
+          ? Promise.reject(new Error('exiftool exploded'))
+          : deps.metadata.keeperTags(path),
+    } as Deps['metadata'],
+  });
+  const errs: unknown[] = [];
+  const r = await dedupeIdenticalAll(c, { apply: true, onError: (e) => void errs.push(e) });
+  expect(r).toMatchObject({ families: 1, files: 1, errors: 1 });
+  expect(r.errorRows).toEqual([
+    {
+      sha_a: '',
+      sha_b: '',
+      members: [f1.cam, f1.pic].sort().join(';'),
+      error: expect.stringMatching(/exiftool exploded/) as unknown,
+    },
+  ]);
+  expect(errs).toEqual(r.errorRows);
+  expect(c.logs.join('\n')).toMatch(/family not processed/);
+  // Nothing of the failed family was retired; the other family was.
+  expect((await row(f1.pic)).state).toBe('HASHED');
+  expect((await row(f1.cam)).state).toBe('HASHED');
+  expect((await row(f2.pic)).state).toBe('DUPLICATE');
+  expect(await exists(await vaultPath(f2.pic))).toBe(false);
 });

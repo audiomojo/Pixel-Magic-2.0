@@ -203,8 +203,8 @@ export const MAX_SWEEP_BATCHES = 50;
 
 /**
  * Scheduled (`pm-copies`) or on demand (`cli sweep-copies`): removes confirmed duplicates that
- * FileWorkflow did not (crash leftovers, deferred copies, files ingested before removal existed).
- * Bounded: `MAX_SWEEP_BATCHES` batches of `SWEEP_BATCH`; the next run resumes at the cursor.
+ * FileWorkflow did not (crash leftovers, deferred copies, files ingested before removal existed),
+ * and the vault files of retired identical duplicates whose removal was deferred. Bounded: `MAX_SWEEP_BATCHES` batches of `SWEEP_BATCH`; the next run resumes at the cursor.
  */
 export async function CopySweepWorkflow(): Promise<SweepResult> {
   const total: SweepResult = {

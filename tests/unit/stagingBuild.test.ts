@@ -17,6 +17,7 @@ import { basename, dirname, join, relative } from 'node:path';
 import type { Client } from '@temporalio/client';
 import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
+import { removeRetired, type IdenticalCtx } from '../../src/activities/identical.js';
 import { createActivities, type Deps } from '../../src/activities/index.js';
 import { vaultRel, type DataLayout } from '../../src/fsops.js';
 import { verifyVault } from '../../src/operator.js';
@@ -707,16 +708,44 @@ test('a pick of a retired content marks its keeper', async () => {
   expect(await setNames()).toEqual(['0-best_20211003_140211_B.HEIC', '20211003_140211_A.HEIC']);
 });
 
-test('a retired vault file unlinked under the current generation: tree reads, next build drops it, verify-vault is clean', async () => {
+test('a staged retired loser: removal DEFERRED while a generation links it, .rescued stays empty, the sweep then removes it', async () => {
   const { a, a2 } = await seedSimilarSet();
-  await build(true);
+  await build(true); // gen 1 stages A.JPG: a hardlink of a2's vault file
   await retire(a2, a);
-  await rm(join(layout.root, vaultRel(a2, 'jpg')), { force: true });
-  // The current generation still holds the hardlink: every staged file reads.
-  const before = await tree(join(layout.staging, 'current'));
-  expect(before.some(([p]) => p.endsWith('A.JPG'))).toBe(true);
-  expect(await build(false)).toMatchObject({ gen: 2, skipped: false });
-  const after = await tree(join(layout.staging, 'current'));
-  expect(after.some(([p]) => p.endsWith('A.JPG'))).toBe(false);
+  const vault = join(layout.root, vaultRel(a2, 'jpg'));
+  const ctx: IdenticalCtx = {
+    ...deps,
+    beat: () => undefined,
+    log: { info: () => undefined, warn: () => undefined },
+  };
+  const rescued = async () =>
+    walk(join(layout.staging, '.rescued')).catch((e: unknown) => {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw e;
+    });
+  expect(await removeRetired(ctx, a2)).toBe('DEFERRED');
+  expect(existsSync(vault)).toBe(true);
+  // gen 2 no longer stages it, but keeps gen 1 (the previous generation), which still links it.
+  expect(await build(true)).toMatchObject({ gen: 2, skipped: false });
+  expect((await tree(join(layout.staging, 'current'))).some(([p]) => p.endsWith('A.JPG'))).toBe(
+    false,
+  );
+  expect(await removeRetired(ctx, a2)).toBe('DEFERRED');
+  // gen 3 reaps gen 1: its link still has the vault name as a twin, so it is unlinked, never
+  // rescued as a user's file.
+  expect(await build(true)).toMatchObject({ gen: 3, skipped: false });
+  expect(existsSync(genDir(1))).toBe(false);
+  expect(await rescued()).toEqual([]);
+  expect(existsSync(vault)).toBe(true);
+  // The copy sweep's retired pass finishes it now that nothing else links the file.
+  expect(await runActivity(acts.sweepCopies, [10])).toMatchObject({ removed: 1, deferred: 0 });
+  expect(existsSync(vault)).toBe(false);
+  const r = await pool.query<{ duplicate_removed_at: Date | null }>(
+    'SELECT duplicate_removed_at FROM contents WHERE sha256 = $1',
+    [a2],
+  );
+  expect(r.rows[0]!.duplicate_removed_at).toBeInstanceOf(Date);
+  expect(await build(true)).toMatchObject({ gen: 4, skipped: false });
+  expect(await rescued()).toEqual([]);
   expect(await verifyVault(layout)).toMatchObject({ mismatches: [] });
 });

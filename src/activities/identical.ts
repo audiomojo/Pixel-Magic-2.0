@@ -27,7 +27,8 @@ export interface IdenticalCtx extends Deps {
 }
 
 export type DedupeOutcome = 'UNIQUE' | 'KEPT' | 'DUPLICATE';
-export type RemoveOutcome = 'REMOVED' | 'ALREADY_REMOVED' | 'MISSING' | 'MISMATCH';
+/** DEFERRED: the vault file has another link (a staging generation); nothing done, retried later. */
+export type RemoveOutcome = 'REMOVED' | 'ALREADY_REMOVED' | 'MISSING' | 'MISMATCH' | 'DEFERRED';
 export interface Retired {
   keeper: string;
   retired: { sha256: string; rule: KeeperRule }[];
@@ -292,8 +293,9 @@ async function namesOf(c: pg.PoolClient, sha256: string): Promise<string[]> {
 }
 
 /**
- * Deletes a retired content's vault file once a fresh sha256 of it equals `contents.sha256`
- * (and the keeper's vault file is present), then records it. Safe to repeat and to run on a row
+ * Deletes a retired content's vault file once a fresh sha256 of it equals `contents.sha256` and
+ * a fresh sha256 of the keeper's vault file equals `duplicate_of`, then records it. DEFERRED
+ * (nothing done, nothing recorded) while another name links the file (R15). Safe to repeat and to run on a row
  * left retired-but-not-removed by a crash; concurrent calls for one content serialize on its
  * row. A file already gone is MISSING (0 bytes reclaimed); any mismatch is flagged and kept.
  */
@@ -337,6 +339,10 @@ export async function removeRetired(ctx: IdenticalCtx, sha256: string): Promise<
       ctx.log.warn('identical duplicate not removed: mismatch flagged', { ...where, error });
       return 'MISMATCH';
     };
+    const deferred = (): RemoveOutcome => {
+      ctx.log.info('identical duplicate removal deferred: still linked', where);
+      return 'DEFERRED';
+    };
     const mark = async (bytes: bigint): Promise<void> => {
       await c.query(
         `UPDATE contents SET duplicate_removed_at = clock_timestamp(),
@@ -357,11 +363,19 @@ export async function removeRetired(ctx: IdenticalCtx, sha256: string): Promise<
       return flag(`keeper ${r.duplicate_of} is ${keeper?.state ?? 'missing'}`);
     const kept = await unlessEnoent(lstat(keptPath));
     if (!kept?.isFile()) return flag(`keeper vault file ${String(where.kept)} missing`);
+    // A staging generation (or a link the user made) still names these bytes: unlinking the vault
+    // name would free nothing and leave the other name to be reaped as a user's file. Later: the
+    // copy sweep and `dedupe-identical --apply` retry once the generation is gone.
+    if (before.nlink > 1n) return deferred();
+    const keptSha = await sha256File(keptPath, () => ctx.beat());
+    if (keptSha !== r.duplicate_of)
+      return flag(`keeper vault sha256 ${keptSha}, expected ${r.duplicate_of}`);
     const actual = await sha256File(path, () => ctx.beat());
     if (actual !== sha256) return flag(`vault sha256 ${actual}, expected ${sha256}`);
     const after = await unlessEnoent(lstat(path, { bigint: true }));
     if (!after || after.size !== before.size || after.mtimeNs !== before.mtimeNs)
       return flag(`${where.removed} changed while hashing`);
+    if (after.nlink > 1n) return deferred();
     await unlessEnoent(unlink(path));
     await fsyncDir(dirname(path)); // the unlink is durable before the row says so
     await mark(before.size);
@@ -468,10 +482,34 @@ export interface CleanupSummary {
   files: number;
   /** Bytes freed (apply: actually reclaimed) or that would be. */
   bytes: number;
-  /** Pairs that failed to compare (retried next run); under apply also MISMATCH/MISSING removals. */
+  /** Apply: removals DEFERRED (still linked by a staging generation; finished later). */
+  deferred: number;
+  /**
+   * Pairs that failed to compare (retried next run), families that failed to plan or retire
+   * (nothing retired; retried next run); under apply also MISMATCH/MISSING removals.
+   */
   errors: number;
   rows: ReportRow[];
+  errorRows: ErrorRow[];
 }
+
+/** One error of a cleanup run: a pair (sha_a, sha_b), a family (members) or a removal. */
+export interface ErrorRow {
+  sha_a: string;
+  sha_b: string;
+  /** A failed family's members, `;`-separated. */
+  members: string;
+  error: string;
+}
+
+export const ERROR_COLUMNS = ['sha_a', 'sha_b', 'members', 'error'] as const;
+
+/** The errors file's header. */
+export const errorsHeader = (): string => ERROR_COLUMNS.join(',') + '\n';
+
+/** Errors file lines (no header), one per error. */
+export const errorLines = (rows: ErrorRow[]): string =>
+  rows.map((r) => ERROR_COLUMNS.map((k) => csvField(r[k])).join(',') + '\n').join('');
 
 /** `field` quoted for CSV only when it must be. */
 const csvField = (v: string | number): string => {
@@ -549,31 +587,79 @@ async function reportRows(
  */
 export async function dedupeIdenticalAll(
   ctx: IdenticalCtx,
-  opts: { apply: boolean; onRows?: (rows: ReportRow[]) => void | Promise<void> },
+  opts: {
+    apply: boolean;
+    onRows?: (rows: ReportRow[]) => void | Promise<void>;
+    onError?: (row: ErrorRow) => void | Promise<void>;
+  },
 ): Promise<CleanupSummary> {
+  const out: CleanupSummary = {
+    families: 0,
+    files: 0,
+    bytes: 0,
+    deferred: 0,
+    errors: 0,
+    rows: [],
+    errorRows: [],
+  };
   const failed = new Set<string>();
+  const error = (row: ErrorRow): void => {
+    out.errorRows.push(row);
+    out.errors += 1;
+  };
+  let flushed = 0;
+  /** Hands the errors recorded since the last call to `onError`, in order. */
+  const flush = async (): Promise<void> => {
+    for (; flushed < out.errorRows.length; flushed++) await opts.onError?.(out.errorRows[flushed]!);
+  };
   const run: IdenticalCtx = {
     ...ctx,
     log: {
       info: ctx.log.info,
       warn: (m, meta) => {
-        if (meta && typeof meta['a'] === 'string' && typeof meta['b'] === 'string')
-          failed.add(`${meta['a']}:${meta['b']}`);
+        const [a, b, detail] = [meta?.['a'], meta?.['b'], meta?.['detail']];
+        if (typeof a === 'string' && typeof b === 'string' && !failed.has(`${a}:${b}`)) {
+          failed.add(`${a}:${b}`);
+          error({
+            sha_a: a,
+            sha_b: b,
+            members: '',
+            error: typeof detail === 'string' ? detail : m,
+          });
+        }
         ctx.log.warn(m, meta);
       },
     },
   };
-  let removalErrors = 0;
-  /** Applied rows: only a real removal frees bytes or counts as removed; MISSING/MISMATCH are errors. */
-  const settle = (row: ReportRow): void => {
+  /**
+   * Applied rows: only a real removal frees bytes or counts as removed; DEFERRED is its own
+   * count (finished later); MISSING/MISMATCH are errors.
+   */
+  const settle = async (row: ReportRow): Promise<void> => {
     if (row.outcome === 'REMOVED') out.files += 1;
     else {
       row.bytes = 0;
-      if (row.outcome === 'MISMATCH' || row.outcome === 'MISSING') removalErrors += 1;
+      if (row.outcome === 'DEFERRED') out.deferred += 1;
+      if (row.outcome === 'MISMATCH' || row.outcome === 'MISSING') {
+        const why =
+          row.outcome === 'MISMATCH'
+            ? (
+                await ctx.pool.query<{ e: string | null }>(
+                  'SELECT last_error AS e FROM contents WHERE sha256 = $1',
+                  [row.removed_sha256],
+                )
+              ).rows[0]?.e
+            : null;
+        error({
+          sha_a: String(row.removed_sha256),
+          sha_b: String(row.keeper_sha256),
+          members: '',
+          error: `removal ${row.outcome}${why ? `: ${why}` : ': vault file already gone'}`,
+        });
+      }
     }
     out.bytes += Number(row.bytes);
   };
-  const out: CleanupSummary = { families: 0, files: 0, bytes: 0, errors: 0, rows: [] };
 
   if (opts.apply) {
     const pending = await ctx.pool.query<{ sha256: string }>(
@@ -594,9 +680,11 @@ export async function dedupeIdenticalAll(
         c.release();
       }
       row.outcome = await removeRetired(run, sha256);
-      settle(row);
+      await settle(row);
       ctx.beat();
+      out.rows.push(row);
       await opts.onRows?.([row]);
+      await flush();
     }
   }
 
@@ -621,31 +709,46 @@ export async function dedupeIdenticalAll(
     for (const sha of members) {
       if (handled.has(sha)) continue;
       handled.add(sha);
-      const done = await withTx(ctx.pool, async (c) => {
-        await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${LONG_TX}'`);
-        await lockKey(run, c, sha);
-        const now = (
-          await c.query<{ state: string }>('SELECT state FROM contents WHERE sha256 = $1', [sha])
-        ).rows[0]?.state;
-        if (now !== 'HASHED' && now !== 'CLUSTERED') return null; // retired meanwhile
-        const family = await findFamily(run, c, sha);
-        for (const f of family) handled.add(f);
-        if (family.length < 2) return null;
-        const plan = opts.apply
-          ? await retireFamily(run, c, family).then((r) => ({
-              keeper: r.keeper,
-              losers: r.retired,
-            }))
-          : await planFamily(run, c, family);
-        return { plan, rows: await reportRows(run, c, plan.keeper, plan.losers) };
-      });
+      let family = [sha];
+      let done;
+      try {
+        done = await withTx(ctx.pool, async (c) => {
+          await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${LONG_TX}'`);
+          await lockKey(run, c, sha);
+          const now = (
+            await c.query<{ state: string }>('SELECT state FROM contents WHERE sha256 = $1', [sha])
+          ).rows[0]?.state;
+          if (now !== 'HASHED' && now !== 'CLUSTERED') return null; // retired meanwhile
+          family = await findFamily(run, c, sha);
+          for (const f of family) handled.add(f);
+          if (family.length < 2) return null;
+          const plan = opts.apply
+            ? await retireFamily(run, c, family).then((r) => ({
+                keeper: r.keeper,
+                losers: r.retired,
+              }))
+            : await planFamily(run, c, family);
+          return { plan, rows: await reportRows(run, c, plan.keeper, plan.losers) };
+        });
+      } catch (e) {
+        // One family's failure (exiftool, a lock timeout, a member gone) retires nothing of it
+        // (the transaction rolled back) and must not stop the others: recorded, retried next run.
+        ctx.log.warn('family not processed; nothing retired', {
+          members: family,
+          error: errText(e),
+        });
+        error({ sha_a: '', sha_b: '', members: family.join(';'), error: errText(e) });
+        await flush();
+        continue;
+      }
+      await flush();
       if (!done) continue;
       out.families += 1;
       if (opts.apply) {
         await ctx.checkpoint?.('identical_retired');
         for (const row of done.rows) {
           row.outcome = await removeRetired(run, String(row.removed_sha256));
-          settle(row);
+          await settle(row);
           ctx.beat();
         }
       } else {
@@ -654,9 +757,9 @@ export async function dedupeIdenticalAll(
       }
       out.rows.push(...done.rows);
       await opts.onRows?.(done.rows);
+      await flush();
     }
   }
-  out.errors = failed.size + removalErrors;
   return out;
 }
 

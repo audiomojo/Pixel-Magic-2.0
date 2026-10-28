@@ -5,6 +5,7 @@ import { lstat, unlink } from 'node:fs/promises';
 import { heartbeat, log } from '@temporalio/activity';
 import { fsyncDir, sha256File, unlessEnoent } from '../fsops.js';
 import type { ReclaimOutcome, SweepResult } from '../types.js';
+import { removeRetired, type IdenticalCtx } from './identical.js';
 import type { Deps } from './index.js';
 import { ChangedWhileHashingError } from './ingest.js';
 
@@ -76,10 +77,20 @@ export function makeCopies(deps: Deps) {
     const copy = layout.copiesFile(String(id), row.ext);
     const vault = layout.vaultFile(sha, row.ext);
 
-    // A retired content has no vault file by design: the .copies file alone is checked.
-    const retired =
-      (await pool.query(`SELECT 1 FROM contents WHERE sha256 = $1 AND state = 'DUPLICATE'`, [sha]))
-        .rowCount === 1;
+    // A retired content whose vault file was removed (and not flagged) has no vault file by
+    // design: the .copies file alone is checked — but only while its keeper's vault file is
+    // there, so the bytes stay somewhere. Any other retired content (removal pending, flagged,
+    // keeper gone) takes the normal path: against its own vault file, flagged when missing.
+    const k = (
+      await pool.query<{ sha256: string; ext: string }>(
+        `SELECT k.sha256, k.ext FROM contents d JOIN contents k ON k.sha256 = d.duplicate_of
+          WHERE d.sha256 = $1 AND d.state = 'DUPLICATE' AND d.duplicate_removed_at IS NOT NULL
+            AND NOT d.duplicate_mismatch`,
+        [sha],
+      )
+    ).rows[0];
+    const kept = k ? await lstatOrNull(layout.vaultFile(k.sha256, k.ext)) : null;
+    const retired = kept?.isFile() === true;
     const c = await lstatOrNull(copy);
     const v = retired ? null : await lstatOrNull(vault);
     if (!c) {
@@ -123,15 +134,50 @@ export function makeCopies(deps: Deps) {
   }
 
   /**
+   * Up to `limit` retired identical duplicates whose vault file is not yet dealt with (removal
+   * DEFERRED while a staging generation linked it, or a crash's leftover), after the persisted
+   * sha256 cursor: `removeRetired` each. True when the pass reached the end (cursor reset).
+   */
+  async function sweepRetired(limit: number, out: SweepResult, after: string): Promise<boolean> {
+    const ctx: IdenticalCtx = { ...deps, beat, log };
+    const rows = (
+      await pool.query<{ sha256: string }>(
+        `SELECT sha256 FROM contents
+          WHERE state = 'DUPLICATE' AND duplicate_removed_at IS NULL AND NOT duplicate_mismatch
+            AND sha256 > $1
+          ORDER BY sha256 LIMIT $2`,
+        [after, limit],
+      )
+    ).rows;
+    for (const { sha256 } of rows) {
+      const o = await removeRetired(ctx, sha256);
+      out.examined++;
+      if (o === 'REMOVED' || o === 'MISSING') out.removed++;
+      else if (o === 'MISMATCH') out.mismatched++;
+      else if (o === 'DEFERRED') out.deferred++;
+      heartbeat(out);
+    }
+    const wrapped = rows.length < limit;
+    await pool.query('UPDATE copy_sweep_state SET retired_after = $1 WHERE id = 1', [
+      wrapped ? '' : rows[rows.length - 1]!.sha256,
+    ]);
+    return wrapped;
+  }
+
+  /**
    * Queue `io`, heartbeating (`CopySweepWorkflow`). Up to `limit` COPY rows neither removed nor
    * flagged, after the persisted cursor in id order: crash leftovers, deferred copies and the
-   * one-off pass over data ingested before removal existed. `wrapped`: the pass reached the end
-   * and the cursor went back to the start.
+   * one-off pass over data ingested before removal existed. Then up to `limit` pending retired
+   * identical duplicates (`sweepRetired`, its own cursor). `wrapped`: both passes reached the end
+   * and their cursors went back to the start.
    */
   async function sweepCopies(limit: number): Promise<SweepResult> {
-    const after = (
-      await pool.query<{ after_id: bigint }>('SELECT after_id FROM copy_sweep_state WHERE id = 1')
-    ).rows[0]!.after_id;
+    const state = (
+      await pool.query<{ after_id: bigint; retired_after: string }>(
+        'SELECT after_id, retired_after FROM copy_sweep_state WHERE id = 1',
+      )
+    ).rows[0]!;
+    const after = state.after_id;
     const rows = (
       await pool.query<CopyRow>(
         `SELECT ${ROW_COLUMNS} FROM files
@@ -155,9 +201,11 @@ export function makeCopies(deps: Deps) {
       else if (o === 'DEFERRED') out.deferred++;
       heartbeat(out);
     }
-    out.wrapped = rows.length < limit;
-    const next = out.wrapped ? 0n : rows[rows.length - 1]!.id;
+    const copiesWrapped = rows.length < limit;
+    const next = copiesWrapped ? 0n : rows[rows.length - 1]!.id;
     await pool.query('UPDATE copy_sweep_state SET after_id = $1 WHERE id = 1', [next]);
+    const retiredWrapped = await sweepRetired(limit, out, state.retired_after);
+    out.wrapped = copiesWrapped && retiredWrapped;
     if (out.examined > 0) log.info('duplicate sweep', { ...out });
     return out;
   }

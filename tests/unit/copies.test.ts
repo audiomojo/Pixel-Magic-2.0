@@ -362,3 +362,117 @@ test('the sweep removes a retired content copy too', async () => {
   expect(r.removed).toBe(1);
   expect(existsSync(copyPath(c))).toBe(false);
 });
+
+/** Ingests `bytes` (the retired one) and a keeper, then retires the first by hand as `how` says. */
+async function retireAs(
+  bytes: Buffer,
+  how: { removed: boolean; mismatch?: boolean; unlinkVault?: boolean; keeperGone?: boolean },
+): Promise<{ owner: IngestResult; keeper: IngestResult }> {
+  const owner = await ingest('retired-owner.jpg', bytes);
+  const keeper = await ingest('keeper.jpg', JPEG_B);
+  await pool.query(
+    `UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2,
+                         duplicate_removed_at = CASE WHEN $3 THEN now() END,
+                         duplicate_mismatch = $4
+      WHERE sha256 = $1`,
+    [owner.sha256, keeper.sha256, how.removed, how.mismatch ?? false],
+  );
+  if (how.unlinkVault) await unlink(vaultPath(owner));
+  if (how.keeperGone) await unlink(vaultPath(keeper));
+  return { owner, keeper };
+}
+
+test('a retired content flagged duplicate_mismatch takes the normal path: a bad vault file keeps the copy', async () => {
+  const { owner } = await retireAs(JPEG_A, { removed: false, mismatch: true });
+  const c = await ingest('again.jpg', JPEG_A);
+  expect(c.state).toBe('COPY');
+  await corrupt(vaultPath(owner), JPEG_B);
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect(existsSync(copyPath(c))).toBe(true);
+  expect((await marks(c)).copy_mismatch).toBe(true);
+});
+
+test('a retired content flagged with its vault file gone: the copy is the only bytes, kept and flagged', async () => {
+  await retireAs(JPEG_A, { removed: false, mismatch: true });
+  const c = await ingest('again.jpg', JPEG_A);
+  await unlink(vaultPath(c));
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect(existsSync(copyPath(c))).toBe(true);
+});
+
+test('a removed retired content whose keeper vault file is gone: the copy is kept and flagged', async () => {
+  await retireAs(JPEG_A, { removed: true, unlinkVault: true, keeperGone: true });
+  const c = await ingest('again.jpg', JPEG_A);
+  expect(c.state).toBe('COPY');
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect(existsSync(copyPath(c))).toBe(true);
+  expect((await marks(c)).last_error).toMatch(/vault file .* missing/);
+});
+
+test('a removed retired content whose keeper is gone, .copies file missing too: flagged, not marked', async () => {
+  await retireAs(JPEG_A, { removed: true, unlinkVault: true, keeperGone: true });
+  const c = await ingest('again.jpg', JPEG_A);
+  await unlink(copyPath(c));
+  expect(await reclaim(c)).toBe('MISMATCH');
+  expect((await marks(c)).copy_removed_at).toBeNull();
+});
+
+test('a removed retired content with its keeper present: the copy is deleted as before', async () => {
+  const { keeper } = await retireAs(JPEG_A, { removed: true, unlinkVault: true });
+  const c = await ingest('again.jpg', JPEG_A);
+  expect(await reclaim(c)).toBe('REMOVED');
+  expect(existsSync(copyPath(c))).toBe(false);
+  expect(existsSync(vaultPath(keeper))).toBe(true);
+});
+
+/** Retired, removal pending (vault file present), keeper in the vault. */
+async function pendingRetired(name: string, bytes: Buffer, keeper: IngestResult) {
+  const r = await ingest(name, bytes);
+  await pool.query(`UPDATE contents SET state = 'DUPLICATE', duplicate_of = $2 WHERE sha256 = $1`, [
+    r.sha256,
+    keeper.sha256,
+  ]);
+  return r;
+}
+const retiredRow = async (r: IngestResult) =>
+  (
+    await pool.query<{ duplicate_removed_at: Date | null; duplicate_mismatch: boolean }>(
+      'SELECT duplicate_removed_at, duplicate_mismatch FROM contents WHERE sha256 = $1',
+      [r.sha256],
+    )
+  ).rows[0]!;
+
+test('the sweep finishes pending retired removals: deferred while linked, removed once not', async () => {
+  const keeper = await ingest('keeper.jpg', JPEG_B);
+  const a = await pendingRetired('a.jpg', JPEG_A, keeper);
+  const b = await pendingRetired('b.jpg', Buffer.concat([JPEG_A, Buffer.from('b')]), keeper);
+  const staged = join(layout.root, 'staged-link.jpg');
+  await link(vaultPath(a), staged);
+  expect(await sweep(10)).toMatchObject({ removed: 1, deferred: 1, wrapped: true });
+  expect(existsSync(vaultPath(a))).toBe(true);
+  expect((await retiredRow(a)).duplicate_removed_at).toBeNull();
+  expect(existsSync(vaultPath(b))).toBe(false);
+  expect((await retiredRow(b)).duplicate_removed_at).toBeInstanceOf(Date);
+  await unlink(staged);
+  expect(await sweep(10)).toMatchObject({ removed: 1, deferred: 0 });
+  expect(existsSync(vaultPath(a))).toBe(false);
+  expect((await retiredRow(a)).duplicate_removed_at).toBeInstanceOf(Date);
+  expect(existsSync(vaultPath(keeper))).toBe(true);
+  expect(await sweep(10)).toMatchObject({ examined: 0, wrapped: true });
+});
+
+test('the retired pass is bounded and resumes at its own cursor', async () => {
+  const keeper = await ingest('keeper.jpg', JPEG_B);
+  const rs = [];
+  for (let i = 0; i < 3; i++)
+    rs.push(
+      await pendingRetired(`r${String(i)}.jpg`, Buffer.concat([JPEG_A, Buffer.from([i])]), keeper),
+    );
+  for (const r of rs) await link(vaultPath(r), join(layout.root, `l-${r.sha256!}`));
+  const first = await sweep(2);
+  expect(first).toMatchObject({ deferred: 2, wrapped: false });
+  const second = await sweep(2);
+  expect(second).toMatchObject({ deferred: 1, wrapped: true });
+  const third = await sweep(2);
+  expect(third).toMatchObject({ deferred: 2, wrapped: false }); // back at the start
+});

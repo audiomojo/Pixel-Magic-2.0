@@ -157,12 +157,13 @@ test('only a COPY row can be marked removed, and never while flagged a mismatch'
 });
 
 test('the duplicate sweep cursor is a singleton that truncate resets', async () => {
-  await pool.query('UPDATE copy_sweep_state SET after_id = 42 WHERE id = 1');
+  await pool.query(`UPDATE copy_sweep_state SET after_id = 42, retired_after = 'ab' WHERE id = 1`);
   await truncate();
   expect(
-    (await one<{ after_id: bigint }>('SELECT after_id FROM copy_sweep_state WHERE id = 1'))
-      .after_id,
-  ).toBe(0n);
+    await one<{ after_id: bigint; retired_after: string }>(
+      'SELECT after_id, retired_after FROM copy_sweep_state WHERE id = 1',
+    ),
+  ).toEqual({ after_id: 0n, retired_after: '' });
   await expect(pool.query('INSERT INTO copy_sweep_state (id) VALUES (2)')).rejects.toMatchObject({
     code: '23514',
   });

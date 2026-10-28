@@ -57,7 +57,10 @@ export type DecodeKilledType = 'DecodeKilled';
  */
 export type ReclaimOutcome = 'REMOVED' | 'ALREADY_REMOVED' | 'MISMATCH' | 'DEFERRED' | 'NOT_COPY';
 
-/** `sweepCopies`' outcome for one bounded batch; `wrapped`: the pass reached the last COPY row. */
+/**
+ * `sweepCopies`' outcome for one bounded batch (COPY rows, then pending retired identical
+ * duplicates); `wrapped`: both passes reached their last row.
+ */
 export interface SweepResult {
   examined: number;
   removed: number;
