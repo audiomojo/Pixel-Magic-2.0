@@ -31,6 +31,7 @@ class Described:
 class Pick:
     chosen: str
     shown: list[str]
+    set_id: int
 
 
 @dataclass
@@ -116,11 +117,29 @@ def load_sets(conn: psycopg.Connection, feature_version: int) -> dict[int, list[
     return sets
 
 
-def load_picks(conn: psycopg.Connection) -> list[Pick]:
+def load_picks(conn: psycopg.Connection, before: datetime | str | None = None) -> list[Pick]:
+    """The usable picks, in pick order; `before` keeps those decided before that time."""
     rows = conn.execute(
-        "SELECT chosen_sha256, shown_sha256 FROM picks WHERE NOT no_clear_best ORDER BY id"
+        """
+        SELECT chosen_sha256, shown_sha256, set_id FROM picks
+        WHERE NOT no_clear_best AND (%s::timestamptz IS NULL OR decided_at < %s::timestamptz)
+        ORDER BY id
+        """,
+        (before, before),
     ).fetchall()
-    return [Pick(chosen, list(shown)) for chosen, shown in rows]
+    return [Pick(chosen, list(shown), set_id) for chosen, shown, set_id in rows]
+
+
+@dataclass
+class Baselines:
+    """The scorecard's figures, all on the same held-out picks as the model's cv_agreement."""
+
+    cv_n: int
+    chance_agreement: float | None
+    rule_agreement: float | None
+    rule_ties: int | None
+    model_wins: int | None
+    rule_wins: int | None
 
 
 def insert_model(
@@ -130,16 +149,63 @@ def insert_model(
     cv_agreement: float | None,
     promoted: bool,
     path: str,
+    baselines: Baselines,
 ) -> int:
+    b = baselines
     row = conn.execute(
         """
-        INSERT INTO ranker_models (feature_version, picks_used, cv_agreement, promoted, path)
-        VALUES (%s, %s, %s, %s, %s) RETURNING version
+        INSERT INTO ranker_models (feature_version, picks_used, cv_agreement, promoted, path,
+          cv_n, chance_agreement, rule_agreement, rule_ties, model_wins, rule_wins)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING version
         """,
-        (feature_version, picks_used, cv_agreement, promoted, path),
+        (feature_version, picks_used, cv_agreement, promoted, path, b.cv_n, b.chance_agreement,
+         b.rule_agreement, b.rule_ties, b.model_wins, b.rule_wins),
     ).fetchone()
     assert row is not None
     return row[0]
+
+
+@dataclass
+class ModelHistory:
+    """A ranker_models row as the scorecard backfill sees it."""
+
+    version: int
+    created_at: datetime
+    feature_version: int
+    picks_used: int
+    cv_agreement: float | None
+    path: str
+    baselines: Baselines
+
+
+def model_history(conn: psycopg.Connection) -> list[ModelHistory]:
+    """Every version, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT version, created_at, feature_version, picks_used, cv_agreement, path,
+               cv_n, chance_agreement, rule_agreement, rule_ties, model_wins, rule_wins
+        FROM ranker_models ORDER BY version
+        """
+    ).fetchall()
+    return [ModelHistory(*row[:6], Baselines(*row[6:])) for row in rows]
+
+
+def fill_baselines(conn: psycopg.Connection, version: int, b: Baselines) -> None:
+    """Sets the baseline columns that are still null; filled ones are left alone."""
+    conn.execute(
+        """
+        UPDATE ranker_models SET
+          cv_n = coalesce(cv_n, %s),
+          chance_agreement = coalesce(chance_agreement, %s),
+          rule_agreement = coalesce(rule_agreement, %s),
+          rule_ties = coalesce(rule_ties, %s),
+          model_wins = coalesce(model_wins, %s),
+          rule_wins = coalesce(rule_wins, %s)
+        WHERE version = %s
+        """,
+        (b.cv_n, b.chance_agreement, b.rule_agreement, b.rule_ties, b.model_wins, b.rule_wins,
+         version),
+    )
 
 
 def current_model(conn: psycopg.Connection) -> ModelRow | None:

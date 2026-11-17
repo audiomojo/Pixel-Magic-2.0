@@ -712,6 +712,103 @@ describe('GET /api/picks/scoreboard', () => {
   });
 });
 
+async function modelRow(o: {
+  picksUsed: number;
+  cv: number | null;
+  promoted: boolean;
+  baselines: [number, number, number, number, number, number] | null;
+}): Promise<number> {
+  const b = o.baselines;
+  const { rows } = await pgh.pool.query<{ version: number }>(
+    `INSERT INTO ranker_models (feature_version, picks_used, cv_agreement, promoted, path,
+       cv_n, chance_agreement, rule_agreement, rule_ties, model_wins, rule_wins)
+     VALUES (1, $1, $2, $3, 'm', $4, $5, $6, $7, $8, $9) RETURNING version`,
+    [o.picksUsed, o.cv, o.promoted, ...(b ?? [null, null, null, null, null, null])],
+  );
+  return rows[0]!.version;
+}
+
+describe('GET /api/picks/scoreboard: the scorecard', () => {
+  test("the current model's rows, the verdict, the blind row and the curve", async () => {
+    const e = await setup();
+    const v1 = await modelRow({
+      picksUsed: 0,
+      cv: 0.5,
+      promoted: true,
+      baselines: [10, 0.5, 0.5, 2, 0, 0],
+    });
+    const v2 = await modelRow({
+      picksUsed: 30,
+      cv: 0.7,
+      promoted: true,
+      baselines: [30, 0.25, 0.5, 3, 12, 3],
+    });
+    await modelRow({ picksUsed: 31, cv: 0.65, promoted: false, baselines: null }); // pre-0012 shape
+    const old = '2026-01-01T10:00:00Z';
+    for (let i = 0; i < 3; i++)
+      await pickRow({
+        setId: i,
+        chosen: A,
+        shown: [A, B],
+        random: true,
+        modelPick: i < 2 ? A : B,
+        modelVersion: v1,
+        decidedAt: old,
+      });
+    for (let i = 0; i < 2; i++)
+      await pickRow({
+        setId: 10 + i,
+        chosen: C,
+        shown: [C, D, E],
+        random: true,
+        modelPick: i < 1 ? C : D,
+        modelVersion: v2,
+        decidedAt: i === 0 ? '2026-01-02T10:00:00Z' : old,
+      });
+    await pickRow({
+      setId: 20,
+      chosen: A,
+      shown: [A, B],
+      modelPick: B,
+      modelVersion: v2,
+      decidedAt: old,
+    });
+    const s = (await e.get('/api/picks/scoreboard')).json;
+    expect(s.lastPickAt).toBe('2026-01-02T10:00:00.000Z');
+    const card = s.scorecard;
+    expect(card.version).toBe(v2);
+    expect(card.n).toBe(30);
+    expect(card.model.pct).toBeCloseTo(0.7);
+    expect(card.rule).toMatchObject({ pct: 0.5, ties: 3 });
+    expect(card.chance).toBeCloseTo(0.25);
+    expect(card.paired).toMatchObject({ modelWins: 12, ruleWins: 3 });
+    expect(card.verdict.state).toBe('learning');
+    expect(card.blind).toMatchObject({
+      matched: 3,
+      of: 5,
+      byRuleOnly: { matched: 2, of: 3 },
+      byFitted: { matched: 1, of: 2 },
+      enough: false,
+    });
+    expect(card.blind.chance).toBeCloseTo((3 * 0.5 + 2 / 3) / 5);
+    expect(card.blind.lo).toBeGreaterThan(0);
+    expect(card.blind.hi).toBeLessThan(1);
+    expect(s.curve.map((c: { version: number }) => c.version)).toEqual([v1, v2, v2 + 1]);
+    expect(s.curve[0]).toMatchObject({ fitted: false, promoted: true, cvN: 10, rule: 0.5 });
+    expect(s.curve[2]).toMatchObject({ fitted: true, promoted: false, cvN: 31, cv: 0.65 });
+  });
+
+  test('with no picks and no model the card is empty rather than broken', async () => {
+    const e = await setup();
+    const s = (await e.get('/api/picks/scoreboard')).json;
+    expect(s.lastPickAt).toBeNull();
+    expect(s.scorecard.version).toBeNull();
+    expect(s.scorecard.verdict.state).toBe('no-model');
+    expect(s.scorecard.blind).toMatchObject({ matched: 0, of: 0, chance: null, enough: false });
+    expect(s.curve).toEqual([]);
+  });
+});
+
 // ---- previews ----------------------------------------------------------------------------
 describe('GET /api/preview', () => {
   async function vaultFile(dataDir: string, s: string, ext: string, bytes: Buffer): Promise<void> {

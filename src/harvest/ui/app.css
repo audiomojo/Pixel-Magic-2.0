@@ -389,6 +389,73 @@ dialog::backdrop {
 .reveal {
   min-height: 1.5em;
 }
+.scorecard {
+  padding-bottom: 0.75rem;
+  margin-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.scorecard .rows {
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+}
+.scorecard .rows caption {
+  text-align: left;
+  color: var(--muted);
+  padding-bottom: 0.25rem;
+}
+.scorecard .rows th,
+.scorecard .rows td {
+  text-align: left;
+  padding: 0.2rem 1rem 0.2rem 0;
+  font-weight: 400;
+}
+.scorecard .rows td:nth-child(2) {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.scorecard .rows td:nth-child(3) {
+  color: var(--muted);
+}
+.curve {
+  display: block;
+  width: 100%;
+  max-width: 32rem;
+  height: auto;
+  margin-top: 0.5rem;
+}
+.curve .grid {
+  stroke: var(--line);
+}
+.curve .label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+.curve .band {
+  fill: var(--accent);
+  opacity: 0.15;
+}
+.curve .model {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.curve .dot {
+  fill: var(--accent);
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.curve .dot.hollow {
+  fill: var(--surface);
+}
+.curve .rule {
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+}
+.curve .chance {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
 .disagree img {
   height: 3rem;
   vertical-align: middle;

@@ -80,7 +80,10 @@ picks(id bigserial PK, set_id bigint, chosen_sha256 text NULL, shown_sha256 text
       reasons text[], decided_at timestamptz)
 photo_scores(sha256 text, model_version int, score real, PRIMARY KEY (sha256, model_version))
 ranker_models(version serial PK, created_at timestamptz, feature_version int, picks_used int,
-              cv_agreement real, promoted bool, path text)
+              cv_agreement real, promoted bool, path text,
+              -- migration 0012, the scorecard's baselines on the same held-out picks:
+              cv_n int, chance_agreement real, rule_agreement real, rule_ties int,
+              model_wins int, rule_wins int)
 ```
 
 - `photo_features.quality`: sharpness, exposure (clipped highlights/shadows), motion blur, noise,
@@ -123,8 +126,23 @@ ranker_models(version serial PK, created_at timestamptz, feature_version int, pi
   the inputs): "the chosen photo beat each other shown". Regularisation strength by
   cross-validation. Its weights are readable ("eyes open matters far more than sharpness to you").
   Swappable for a stronger ranker (e.g. gradient-boosted trees) if it stalls after ~1,000 picks.
-- **Cross-validation:** 5 folds by set; agreement = share of held-out picks where the model's top
-  candidate is the chosen one.
+- **Cross-validation:** 5 folds by set (every pick of a set lands in one fold, so a second pick
+  on a set is never held out against a model that trained on the first; sets are permuted in
+  order of first pick, which with one pick per set is a permutation of the picks). **Agreement**
+  = mean credit over the held-out picks, where a pick's credit is 1 when the chosen photo alone
+  scores highest, 1/k when it is one of k tied at the top (scores within 1e-9), else 0. The tie
+  credit is what makes the rule score's figure fair: with few faces detected it often ties, and
+  a tie is "no preference", not a miss. The same definition grades the rule score, chooses λ and
+  decides promotion.
+- **Baselines**, stored with every version on exactly the picks its CV was measured on
+  (`cv_n`): `chance_agreement` (mean of 1/candidates shown), `rule_agreement` and `rule_ties`
+  (the rule score on the same picks), and the paired counts `model_wins`/`rule_wins` (picks where
+  one credit beat the other). Below `MIN_TRAIN_PICKS` the rule *is* the model: its figure is the
+  `cv_agreement` and the paired counts are 0. Older rows are filled by the one-off backfill
+  (`cd ai && uv run python -m pixelmagic_ai.scorecard backfill`), which re-measures each version
+  on the picks decided before its `created_at`, using today's sets and features (sets merge and
+  photos get described over time; the picks are exact, their inputs are today's). It fills only
+  nulls and never changes `cv_agreement` or `picks_used`; v1 (no picks) stays null.
 - **Pick of a set**, in order: the user's latest pick whose chosen photo is still a candidate;
   else the current model's highest-scoring candidate, when at least two candidates are described;
   else none (nothing is marked).
@@ -152,9 +170,31 @@ ranker_models(version serial PK, created_at timestamptz, feature_version int, pi
 - **Which set next**: sets without a user pick, with at least two described candidates; 80 % the
   lowest confidence, 20 % uniformly random (`random_draw`). Sets whose candidates changed since
   the user's pick come back once.
-- **Scoreboard**: headline "matched your pick X of your last 50 random sets"; trend by model
-  version; total picks; sets whose pick changed with the latest model; a "where we disagree" list.
-  Before 50 random picks exist it shows the count so far.
+- **Scorecard** (top of the board; `src/harvest/scorecard.ts` holds the arithmetic, the page
+  only renders): a one-line **verdict** chosen in this order — baselines not recorded (run the
+  backfill); still the rule score (`picks_used = 0`: "N usable picks so far; learning starts at
+  25"); not beating chance (the model's 95 % Wilson interval reaches down to the chance figure);
+  learning (`model_wins > rule_wins` and the two-sided exact sign test on the paired counts gives
+  p < 0.05, shown as "that split would happen by luck about 1 time in N"); worse than the rule
+  score (the same test the other way); otherwise not yet distinguishable, with the counts, the
+  odds and about how many more picks would separate them at today's win/loss rates. The paired
+  test is used rather than comparing two intervals because both are graded on the same picks:
+  the shared noise cancels and the picks where they differ carry all the information. A
+  **three-row table** for the current model: AI model and rule score alone with 95 % Wilson
+  intervals (the credit sum as the success count) and "no preference on N of these" for the
+  rule; random guess as the exact expected value, no interval. The **blind check** as its own
+  row: matched X of the last 50 random sets graded before the user chose, its interval, chance
+  on those same sets, split by whether the rule score or a fitted model graded them; below 30 it
+  says "too few to read yet". A **learning curve** (inline SVG): one dot per fitted version at
+  (`cv_n`, `cv_agreement`), hollow when unpromoted, in its Wilson band; the rule and chance
+  baselines as lines through every version's own values (rule-only versions feed the lines but
+  get no dot); caption: consecutive versions share most picks, read the band, not the wiggle.
+  A nudge when no pick was made for 7 days. The CV figure is slightly optimistic (best of 4 λ
+  on one fold split) and understates agreement on typical sets (80 % of picks are the hardest
+  sets), so the headline target is only ever read off the random picks.
+- **Scoreboard** (below the scorecard): headline "matched your pick X of your last 50 random
+  sets"; trend by model version; total picks; sets whose pick changed with the latest model; a
+  "where we disagree" list. Before 50 random picks exist it shows the count so far.
 
 ### 8.2 API (harvester server; same Host/Origin/header checks as the existing API)
 
@@ -193,12 +233,17 @@ ranker_models(version serial PK, created_at timestamptz, feature_version int, pi
 
 - **Python unit:** quality and face measures on fixture photos; the ranker recovers known weights
   from synthetic picks; cross-validation and promotion; next-set selection (mix, confidence,
-  changed sets); scoreboard arithmetic (only blind, random picks are graded).
+  changed sets); scoreboard arithmetic (only blind, random picks are graded); tie credit, the
+  baselines on exactly the held-out picks, folds never splitting a set, the backfill filling
+  only nulls from the picks before each version.
 - **Python workflow:** the Temporal Python test environment, activities faked at each boundary;
   each workflow applies each effect once.
 - **TypeScript:** `planStaging` marks the right candidate in each precedence case and never renames
   a folder; empty AI tables leave the tree unchanged. Server API tests for every §8.2 route.
-  Playwright: blind-then-reveal, keys, no clear best, the daily counter.
+  Playwright: blind-then-reveal, keys, no clear best, the daily counter. Scorecard: the Wilson
+  interval and sign test against known values, each verdict state in order, the picks-needed
+  estimate, `scoreboard()` with and without baselines; every verdict state and the curve with
+  0, 1 and many versions in the browser.
 - **CI:** Python tests on Linux with a fake face detector; one macOS job runs the Apple Vision
   measures for real.
 

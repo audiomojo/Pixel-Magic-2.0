@@ -498,6 +498,105 @@ test('picks: the scoreboard counts random picks so far', async () => {
   await eventually(() => e.ai, ['pause']);
 });
 
+/** A ranker_models row; `baselines` = [cv_n, chance, rule, rule_ties, model_wins, rule_wins]. */
+async function modelRow(o: {
+  picksUsed: number;
+  cv: number | null;
+  promoted?: boolean;
+  baselines: [number, number, number, number, number, number] | null;
+}): Promise<void> {
+  await q(
+    `INSERT INTO ranker_models (feature_version, picks_used, cv_agreement, promoted, path,
+       cv_n, chance_agreement, rule_agreement, rule_ties, model_wins, rule_wins)
+     VALUES (1, $1, $2, $3, 'm', $4, $5, $6, $7, $8, $9)`,
+    [
+      o.picksUsed,
+      o.cv,
+      o.promoted ?? true,
+      ...(o.baselines ?? [null, null, null, null, null, null]),
+    ],
+  );
+}
+
+test('picks: the scorecard gives a verdict, three rows, the blind row and a curve', async () => {
+  const e = await setup();
+  const [a, b] = await seedSet(1, 2);
+  await modelRow({ picksUsed: 0, cv: 0.5, baselines: [10, 0.5, 0.5, 2, 0, 0] });
+  await modelRow({ picksUsed: 30, cv: 0.7, baselines: [30, 0.25, 0.5, 3, 12, 3] });
+  await modelRow({ picksUsed: 31, cv: 0.65, promoted: false, baselines: null });
+  await q(
+    `INSERT INTO picks (set_id, chosen_sha256, shown_sha256, no_clear_best, random_draw,
+                        model_pick_sha256, model_version, decided_at)
+     VALUES (1, $1, $2, false, true, $1, 2, '2026-01-02T10:00:00Z')`,
+    [a, [a, b]],
+  );
+  await e.open('#/picks');
+  await e.page.getByText(/^Learning: beat the rule score on 12 picks, lost on 3;/).waitFor();
+  const card = e.page.locator('.scorecard');
+  const rowText = (name: RegExp) => card.getByRole('row', { name }).textContent();
+  expect(await rowText(/AI model/)).toContain('70%');
+  expect(await rowText(/Rule score alone/)).toContain('50%');
+  expect(await rowText(/Rule score alone/)).toContain('no preference on 3 of these');
+  expect(await rowText(/Random guess/)).toContain('25%');
+  const text = (await card.textContent()) ?? '';
+  expect(text).toContain('30 held-out picks');
+  expect(text).toContain('Too few to read yet');
+  expect(text).toContain('matched 1 of your last 1 random sets');
+  expect(await e.page.locator('svg.curve circle').count()).toBe(2); // the rule-only v1 gets no dot
+  expect(await e.page.locator('svg.curve circle.hollow').count()).toBe(1); // v3, unpromoted
+  expect(await e.page.locator('svg.curve line.grid').count()).toBe(3); // 0, 50, 100%
+  await e.page
+    .getByText(/^No picks since 2026-01-02\. The model only learns from new picks\.$/)
+    .waitFor();
+  await e.page.getByText(/read the band, not the wiggle/).waitFor();
+});
+
+test('picks: every other verdict state renders in plain words', async () => {
+  const e = await setup();
+  const states: [string, Parameters<typeof modelRow>[0][], RegExp][] = [
+    ['no model', [], /^No model yet\.$/],
+    [
+      'no baselines',
+      [{ picksUsed: 30, cv: 0.7, baselines: null }],
+      /^Baselines not recorded yet for model v1\./,
+    ],
+    [
+      'rule only',
+      [{ picksUsed: 0, cv: 0.5, baselines: [12, 0.5, 0.5, 2, 0, 0] }],
+      /^Still the rule score: 12 usable picks so far; learning starts at 25\.$/,
+    ],
+    [
+      'not above chance',
+      [{ picksUsed: 30, cv: 0.5, baselines: [30, 0.45, 0.4, 2, 8, 6] }],
+      /^Not beating chance yet: the model's range/,
+    ],
+    [
+      'worse',
+      [{ picksUsed: 30, cv: 0.6, baselines: [30, 0.25, 0.7, 2, 3, 20] }],
+      /^Worse than the rule score: it beat the model on 20 picks, lost on 3;/,
+    ],
+    [
+      'undecided',
+      [{ picksUsed: 76, cv: 0.62, baselines: [77, 0.448, 0.539, 19, 20, 11] }],
+      /^Not yet distinguishable from the rule score: beat it on 20 picks, lost on 11; .* About \d+ more picks should separate them\.$/,
+    ],
+  ];
+  await e.open('#/picks');
+  for (const [, rows, text] of states) {
+    await q('TRUNCATE ranker_models RESTART IDENTITY');
+    for (const r of rows) await modelRow(r);
+    await e.page.reload();
+    await e.page.getByText(text).waitFor();
+  }
+  // The last state: one fitted version, one dot, no hollow.
+  expect(await e.page.locator('svg.curve circle').count()).toBe(1);
+  expect(await e.page.locator('svg.curve circle.hollow').count()).toBe(0);
+  await q('TRUNCATE ranker_models RESTART IDENTITY');
+  await e.page.reload();
+  await e.page.getByText(/^No model yet\.$/).waitFor();
+  expect(await e.page.locator('svg.curve').count()).toBe(0); // nothing to draw
+});
+
 test('picks: with no set left it says so', async () => {
   const e = await setup();
   await e.open('#/picks');

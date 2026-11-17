@@ -165,6 +165,17 @@ pause the `ai-describe` schedule in the Temporal UI (that only stops new runs).
 After installing, run `make stage FORCE=1` once so staging records the similar sets the
 worker describes.
 
+**Scorecard.** The top of the Picks tab says whether the model is learning: a one-line verdict,
+the model against the rule score it started from and against random guessing (95 % intervals,
+on the same held-out picks), the blind check on random sets, and a learning curve by version.
+Every training run stores these baselines with the model (migration 0012). After upgrading,
+fill them in for the older versions once:
+
+    cd ai && uv run python -m pixelmagic_ai.scorecard backfill
+
+It re-measures each version on the picks that existed when it was created, fills only empty
+columns (so it is safe to run again) and never changes a stored agreement figure.
+
 ## Identical-picture dedupe
 
 A photo whose full-resolution pixels are exactly equal to another's (same picture, different

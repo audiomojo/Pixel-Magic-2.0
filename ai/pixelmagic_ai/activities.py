@@ -138,18 +138,22 @@ class Activities:
         current = None
         if found is not None:  # no readable file: compare against the rule score
             current = found[1] or ranker.RULE_ONLY(ranker.fit_pca(sets))
-        model, cv, promoted = ranker.train(sets, picks, current)
-        used = ranker.picks_used(model, sets, picks)
-        version = db.insert_model(conn, fv, used, cv, promoted, "")
+        r = ranker.train(sets, picks, current)
+        used = ranker.picks_used(r.model, sets, picks)
+        baselines = db.Baselines(
+            r.cv_n, r.chance, r.rule_agreement, r.rule_ties, r.model_wins, r.rule_wins
+        )
+        version = db.insert_model(conn, fv, used, r.cv, r.promoted, "", baselines)
         path = model_path(self.deps.settings.data_dir, version)
-        save_atomic(model, path)
+        save_atomic(r.model, path)
         db.set_model_path(conn, version, str(path))
         conn.commit()
         log.info(
-            "model version %d: %d picks, cv %.3f, %s",
-            version, used, cv, "promoted" if promoted else "kept unpromoted",
+            "model version %d: %d picks, cv %.3f (rule %s, chance %s on %d), %s",
+            version, used, r.cv, r.rule_agreement, r.chance, r.cv_n,
+            "promoted" if r.promoted else "kept unpromoted",
         )
-        return version, promoted
+        return version, r.promoted
 
     @activity.defn(name="train_ranker")
     def train_ranker(self) -> int | None:

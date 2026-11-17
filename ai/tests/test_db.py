@@ -7,6 +7,8 @@ V = 1
 A, B, C, D = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
 
 
+NO_BASELINES = db.Baselines(0, None, None, None, None, None)
+
 def add_content(conn: psycopg.Connection, sha: str, ext: str = "jpg") -> None:
     conn.execute(
         "INSERT INTO contents (sha256, ext, kind, size_bytes, state)"
@@ -73,21 +75,21 @@ def test_load_picks_skips_no_clear_best(conn):
         " VALUES (1, %s, %s, false), (2, NULL, %s, true)",
         (A, [A, B], [C, D]),
     )
-    assert db.load_picks(conn) == [db.Pick(chosen=A, shown=[A, B])]
+    assert db.load_picks(conn) == [db.Pick(chosen=A, shown=[A, B], set_id=1)]
 
 
 def test_current_model_ignores_unpromoted_rows(conn):
     assert db.current_model(conn) is None
-    v1 = db.insert_model(conn, V, 40, 0.8, True, "m1.pkl")
-    db.insert_model(conn, V, 60, 0.9, False, "m2.pkl")
+    v1 = db.insert_model(conn, V, 40, 0.8, True, "m1.pkl", NO_BASELINES)
+    db.insert_model(conn, V, 60, 0.9, False, "m2.pkl", NO_BASELINES)
     model = db.current_model(conn)
     assert model is not None and model.version == v1 and model.path == "m1.pkl"
-    v3 = db.insert_model(conn, V, 80, 0.85, True, "m3.pkl")
+    v3 = db.insert_model(conn, V, 80, 0.85, True, "m3.pkl", NO_BASELINES)
     assert db.current_model(conn).version == v3
 
 
 def test_write_scores_upserts_and_mark_ranked(conn):
-    v = db.insert_model(conn, V, 40, None, True, "m.pkl")
+    v = db.insert_model(conn, V, 40, None, True, "m.pkl", NO_BASELINES)
     db.write_scores(conn, v, {A: 1.0, B: 2.0})
     db.write_scores(conn, v, {A: 3.0})
     rows = conn.execute("SELECT sha256, score FROM photo_scores ORDER BY sha256").fetchall()

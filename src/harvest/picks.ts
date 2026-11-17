@@ -24,6 +24,7 @@ import type { HarvestSettings } from './config.js';
 import type { PipelineControl } from './pipelineControl.js';
 import { HttpError, parse, send, type Json } from './http.js';
 import { GuardedFs } from './paths.js';
+import { buildScorecard, curvePoint, wilson, type ModelFigures } from './scorecard.js';
 import { evictThumbs, placeholderJpeg, readSource, renderJpeg, writeCacheFile } from './thumbs.js';
 
 export const DAILY_GOAL = 10;
@@ -31,6 +32,8 @@ export const DAILY_GOAL = 10;
 const RANDOM_SHARE = 0.2;
 const TRAIN_EVERY = 10;
 const HEADLINE_PICKS = 50;
+/** Graded random picks before the blind row says anything (±13 points at 50; below 30 it is noise). */
+const BLIND_ENOUGH = 30;
 const DISAGREEMENTS = 20;
 const TOKEN_TTL_MS = 24 * 3600_000;
 /** A token "issued" further than this in the future is refused too (clock skew allowance). */
@@ -549,6 +552,11 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
       return null;
     });
     const t = totals.rows[0]!;
+    const models = await modelFigures();
+    const current = models.filter((m) => m.promoted).at(-1) ?? null;
+    const lastPick = await pool.query<{ at: Date | null }>(
+      'SELECT max(decided_at) AS at FROM picks',
+    );
     return {
       headline: headline.rows[0]!,
       byVersion: byVersion.rows,
@@ -557,6 +565,51 @@ export function createPicksRoutes(d: PicksDeps): PicksRoutes {
       disagreements: disagreements.rows,
       failedPhotos: t.failed,
       describe: { paused, backlog: t.backlog },
+      scorecard: { ...buildScorecard(current), blind: await blindRow() },
+      curve: models.map(curvePoint),
+      lastPickAt: lastPick.rows[0]?.at?.toISOString() ?? null,
+    };
+  }
+
+  /** Every ranker_models row, oldest first, with the scorecard's baselines (null before the backfill). */
+  async function modelFigures(): Promise<ModelFigures[]> {
+    const { rows } = await pool.query<ModelFigures>(
+      `SELECT version, promoted, picks_used AS "picksUsed", cv_agreement AS "cvAgreement",
+              cv_n AS "cvN", chance_agreement AS "chanceAgreement",
+              rule_agreement AS "ruleAgreement", rule_ties AS "ruleTies",
+              model_wins AS "modelWins", rule_wins AS "ruleWins"
+         FROM ranker_models ORDER BY version`,
+    );
+    return rows;
+  }
+
+  /**
+   * The blind check: the last 50 random sets graded before the user chose, split by who graded
+   * them (the rule score, or a fitted model), with chance on those same sets. The cleanest test
+   * of the model and the slowest to fill; below BLIND_ENOUGH graded picks it is not read.
+   */
+  async function blindRow(): Promise<Json> {
+    const { rows } = await pool.query<{ matched: boolean; chance: number; fitted: boolean | null }>(
+      `SELECT p.chosen_sha256 = p.model_pick_sha256 AS matched,
+              1.0 / array_length(p.shown_sha256, 1) AS chance,
+              m.picks_used > 0 AS fitted
+         FROM picks p LEFT JOIN ranker_models m ON m.version = p.model_version
+        WHERE ${GRADED}
+        ORDER BY p.decided_at DESC, p.id DESC LIMIT ${String(HEADLINE_PICKS)}`,
+    );
+    const count = (xs: typeof rows) => ({
+      matched: xs.filter((r) => r.matched).length,
+      of: xs.length,
+    });
+    const all = count(rows);
+    const mean = rows.length ? rows.reduce((a, r) => a + Number(r.chance), 0) / rows.length : null;
+    return {
+      ...all,
+      ...wilson(all.matched, all.of),
+      chance: mean,
+      byRuleOnly: count(rows.filter((r) => r.fitted === false)),
+      byFitted: count(rows.filter((r) => r.fitted === true)),
+      enough: all.of >= BLIND_ENOUGH,
     };
   }
 

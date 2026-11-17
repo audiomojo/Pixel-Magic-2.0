@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -182,7 +183,7 @@ def test_worse_candidate_is_kept_unpromoted_and_scores_not_rewritten(acts, conn,
 
     add_unsure_pick(conn)  # something new, so training runs
     real = ranker.train
-    monkeypatch.setattr(ranker, "train", lambda *a: (real(*a)[0], 0.1, False))
+    monkeypatch.setattr(ranker, "train", lambda *a: replace(real(*a), cv=0.1, promoted=False))
     assert acts.train_ranker() is None
     v3 = models(conn)[2]
     assert v3[0] == 3 and v3[2] is False and v3[4] is None
@@ -384,7 +385,7 @@ def test_train_skips_after_a_losing_training_without_newer_picks(acts, conn, tmp
     acts.train_ranker()
     add_smile_picks(conn, sets, 30)
     real = ranker.train
-    monkeypatch.setattr(ranker, "train", lambda *a: (real(*a)[0], 0.1, False))
+    monkeypatch.setattr(ranker, "train", lambda *a: replace(real(*a), cv=0.1, promoted=False))
     assert acts.train_ranker() is None  # v2 kept unpromoted
     assert len(models(conn)) == 2
     files = sorted((tmp_path / "ai" / "models").iterdir())
@@ -414,3 +415,23 @@ def test_rank_needed(acts, conn):
     assert acts.rank_needed() is True
     acts.rank_sets()
     assert acts.rank_needed() is False
+
+
+def baselines(conn, version: int) -> tuple:
+    return conn.execute(
+        "SELECT cv_n, chance_agreement, rule_agreement, rule_ties, model_wins, rule_wins"
+        " FROM ranker_models WHERE version = %s",
+        (version,),
+    ).fetchone()
+
+
+def test_training_stores_the_scorecard_baselines_with_the_model(acts, conn):
+    sets = add_sets(conn)
+    acts.train_ranker()
+    assert baselines(conn, 1) == (0, None, None, None, 0, 0)  # the rule, on no picks
+    add_smile_picks(conn, sets, 30)
+    assert acts.train_ranker() == 2
+    cv_n, chance, rule, ties, wins, losses = baselines(conn, 2)
+    assert cv_n == 30 and chance == pytest.approx(1 / SIZE)
+    assert 0 <= rule <= 1 and 0 <= ties <= 30
+    assert wins + losses <= 30 and wins > losses  # the smile is learnt; the rule ignores it
