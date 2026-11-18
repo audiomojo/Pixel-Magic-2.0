@@ -1,7 +1,7 @@
 # Pixel Magic 2.0 — Design Spec
 
 > Status: **DRAFT for review** · 2026-10-17
-> Supersedes `architecturte/01–05` (kept for history). Where they disagree, this spec wins.
+> Supersedes `architecture/01–05` (kept for history). Where they disagree, this spec wins.
 
 ## 1. Purpose
 

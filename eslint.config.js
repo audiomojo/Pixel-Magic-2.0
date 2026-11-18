@@ -9,7 +9,7 @@ export default tseslint.config(
       'node_modules/',
       'data/',
       'data-test/',
-      'architecturte/',
+      'architecture/',
       'ai/',
       'test-automation/',
     ],
